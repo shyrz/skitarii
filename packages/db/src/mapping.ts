@@ -1,0 +1,227 @@
+import {
+  asChatId,
+  asUserId,
+  type Action,
+  type Appeal,
+  type ChatConfig,
+  type DailyAggregate,
+  type MessageEvent,
+  type ModerationDecision,
+  type Rule,
+  type RuleAction,
+  type Signal,
+  type Subscription,
+} from '@skitarii/core'
+import { z } from 'zod'
+import { SAMPLE_TEXT_MAX_LENGTH, type AppealRow, type ChatRow, type DailyAggregateRow, type MessageEventRow, type ModerationDecisionRow, type SubscriptionRow } from './schema.js'
+
+/**
+ * 数据库行 ↔ 领域对象的映射边界。
+ *
+ * 这里是「外部数据进系统」的唯一收口：JSONB 列按 zod schema 解析成领域类型，
+ * 字符串/数字列经 `asChatId` / `asUserId` 打上品牌，枚举列直接取值；列类型与领域联合类型
+ * 由编译器对齐，任何一侧新增取值都会在这里编译失败。
+ *
+ * 解析失败一律抛错而不是回退默认值：坏数据应当让运维看见（日志里带事件 id 可定位），
+ * 而不是让一条解析失败的消息静默按「无规则」放行。
+ */
+
+/** `Rule[]` 的 JSONB 形状。与领域 `Rule` 的字段一一对应。 */
+const ruleSchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum(['keyword', 'regex', 'link-domain']),
+  pattern: z.string(),
+  score: z.number().min(0).max(1),
+  actionHint: z.enum(['pass', 'warn', 'delete', 'mute', 'ban']),
+  enabled: z.boolean(),
+})
+
+const ruleListSchema = z.array(ruleSchema)
+
+/** `Signal[]` 的 JSONB 形状。判别字段是 `kind`，与领域联合一一对应。 */
+const signalSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('rule-hit'), ruleId: z.string().min(1), score: z.number().min(0).max(1) }),
+  z.object({ kind: z.literal('llm'), verdict: z.enum(['legit', 'spam', 'scam']), confidence: z.number().min(0).max(1) }),
+])
+
+const signalListSchema = z.array(signalSchema)
+
+/**
+ * 解析 `chats.rules`。
+ *
+ * @param value JSONB 列的原始值（`unknown`）。
+ * @returns 领域规则集。
+ * @throws {z.ZodError} 结构不符合 `Rule[]` 时抛出，附带首个错误路径。
+ */
+export function parseChatRules(value: unknown): Rule[] {
+  const rules: Rule[] = ruleListSchema.parse(value)
+  return rules
+}
+
+/**
+ * `chats` 行 → 群配置。
+ *
+ * @param row 数据库行。
+ * @returns 领域配置，`chatId` 已打品牌。
+ */
+export function toChatConfig(row: ChatRow): ChatConfig {
+  return {
+    chatId: asChatId(row.chatId),
+    title: row.title,
+    language: row.language,
+    rules: parseChatRules(row.rules),
+    passThreshold: row.passThreshold,
+    llmThreshold: row.llmThreshold,
+    muteDurationMinutes: row.muteDurationMinutes,
+  }
+}
+
+/**
+ * `message_events` 行 → 消息事件。摘录列不在这里映射：它只服务于申诉页面，
+ * 需要时由 `findWithSample` 单独取出，避免「顺手带出正文」成为默认路径。
+ *
+ * @param row 数据库行。
+ * @returns 领域事件。
+ */
+export function toMessageEvent(row: MessageEventRow): MessageEvent {
+  return {
+    id: row.id,
+    chatId: asChatId(row.chatId),
+    userId: asUserId(row.userId),
+    messageId: row.messageId,
+    contentHash: row.contentHash,
+    features: { hasLink: row.hasLink, mediaType: row.mediaType, length: row.length },
+    createdAt: row.createdAt,
+  }
+}
+
+/**
+ * 决策的档位列 + 解禁时刻列 → 领域处置。
+ *
+ * 两个列在领域里是同一个判别联合，因此映射必须联合判断：`mute` 缺 `action_until`
+ * 说明 DDL 的 CHECK 被绕过（或代码写坏了），此时抛错而不是造一个 `until` 为空的禁言。
+ *
+ * @param action `moderation_decisions.action` 列。
+ * @param until `moderation_decisions.action_until` 列。
+ * @returns 领域处置。
+ * @throws {Error} `mute` 与 `action_until` 不匹配时抛出。
+ */
+export function toAction(action: RuleAction, until: Date | null): Action {
+  switch (action) {
+    case 'pass':
+      return { kind: 'pass' }
+    case 'warn':
+      return { kind: 'warn' }
+    case 'delete':
+      return { kind: 'delete' }
+    case 'ban':
+      return { kind: 'ban' }
+    case 'mute':
+      if (until === null) throw new Error('mute 决策缺少 action_until')
+      return { kind: 'mute', until }
+    default: {
+      const exhaustive: never = action
+      throw new Error(`未知处置档位: ${String(exhaustive)}`)
+    }
+  }
+}
+
+/**
+ * `moderation_decisions` 行 → 领域决策。
+ *
+ * @param row 数据库行。
+ * @returns 领域决策，`signals` 已解析成 `Signal[]`。
+ */
+export function toModerationDecision(row: ModerationDecisionRow): ModerationDecision {
+  const signals: Signal[] = signalListSchema.parse(row.signals)
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    chatId: asChatId(row.chatId),
+    userId: asUserId(row.userId),
+    action: toAction(row.action, row.actionUntil),
+    score: row.score,
+    signals,
+    decidedAt: row.decidedAt,
+    executed: row.executed,
+  }
+}
+
+/**
+ * `appeals` 行 → 领域申诉。结案人列不进领域类型（`Appeal` 的权威形状在 core），
+ * 需要时由调用方读数据库行或另加查询。
+ *
+ * @param row 数据库行。
+ * @returns 领域申诉。
+ */
+export function toAppeal(row: AppealRow): Appeal {
+  return {
+    id: row.id,
+    decisionId: row.decisionId,
+    userId: asUserId(row.userId),
+    state: row.state,
+    note: row.note,
+    createdAt: row.createdAt,
+    resolvedAt: row.resolvedAt,
+  }
+}
+
+/**
+ * `subscriptions` 行 → 领域订阅。
+ *
+ * @param row 数据库行。
+ * @returns 领域订阅。
+ */
+export function toSubscription(row: SubscriptionRow): Subscription {
+  return {
+    id: row.id,
+    chatId: asChatId(row.chatId),
+    userId: asUserId(row.userId),
+    inviteLink: row.inviteLink,
+    expiresAt: row.expiresAt,
+    state: row.state,
+  }
+}
+
+/**
+ * `daily_aggregates` 行 → 日聚合。
+ *
+ * @param row 数据库行。
+ * @returns 日聚合；`date` 列的 `YYYY-MM-DD` 形态由驱动保证，这里不做二次格式化。
+ */
+export function toDailyAggregate(row: DailyAggregateRow): DailyAggregate {
+  return {
+    chatId: asChatId(row.chatId),
+    date: row.date,
+    messageCount: row.messageCount,
+    actionCount: row.actionCount,
+    appealCount: row.appealCount,
+    overturnedCount: row.overturnedCount,
+  }
+}
+
+/**
+ * 截断正文摘录：先滤掉 NUL 与控制字符，再去掉首尾空白（否则摘录可能整段都是换行），
+ * 最后按 Unicode 码点截到长度上限。
+ *
+ * 过滤控制字符的理由：Postgres 的 `text` 列拒绝 NUL（`\u0000`），写入会直接抛错并中断 attachSample
+ * 所在的管线路径；其余 C0/C1 控制字符（终端转义、退格、垂直制表符）没有展示价值，留在申诉页里只会
+ * 变成乱码。`\t`、`\n`、`\r` 是正文排版的一部分，保留。
+ *
+ * 按码点而不是 UTF-16 单元截断：`String.prototype.slice` 会把表情符号切成半个代理对，
+ * 存进 `text` 列虽然不报错，但读出来是乱码。
+ *
+ * @param text 消息原文。
+ * @returns 可直接写入 `message_events.sample_text` 的摘录。
+ */
+export function truncateSampleText(text: string): string {
+  const chars = Array.from(text.replace(CONTROL_CHARACTERS, '').trim())
+  if (chars.length <= SAMPLE_TEXT_MAX_LENGTH) return chars.join('')
+  return chars.slice(0, SAMPLE_TEXT_MAX_LENGTH).join('')
+}
+
+/**
+ * 需要滤掉的控制字符：NUL、除 `\t`（\u0009）`\n`（\u000a）`\r`（\u000d）之外的 C0、
+ * DEL（\u007f）与 C1（\u0080-\u009f）。
+ */
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu
