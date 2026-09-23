@@ -1,0 +1,25 @@
+{
+  "name": "skitarii",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.24.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:bot": "pnpm --filter @skitarii/bot dev",
+    "dev:server": "pnpm --filter @skitarii/server dev",
+    "dev:web": "pnpm --filter @skitarii/web dev",
+    "build:web": "pnpm --filter @skitarii/web build",
+    "db:generate": "pnpm --filter @skitarii/db generate",
+    "db:migrate": "pnpm --filter @skitarii/db migrate"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}

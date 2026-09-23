@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+  - apps/*
+
+# esbuild 的安装脚本负责落盘平台二进制；pnpm 11 默认拦截，这里显式放行。
+allowBuilds:
+  esbuild: true
