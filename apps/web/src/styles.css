@@ -1,0 +1,380 @@
+/**
+ * 全局样式。主题色全部走 Telegram 注入的 --tg-theme-* 变量；
+ * 在 Telegram 之外（如浏览器调试）打开时变量缺失，回落到 --*-fallback，
+ * 兜底色经 prefers-color-scheme 跟随系统深浅色。
+ */
+
+:root {
+  --bg-fallback: #ffffff;
+  --text-fallback: #000000;
+  --hint-fallback: #707579;
+  --secondary-fallback: #f4f4f5;
+  --button-fallback: #50a8eb;
+  --button-text-fallback: #ffffff;
+  --link-fallback: #168acd;
+  --destructive-fallback: #e53935;
+  --divider-fallback: rgb(0 0 0 / 0.08);
+
+  --bg: var(--tg-theme-bg-color, var(--bg-fallback));
+  --text: var(--tg-theme-text-color, var(--text-fallback));
+  --hint: var(--tg-theme-hint-color, var(--hint-fallback));
+  --secondary-bg: var(--tg-theme-secondary-bg-color, var(--secondary-fallback));
+  --button: var(--tg-theme-button-color, var(--button-fallback));
+  --button-text: var(--tg-theme-button-text-color, var(--button-text-fallback));
+  --link: var(--tg-theme-link-color, var(--link-fallback));
+  --destructive: var(--tg-theme-destructive-text-color, var(--destructive-fallback));
+  --divider: var(--tg-theme-section-separator-color, var(--divider-fallback));
+
+  /* 动作/状态语义色。深浅两主题下都要可读，故取中间明度。 */
+  --tone-notice: #4d9fdd;
+  --tone-caution: #e8963c;
+  --tone-danger: #e5534b;
+  --tone-success: #3aab6f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-fallback: #212121;
+    --text-fallback: #ffffff;
+    --hint-fallback: #98989e;
+    --secondary-fallback: #181818;
+    --divider-fallback: rgb(255 255 255 / 0.1);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    -apple-system, 'PingFang SC', 'Noto Sans SC', 'Helvetica Neue', 'Segoe UI', Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-wrap: pretty;
+}
+
+/* ---- 布局 ---- */
+
+.screen {
+  max-width: 480px;
+  min-height: 100dvh;
+  margin: 0 auto;
+  padding: 24px 16px calc(24px + env(safe-area-inset-bottom));
+}
+
+/* 进入动画：仅首次进入的编排，只做 opacity/transform，180ms 内完成 */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.stack > * {
+  animation: rise 180ms ease-out both;
+}
+
+.stack > *:nth-child(2) {
+  animation-delay: 50ms;
+}
+
+.stack > *:nth-child(3) {
+  animation-delay: 100ms;
+}
+
+.stack > *:nth-child(4) {
+  animation-delay: 150ms;
+}
+
+/* ---- 居中状态页（加载中 / 打不开 / 网络错误） ---- */
+
+.center-state {
+  min-height: 70dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.center-state .state-icon {
+  color: var(--hint);
+  margin-bottom: 8px;
+}
+
+.center-state h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  text-wrap: balance;
+}
+
+.center-state p {
+  margin: 0;
+  max-width: 300px;
+  color: var(--hint);
+  font-size: 15px;
+}
+
+.center-state .btn {
+  width: auto;
+  min-width: 160px;
+  margin-top: 16px;
+  padding: 0 24px;
+}
+
+/* 加载指示：keyframes 用于一次性/持续指示器，不参与交互反馈 */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 3px solid var(--divider);
+  border-top-color: var(--hint);
+  animation: spin 800ms linear infinite;
+}
+
+/* ---- 标题区 ---- */
+
+.header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-wrap: balance;
+}
+
+.header .sub {
+  margin: 0;
+  color: var(--hint);
+  font-size: 15px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--tone) 15%, transparent);
+  color: var(--tone);
+}
+
+/* ---- 详情卡片 ---- */
+
+.card {
+  background: var(--secondary-bg);
+  border-radius: 24px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.field + .field {
+  margin-top: 14px;
+}
+
+.field .label {
+  margin: 0 0 2px;
+  font-size: 13px;
+  color: var(--hint);
+}
+
+.field .value {
+  margin: 0;
+  font-size: 16px;
+}
+
+/* 摘录块在卡片内：内圆角 8 + 与卡片边缘的距离 16 = 卡片圆角 24，保持同心 */
+.quote {
+  margin: 4px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 15px;
+  line-height: 1.55;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* ---- 表单 ---- */
+
+.form .label {
+  display: block;
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.form .hint {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: var(--hint);
+}
+
+.textarea {
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  padding: 12px 14px;
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  background: var(--secondary-bg);
+  color: var(--text);
+  font: inherit;
+  /* iOS 上输入框字号小于 16px 会触发自动缩放 */
+  font-size: 16px;
+  line-height: 1.5;
+  resize: none;
+  transition:
+    border-color 150ms ease-out,
+    box-shadow 150ms ease-out;
+}
+
+.textarea::placeholder {
+  color: var(--hint);
+}
+
+.textarea:focus-visible {
+  outline: none;
+  border-color: var(--button);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--button) 25%, transparent);
+}
+
+.counter {
+  margin: 6px 2px 0;
+  text-align: right;
+  font-size: 13px;
+  color: var(--hint);
+  font-variant-numeric: tabular-nums;
+}
+
+.counter.over {
+  color: var(--destructive);
+}
+
+.form-error {
+  margin: 10px 2px 0;
+  font-size: 14px;
+  color: var(--destructive);
+}
+
+/* ---- 按钮 ---- */
+
+.btn {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  margin-top: 16px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--button);
+  color: var(--button-text);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 150ms ease-out,
+    opacity 150ms ease-out;
+}
+
+.btn:active {
+  transform: scale(0.96);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+}
+
+.btn-secondary {
+  background: var(--secondary-bg);
+  color: var(--link);
+}
+
+/* ---- 申诉状态横幅 ---- */
+
+.appeal-status {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: color-mix(in srgb, var(--tone) 12%, transparent);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+}
+
+.appeal-status .status-icon {
+  flex: none;
+  color: var(--tone);
+  /* 图标配 600 字重标题，视觉对齐到首行文本中线 */
+  margin-top: 2px;
+}
+
+.appeal-status h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.appeal-status p {
+  margin: 4px 0 0;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.appeal-status .time {
+  color: var(--hint);
+  font-size: 13px;
+}
+
+/* ---- 动效克制：reduced-motion 下关闭全部动画与按压位移 ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .stack > * {
+    animation: none;
+  }
+
+  .spinner {
+    animation: none;
+  }
+
+  .btn,
+  .textarea {
+    transition: none;
+  }
+
+  .btn:active {
+    transform: none;
+  }
+}
