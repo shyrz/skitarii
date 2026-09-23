@@ -9,6 +9,7 @@ import { createAppeal, getAppeal, type AppealApiDeps } from './api.js'
 import { parseServerEnv } from './env.js'
 import { createScheduler } from './scheduler.js'
 import { serveStatic } from './static.js'
+import { registerWebhook } from './webhook.js'
 
 /**
  * HTTP 进程入口：Telegram webhook、Mini App API、Mini App 静态托管、维护调度器的宿主。
@@ -229,6 +230,12 @@ try {
   logger.info(`webhook 已就绪：@${bot.botInfo.username}`)
 } catch (error) {
   logger.warn('bot 初始化失败（可能是网络或 token 问题），将在首个 webhook 请求时重试', error)
+}
+
+// PUBLIC_URL 非空才注册：本地开发与内网跑没有公网地址，注册只会徒增失败日志。
+// 注册函数内部吞掉失败（只记 warn），进程照常启动；Telegram 侧保留原有地址，等下次重启再对。
+if (env.PUBLIC_URL !== undefined) {
+  await registerWebhook({ api: bot.api, publicUrl: env.PUBLIC_URL, secretToken: env.WEBHOOK_SECRET, logger })
 }
 
 scheduler.start()

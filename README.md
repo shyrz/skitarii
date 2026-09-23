@@ -71,7 +71,7 @@ cp .env.example .env      # 填入 BOT_TOKEN / DATABASE_URL / OWNER_USER_ID 等
 pnpm db:migrate           # 建表，需要 DATABASE_URL
 pnpm build:web            # Mini App 产物落到 apps/web/dist，由 server 托管
 pnpm dev:bot              # 长轮询 bot（本地开发用）
-pnpm dev:server           # HTTP 服务，默认 8080；webhook 模式下由它驱动 bot
+pnpm dev:server           # HTTP 服务，默认 3000；webhook 模式下由它驱动 bot
 pnpm dev:web              # Mini App 开发服务器，5173
 ```
 
@@ -85,7 +85,7 @@ pnpm dev:web              # Mini App 开发服务器，5173
 DATABASE_URL=postgres://user:pass@localhost:5432/skitarii pnpm db:migrate
 ```
 
-webhook 注册（一次性）：
+webhook 注册：设置了 `PUBLIC_URL` 时由服务启动阶段自动完成，无需手工操作（见「部署（容器 / Zeabur）」）；没设 `PUBLIC_URL` 时手工注册一次，可顺带用 `allowed_updates` 收窄更新类型：
 
 ```bash
 curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
@@ -93,6 +93,77 @@ curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
   -d "secret_token=${WEBHOOK_SECRET}" \
   -d "allowed_updates=[\"message\",\"callback_query\"]"
 ```
+
+## 部署（容器 / Zeabur）
+
+镜像形态是单进程：`apps/server` 一个进程承担 Telegram webhook、Mini App API、`apps/web/dist` 静态托管与维护调度器。镜像里不做第二套 tsc 构建，server 用 `tsx` 直起 TS 源码，因此保留全量依赖（web 构建要 vite、迁移要 drizzle-kit、起服务要 tsx），理由写在 `Dockerfile` 注释里。
+
+构建与启动顺序：
+
+1. `pnpm install --frozen-lockfile`（含 devDependencies，见 `Dockerfile` 注释）
+2. `pnpm build:web`，产出 `apps/web/dist`
+3. 容器启动 `deploy/entrypoint.sh`：先 `pnpm db:migrate`，失败即以非 0 退出，不会带着旧 schema 起服务；成功后 `exec node --import tsx src/index.ts`
+4. 进程监听 `PORT`（平台注入，缺省 3000）；`PUBLIC_URL` 非空时启动阶段调用 `setWebhook(${PUBLIC_URL}/telegram/webhook, { secret_token })`，幂等（每次启动重注册），失败只记日志、不阻断启动，Telegram 侧保留旧地址
+
+```bash
+docker build -t skitarii .
+docker run --rm --env-file .env -p 3000:3000 skitarii
+```
+
+镜像构建与真实迁移尚未在本机实测（开发机没有 Docker），待 Zeabur 实测后回填记录。
+
+### 环境变量
+
+对照 `.env.example` 逐项说明。必填项缺失或取值非法时，进程在启动阶段退出并列出问题变量。
+
+| 变量 | 必填 | 用途 |
+| --- | --- | --- |
+| `BOT_TOKEN` | 是 | BotFather 生成的 bot token；webhook 校验与所有出站调用共用。 |
+| `WEBHOOK_SECRET` | 是 | 提交给 `setWebhook` 的 `secret_token`，也用于校验入站请求头 `X-Telegram-Bot-Api-Secret-Token`。建议 `openssl rand -hex 32` 生成；换地址不改值。 |
+| `DATABASE_URL` | 是 | Postgres 连接串（postgres.js 格式）；迁移与服务都读它。 |
+| `MINI_APP_URL` | 是 | 申诉按钮的目标地址，形如 `${MINI_APP_URL}?startapp=${decisionId}`。 |
+| `OWNER_USER_ID` | 是 | 申诉负责人（Telegram 数字 id）：新申诉私聊该用户，也只有该用户能维持/撤销。 |
+| `PUBLIC_URL` | 否 | 服务对外根地址；非空时启动阶段自动注册 webhook，空串或缺省跳过。 |
+| `PORT` | 否 | HTTP 监听端口，缺省 3000；Zeabur 等平台会注入自己的值。 |
+| `LLM_BASE_URL` | 否 | 云端 LLM 的 OpenAI 兼容服务根地址，不含 `/chat/completions`。 |
+| `LLM_API_KEY` | 否 | 对应 API key。 |
+| `LLM_MODEL` | 否 | 模型名，例如 `gpt-4o-mini`。 |
+| `LLM_TIMEOUT_MS` | 否 | 复核请求超时（毫秒），缺省 30000。三个 `LLM_*` 缺任意一项即视为「未配置复核」，灰色地带按待复核处理。 |
+| `MAINTENANCE_INTERVAL_MS` | 否 | 维护任务（日聚合重算 + 保留期清理）间隔（毫秒），缺省 3600000。 |
+
+自动注册只提交 `secret_token`，不限制 `allowed_updates`：没有处理器的更新类型到达后不会产生动作，只是多几跳流量；要收窄就按上面手工注册的 curl 覆盖一次。
+
+### BotFather 前置步骤
+
+按顺序完成，BotFather 的命令名与界面提示以实际回复为准（待实测回填）：
+
+- [ ] 在 @BotFather 新建 bot，记下 `BOT_TOKEN`
+- [ ] `/setprivacy` 选中该 bot，设为 `Disable`（否则读不到全群消息，审核管线收不到非命令消息）
+- [ ] 把 bot 拉进目标群，并授予管理员权限（删除消息 / 禁言 / 封禁都需要）
+- [ ] 注册 Mini App URL：Mini App 由本服务托管在 `${PUBLIC_URL}/app/`，按 BotFather 的 Mini App 流程把地址指过去
+- [ ] 生成 `WEBHOOK_SECRET`：`openssl rand -hex 32`
+
+### Zeabur
+
+本仓库对 Zeabur 的形态是根 `Dockerfile` 直建。根目录存在 Dockerfile 时优先于 zbpack 自动检测，不需要 `zbpack.json` 之类的配置文件。
+
+首次接入（一次性）：
+
+1. Dashboard 的 Settings → Integrations 绑定 GitHub，安装 Zeabur GitHub App 并授权本仓库。
+2. 项目内 Add Service → GitHub，选中本仓库。构建根目录保持仓库根，根 Dockerfile 生效。
+3. Databases 添加 PostgreSQL（官方模板）。
+4. 应用服务 Variables 补齐环境变量，关键值可直接引用平台变量免手填：
+   - `DATABASE_URL` 填 `${POSTGRES_CONNECTION_STRING}`
+   - `PUBLIC_URL` 填 `${ZEABUR_WEB_URL}`（用自定义域名就填该域名地址）
+   - `MINI_APP_URL` 填 `https://t.me/<bot>/<app>` 形式的 Mini App 直链，`<bot>` 是 bot 用户名，`<app>` 是 BotFather 里注册的 Mini App 短名
+   - `BOT_TOKEN`、`WEBHOOK_SECRET`、`OWNER_USER_ID` 按「环境变量」表填写
+   Variables 支持 Edit as Raw 按 `.env` 形态批量粘贴。
+5. Settings → Health Check 的 HTTP path 设为 `/healthz`。健康检查通过后才切流量，失败保留旧版本。
+6. 域名用 Generate Domain 免费拿 `*.zeabur.app`，或 Custom Domain 配 CNAME，TLS 证书自动签发。
+
+此后 push 到跟踪分支即触发自动构建部署，构建在 Zeabur CI 打镜像，启动链路见上一节。只想让部分目录变更触发部署时配 Watch Paths，语法同 `.gitignore`。
+
+Zeabur 的 README「Deploy to Zeabur」按钮走模板机制，模板内服务要求是已发布镜像（PREBUILT_V2），纯 Git 仓库不适用。本项目的「一键」语义就是 GitHub 集成下的 push 即部署。
 
 ## 常用命令
 

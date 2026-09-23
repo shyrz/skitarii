@@ -14,6 +14,7 @@
     "dev:bot": "pnpm --filter @skitarii/bot dev",
     "dev:server": "pnpm --filter @skitarii/server dev",
     "dev:web": "pnpm --filter @skitarii/web dev",
+    "start": "pnpm --filter @skitarii/server start",
     "build:web": "pnpm --filter @skitarii/web build",
     "db:generate": "pnpm --filter @skitarii/db generate",
     "db:migrate": "pnpm --filter @skitarii/db migrate"
