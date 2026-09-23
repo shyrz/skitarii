@@ -22,6 +22,11 @@ WORKDIR /app
 # --chown=node:node：安装与运行都在非 root 用户下进行。
 COPY --chown=node:node . .
 
+# /app 本身由 WORKDIR 以 root 建出，COPY --chown 只改内容属主、不改目录本身。
+# pnpm install 要在 /app 下创建 node_modules，root 属主的 755 目录对 USER node 不可写，
+# pnpm 的 errorHandler 把 errno 当退出码（EACCES=-13 → 243），构建日志只显示 exit code: 243。
+RUN chown node:node /app
+
 RUN chmod +x deploy/entrypoint.sh
 
 USER node
