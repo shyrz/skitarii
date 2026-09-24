@@ -5,19 +5,21 @@ import { getInitData, getWebApp } from '../telegram.js'
 import { AppealsTab } from './AppealsTab.js'
 import { DecisionsTab } from './DecisionsTab.js'
 import { OverviewTab } from './OverviewTab.js'
+import { RulesTab } from './RulesTab.js'
 
 /**
  * owner 管理台入口。首屏拉取概览，那次请求同时承担鉴权：
  * 401 → auth 屏，403 → forbidden 屏，网络/5xx → 可重试的失败屏。
- * 三个页签懒挂载、挂载后不卸载（display 切换），保住筛选条件与已加载数据。
+ * 四个页签懒挂载、挂载后不卸载（display 切换），保住筛选条件与已加载数据。
  */
 
-type TabKey = 'overview' | 'decisions' | 'appeals'
+type TabKey = 'overview' | 'decisions' | 'appeals' | 'rules'
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
   { key: 'decisions', label: '处置' },
   { key: 'appeals', label: '申诉' },
+  { key: 'rules', label: '规则' },
 ]
 
 type PanelScreen =
@@ -110,6 +112,11 @@ export function PanelApp() {
       {mounted.has('appeals') && (
         <div hidden={tab !== 'appeals'}>
           <AppealsTab initData={initData} onFatal={onFatal} />
+        </div>
+      )}
+      {mounted.has('rules') && (
+        <div hidden={tab !== 'rules'}>
+          <RulesTab initData={initData} chats={screen.overview.chats} onFatal={onFatal} />
         </div>
       )}
     </main>

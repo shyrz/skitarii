@@ -377,7 +377,10 @@ body {
   }
 
   .btn,
-  .textarea {
+  .textarea,
+  .input,
+  .switch .track,
+  .switch .track::after {
     transition: none;
   }
 
@@ -391,7 +394,7 @@ body {
 /* 分段控件： secondary 底托 + 选中项浮起，跟随 Telegram 组内分割的视觉习惯 */
 .tabs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 2px;
   padding: 3px;
   margin-bottom: 20px;
@@ -700,4 +703,168 @@ section > .section-title {
   text-align: center;
   font-size: 13px;
   color: var(--hint);
+}
+
+/* ---- 管理台：规则页签 ---- */
+
+/* 单行文本/数值输入框；字号 16px 避免 iOS 聚焦自动缩放（与 .textarea 同约定） */
+.input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  transition:
+    border-color 150ms ease-out,
+    box-shadow 150ms ease-out;
+}
+
+.input:focus-visible {
+  outline: none;
+  border-color: var(--button);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--button) 25%, transparent);
+}
+
+.input.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.threshold-grid {
+  display: flex;
+  gap: 10px;
+}
+
+.threshold-grid .field {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 卡片内 field 间距沿用 .field + .field；阈值卡的说明行与输入拉开一档 */
+.card > .list-sub {
+  margin: 10px 0 0;
+}
+
+.rule-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.rule-actions {
+  display: flex;
+  gap: 12px;
+  flex: none;
+}
+
+/* 文字按钮：卡片内的次级操作（编辑/删除），不抢主按钮视觉 */
+.text-btn {
+  border: 0;
+  background: none;
+  padding: 4px 2px;
+  color: var(--link);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.text-btn.danger {
+  color: var(--destructive);
+}
+
+.text-btn:disabled {
+  opacity: 0.5;
+}
+
+/* 启用开关：40×24 滑动开关，命中区即整个轨道 */
+.switch {
+  position: relative;
+  width: 40px;
+  height: 24px;
+  flex: none;
+}
+
+.switch input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.switch .track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--divider);
+  transition: background 150ms ease-out;
+}
+
+.switch .track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+  transition: transform 150ms ease-out;
+}
+
+.switch input:checked + .track {
+  background: var(--tone-success);
+}
+
+.switch input:checked + .track::after {
+  transform: translateX(16px);
+}
+
+/* pattern 展示块：等宽字体，与引用块同版式 */
+.rule-pattern {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.rule-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.rule-edit-row {
+  display: flex;
+  gap: 8px;
+}
+
+.rule-edit-row .select,
+.rule-edit-row .input {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+
+.rule-edit-row .btn {
+  flex: none;
+  width: auto;
+  min-height: 40px;
+  margin-top: 0;
+  padding: 0 18px;
+}
+
+.save-errors {
+  margin-bottom: 4px;
 }

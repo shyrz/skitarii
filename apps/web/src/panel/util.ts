@@ -3,7 +3,7 @@
  * 与 AppealApp 的同名格式化逻辑各自独立——申诉视图要求零改动，这里不回头引用它。
  */
 
-import type { PanelDecisionAction, PanelSeriesPointDto } from '../api.js'
+import type { PanelDecisionAction, PanelRuleKind, PanelSeriesPointDto } from '../api.js'
 
 /** 动作档位 → 中文文案。只陈述事实，与申诉页措辞一致。 */
 export const ACTION_LABEL: Record<PanelDecisionAction, string> = {
@@ -28,6 +28,27 @@ export const VERDICT_LABEL: Record<string, string> = {
   legit: '正常',
   spam: '垃圾信息',
   scam: '诈骗',
+}
+
+/** 规则匹配方式 → 中文标签（规则页签用）。 */
+export const RULE_KIND_LABEL: Record<PanelRuleKind, string> = {
+  keyword: '关键词',
+  regex: '正则',
+  'link-domain': '域名',
+  'sender-name': '发送者名',
+  'custom-emoji': '表情计数',
+}
+
+/**
+ * 规则动作档位 → 中文文案。与 ACTION_LABEL 分开：规则语境里 warn 写作「警示」，
+ * 避免与处置记录里既成事实的「警告」措辞互相牵扯（phase2b-spec §2）。
+ */
+export const RULE_ACTION_LABEL: Record<PanelDecisionAction, string> = {
+  pass: '放行',
+  warn: '警示',
+  delete: '删除',
+  mute: '禁言',
+  ban: '封禁',
 }
 
 const timeFormatter = new Intl.DateTimeFormat('zh-CN', {

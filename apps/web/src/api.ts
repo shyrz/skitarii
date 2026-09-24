@@ -2,11 +2,12 @@
  * 申诉接口与 owner 面板接口（/api/panel/*）的客户端。initData 是 Telegram 签发的身份凭据：
  * GET 没有请求体，放在 query；POST 放在 body。后端两种携带方式都认。
  *
- * 错误分五类，UI 按类决定显示哪一屏：
- * - NotFoundError：404，记录不存在（申诉/决策找不到，或不属于当前账号），不可重试；
+ * 错误分六类，UI 按类决定显示哪一屏：
+ * - NotFoundError：404，记录不存在（申诉/决策/群找不到，或不属于当前账号），不可重试；
  * - ConflictError：409，申诉已结案（重复提交或并发处理），调用方应重新拉取展示既有状态；
  * - AuthError：401，凭据缺失/验签不过/过期，提示重新从 Telegram 进入；
  * - ForbiddenError：403，已验签但非 owner，仅面板接口会返回；
+ * - InvalidRequestError：400，配置保存校验未通过，details 逐条指位（仅保存配置会返回）；
  * - 其余（网络失败、5xx、异常响应）：可重试。
  */
 
@@ -62,6 +63,17 @@ export class ForbiddenError extends Error {
   constructor() {
     super('仅管理员可用')
     this.name = 'ForbiddenError'
+  }
+}
+
+/** 400：配置保存校验未通过。details 逐条指出第几条规则的哪个字段，UI 原样列出。 */
+export class InvalidRequestError extends Error {
+  readonly details: string[]
+
+  constructor(details: string[]) {
+    super('配置校验未通过')
+    this.name = 'InvalidRequestError'
+    this.details = details
   }
 }
 
@@ -266,4 +278,70 @@ export async function resolvePanelAppeal(
   })
   if (!res.ok) throwForStatus(res)
   return (await res.json()) as PanelResolveResult
+}
+
+/* ---- 规则/阈值配置（phase2b-spec §1；保存后立即生效） ---- */
+
+export type PanelRuleKind = 'keyword' | 'regex' | 'link-domain' | 'sender-name' | 'custom-emoji'
+
+export interface PanelRuleDto {
+  /** 新增规则传空串，由服务端分配 `custom-<8位十六进制>`。 */
+  id: string
+  kind: PanelRuleKind
+  pattern: string
+  score: number
+  actionHint: PanelDecisionAction
+  enabled: boolean
+}
+
+export interface PanelConfigDto {
+  chatId: string
+  title: string
+  language: string
+  passThreshold: number
+  llmThreshold: number
+  muteDurationMinutes: number
+  rules: PanelRuleDto[]
+}
+
+/** PUT 请求体的 config：阈值与规则全量替换；chatId/title/language 由服务端保留，不在 body 里。 */
+export interface PanelConfigInput {
+  passThreshold: number
+  llmThreshold: number
+  muteDurationMinutes: number
+  rules: PanelRuleDto[]
+}
+
+export async function fetchPanelConfig(chatId: string, initData: string): Promise<PanelConfigDto> {
+  const res = await fetch(
+    `/api/panel/chats/${encodeURIComponent(chatId)}/config?${panelQuery(initData, {})}`,
+  )
+  if (!res.ok) throwForStatus(res)
+  return (await res.json()) as PanelConfigDto
+}
+
+export async function savePanelConfig(
+  chatId: string,
+  initData: string,
+  config: PanelConfigInput,
+): Promise<PanelConfigDto> {
+  const res = await fetch(`/api/panel/chats/${encodeURIComponent(chatId)}/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ initData, config }),
+  })
+  if (res.status === 400) {
+    // 只有 error 为 invalid_request 的 400 才是配置校验错误，details 逐条带到 UI；
+    // 其他 400（代理、网关等）按通用错误处理，不误分为校验失败。
+    const body = (await res.json().catch(() => ({}))) as { error?: unknown; details?: unknown }
+    if (body.error === 'invalid_request') {
+      const details = Array.isArray(body.details)
+        ? body.details.filter((d): d is string => typeof d === 'string')
+        : []
+      throw new InvalidRequestError(details)
+    }
+  }
+  if (!res.ok) throwForStatus(res)
+  const body = (await res.json()) as { config: PanelConfigDto }
+  return body.config
 }

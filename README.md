@@ -241,7 +241,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 
 ### 面板接口（owner 专属）
 
-跨群管理台（Mini App 面板视图）的数据面。所有 `/api/panel/*` 端点先验 initData，再要求 `userId === OWNER_USER_ID`；GET 的凭据在查询串，POST 的在 body。列表端点都在 SQL 侧完成过滤、排序与 limit，群标题与正文摘录批量取，不做 N+1 查询。
+跨群管理台（Mini App 面板视图）的数据面。所有 `/api/panel/*` 端点先验 initData，再要求 `userId === OWNER_USER_ID`；GET 的凭据在查询串，POST 与 PUT 的在 body。列表端点都在 SQL 侧完成过滤、排序与 limit，群标题与正文摘录批量取，不做 N+1 查询。
 
 鉴权失败的状态码对所有端点一致：
 
@@ -278,6 +278,47 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 ```
 
 序列升序且日期连续，缺失日补零。`days` 默认 30，clamp 到 [7, 90]。调度器每小时滚动日报，今天的数字可能滞后至多一小时。
+
+#### `GET /api/panel/chats/:chatId/config?initData=...`
+
+```json
+{
+  "chatId": "-1001234567890",
+  "title": "测试群",
+  "language": "zh",
+  "passThreshold": 0.3,
+  "llmThreshold": 0.8,
+  "muteDurationMinutes": 60,
+  "rules": [
+    { "id": "default-ad-wechat", "kind": "keyword", "pattern": "加微信", "score": 0.4, "actionHint": "delete", "enabled": true }
+  ]
+}
+```
+
+响应就是 `ChatConfig` 本体。`language` 目前只读（切换不在本批范围）。未知群 `404 {"error":"chat_not_found"}`。
+
+#### `PUT /api/panel/chats/:chatId/config`
+
+```json
+{
+  "initData": "<Telegram.WebApp.initData>",
+  "config": {
+    "passThreshold": 0.3,
+    "llmThreshold": 0.8,
+    "muteDurationMinutes": 60,
+    "rules": [{ "id": "default-ad-wechat", "kind": "keyword", "pattern": "加微信", "score": 0.4, "actionHint": "delete", "enabled": true }]
+  }
+}
+```
+
+全量替换规则与阈值，保留 `title` / `language`；保存后管线立即读到新配置。`rules` 里的 `id` 可省略或为空串，服务端分配 `custom-<8位十六进制>` 并随响应返回。
+
+响应包装：GET 直接返回配置本体，PUT 把同一形状包在 `config` 键下，前端解析时不要混用。判定顺序是结构 → 鉴权 → 群存在 → 语义校验：未知群即使配置非法也先返回 `404 chat_not_found`。`details` 最多 50 条，超出时截断并以 `…等 N 条其他错误` 汇总。
+
+- `200 {"config":{...}}`：与 GET 同形（注意外层包了 `config` 键），含服务端分配后的 id
+- `400 {"error":"invalid_request","details":[...]}`：逐条指出第几条规则的哪个字段。校验口径：`0 ≤ passThreshold ≤ llmThreshold ≤ 1`；`muteDurationMinutes` 为 1..43200 的整数；规则至多 100 条、id 不得重复；`kind` 取 `keyword | regex | link-domain | sender-name | custom-emoji`；`pattern` 非空（纯空白同样拒绝），`regex` / `sender-name` 需能按 `u` 标志编译，`custom-emoji` 需为十进制计数；`score ∈ [0,1]`；`actionHint` 取五个档位；`enabled` 为布尔
+- `401 {"error":"init_data_invalid"}` / `403 {"error":"forbidden"}`
+- `404 {"error":"chat_not_found"}`：群未登记（保存不会隐式创建群配置）
 
 #### `GET /api/panel/decisions?initData=&chatId=&action=&limit=50&before=ISO&beforeId=uuid`
 
@@ -367,6 +408,8 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **双阈值决定要不要花钱。** `passThreshold` 以下直接放行；`llmThreshold` 以上直接按命中的规则处置；只有落在中间的样本才调用 LLM。灰色地带没拿到复核结论时返回 `warn`，不执行破坏性动作。
 
+**规则与阈值可在面板里编辑。** 规则集、双阈值与禁言时长在 Mini App 面板的「规则」页签编辑，保存后立即生效（管线每条消息读配置）。保存边界会挡住坏数据（阈值乱序、坏正则、非法枚举、超量规则等）并逐条指出第几条规则的哪个字段，与 README 既有口径「规则编译失败在保存接口暴露」一致。
+
 **重复投递不重复处置。** 事件 id 由 `(chatId, messageId)` 派生（编辑消息附加 `edit:${edit_date}:${内容哈希前 16 位}` 判别符：同一秒内不同内容的编辑各自成事件，编辑回退到早前内容时复用当时的事件 id、不再重审），决策 id 由事件 id 派生，落库用 `on conflict do nothing`；执行侧再叠一层 `eventId + action` 的进程内幂等闸门与 `moderation_decisions.executed` 回填。Telegram 重投递同一 update 的效果是「什么都不再发生」。
 
 **不变量尽量进 DDL。** 阈值必须有序、`mute` 才带解禁时刻、置信度与分数限定在 0..1、结案状态与结案时间/结案人必须一致、一条处置至多一条申诉，这些都写成 CHECK 与唯一索引，绕过应用的写入同样会被拒绝。
@@ -380,7 +423,7 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 - 白名单与误伤样本的 few-shot 回写推迟到 Phase 2（申诉结案后的样本沉淀先靠 `appeals` 表与 `signals`）。决策表里已经存下了判定依据，不需要新表。
 - 频道消息（`channel_post`）与 linked discussion 评论、订阅门禁（`subscriptions` 表已就位）按计划留到 Phase 3。
 - 日聚合按 UTC 切日：`ChatConfig` 里没有时区字段，跨时区部署的看板边界会有一天偏差，比值类指标不受影响。
-- 规则集的修改目前只能改数据库或走 `ChatRepo.upsert`，Mini App 的配置面板在 Phase 2。
+- 规则集、阈值与禁言时长可以在面板里编辑，也可以直接改数据库或走 `ChatRepo.upsert`：两处没有版本协调（单 owner 最后写入胜），并发编辑面板与数据库不会互相提示。
 - 单进程假设：幂等闸门与令牌桶都在进程内，多实例部署前需要把它们挪到共享存储。
 - 累犯计数在并发处理下的阈值竞态：`countPriorViolations` 读的是已落库的决策数，同一用户两条消息被并发处理时，两边都可能数到「还差一条」而不加重档位（漏加重）。窗口内累计三次的判定因此是尽力而为，不保证严格；要严格需要给 `(chatId, userId)` 加锁或改成数据库侧的原子计数。
 - 时间源没有贯穿 `decide`：`mute` 的解禁时刻由 `packages/core` 的 `decide` 直接读 `Date.now()` 算出，不经过管线注入的 `now`。正常运行时两者是同一个挂钟，影响只在测试与本地跑批：要用自定义时间源断言 `mute.until` 时得先冻结 `Date`。

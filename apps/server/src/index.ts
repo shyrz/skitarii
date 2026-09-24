@@ -9,9 +9,11 @@ import { createAppeal, getAppeal, type AppealApiDeps } from './api.js'
 import { parseServerEnv } from './env.js'
 import {
   getPanelAppeals,
+  getPanelChatConfig,
   getPanelDecisions,
   getPanelOverview,
   getPanelSeries,
+  putPanelChatConfig,
   resolvePanelAppeal,
   type PanelApiDeps,
 } from './panel.js'
@@ -85,8 +87,11 @@ const WEB_DIST = fileURLToPath(new URL('../../web/dist/', import.meta.url))
 /** 静态挂载前缀。产物用相对基址，改前缀不需要重新构建前端。 */
 const STATIC_PREFIX = '/app/'
 
-/** 请求体上限（字节）。这两个端点的 body 只有 initData、decisionId 与一小段理由。 */
-const MAX_BODY_BYTES = 16 * 1024
+/**
+ * 请求体上限（字节）。config 全量提交（至多 100 条规则加阈值）可能超过旧的 16KB，统一放宽到 64KB；
+ * 其余端点的 body 仍只有 initData、id 与短文本，行为不变。
+ */
+const MAX_BODY_BYTES = 64 * 1024
 
 /** 路由处理器。返回值被忽略；响应由处理器自己写，便于流式与静态文件复用同一签名。 */
 type Handler = (request: IncomingMessage, response: ServerResponse) => Promise<void> | void
@@ -98,7 +103,7 @@ type Handler = (request: IncomingMessage, response: ServerResponse) => Promise<v
 type RouteTarget = { kind: 'exact'; path: string } | { kind: 'prefix'; path: string }
 
 interface Route {
-  method: 'GET' | 'POST'
+  method: 'GET' | 'POST' | 'PUT'
   target: RouteTarget
   handler: Handler
 }
@@ -124,7 +129,9 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', target: { kind: 'exact', path: '/api/panel/overview' }, handler: handlePanelOverview },
   { method: 'GET', target: { kind: 'exact', path: '/api/panel/decisions' }, handler: handlePanelDecisions },
   { method: 'GET', target: { kind: 'exact', path: '/api/panel/appeals' }, handler: handlePanelAppeals },
-  { method: 'GET', target: { kind: 'prefix', path: '/api/panel/chats/' }, handler: handlePanelSeries },
+  // `/api/panel/chats/` 前缀下按尾段分发：GET 走 `/series` 或 `/config`，PUT 只走 `/config`。
+  { method: 'GET', target: { kind: 'prefix', path: '/api/panel/chats/' }, handler: handlePanelChats },
+  { method: 'PUT', target: { kind: 'prefix', path: '/api/panel/chats/' }, handler: handlePanelConfigUpdate },
   { method: 'POST', target: { kind: 'prefix', path: '/api/panel/appeals/' }, handler: handlePanelResolve },
   { method: 'GET', target: { kind: 'exact', path: '/' }, handler: handleStaticAlias },
   { method: 'GET', target: { kind: 'exact', path: '/app' }, handler: handleStaticAlias },
@@ -165,20 +172,48 @@ async function handlePanelOverview(request: IncomingMessage, response: ServerRes
   respondJson(response, result.status, result.body)
 }
 
-/** 面板报表序列：`GET /api/panel/chats/:chatId/series?days=&initData=`。 */
-async function handlePanelSeries(request: IncomingMessage, response: ServerResponse): Promise<void> {
+/**
+ * 面板群维度 GET：`/api/panel/chats/:chatId/series`（报表序列）与 `/api/panel/chats/:chatId/config`（配置）。
+ *
+ * 两条路径共用 `/api/panel/chats/` 前缀，按尾段分发；形状不符的路径返回 `not found`。
+ */
+async function handlePanelChats(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? '/', 'http://localhost')
   const chatId = tailSegment(url.pathname, '/api/panel/chats/', '/series')
+  if (chatId !== null) {
+    const result = await getPanelSeries(panelApi, {
+      chatId,
+      days: url.searchParams.get('days'),
+      initData: url.searchParams.get('initData'),
+    })
+    respondJson(response, result.status, result.body)
+    return
+  }
+
+  const configChatId = tailSegment(url.pathname, '/api/panel/chats/', '/config')
+  if (configChatId !== null) {
+    const result = await getPanelChatConfig(panelApi, {
+      chatId: configChatId,
+      initData: url.searchParams.get('initData'),
+    })
+    respondJson(response, result.status, result.body)
+    return
+  }
+
+  respondJson(response, 404, { error: 'not found' })
+}
+
+/** 面板保存群配置：`PUT /api/panel/chats/:chatId/config`，body `{ initData, config }`。 */
+async function handlePanelConfigUpdate(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const chatId = tailSegment(url.pathname, '/api/panel/chats/', '/config')
   if (chatId === null) {
     respondJson(response, 404, { error: 'not found' })
     return
   }
 
-  const result = await getPanelSeries(panelApi, {
-    chatId,
-    days: url.searchParams.get('days'),
-    initData: url.searchParams.get('initData'),
-  })
+  const body = await readJsonBody(request)
+  const result = await putPanelChatConfig(panelApi, { chatId, body })
   respondJson(response, result.status, result.body)
 }
 
@@ -309,7 +344,8 @@ function respondJson(response: ServerResponse, status: number, body: unknown): v
  * @param response 出站响应
  */
 async function dispatch(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const method = request.method === 'POST' ? 'POST' : 'GET'
+  // 只认路由表里出现的方法；其余（HEAD、DELETE 等）一律按 GET 参与匹配，匹配不上就是 404。
+  const method = request.method === 'POST' ? 'POST' : request.method === 'PUT' ? 'PUT' : 'GET'
   const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
   const route = ROUTES.find(
     (candidate) => candidate.method === method && PATH_MATCHERS[candidate.target.kind](candidate.target.path, pathname),

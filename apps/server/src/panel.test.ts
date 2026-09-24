@@ -5,9 +5,11 @@ import { createHmac } from 'node:crypto'
 import { describe, expect, test } from 'vitest'
 import {
   getPanelAppeals,
+  getPanelChatConfig,
   getPanelDecisions,
   getPanelOverview,
   getPanelSeries,
+  putPanelChatConfig,
   resolvePanelAppeal,
   type PanelApiDeps,
 } from './panel.js'
@@ -157,6 +159,17 @@ function appealFixture(id: string, decisionId: string, createdAt: Date, override
   }
 }
 
+/** PUT 的合法 config 基线：一条关键词规则。 */
+function configPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    passThreshold: 0.3,
+    llmThreshold: 0.8,
+    muteDurationMinutes: 60,
+    rules: [{ id: 'rule-1', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true }],
+    ...overrides,
+  }
+}
+
 const ownerInitData = (): string => signInitData(OWNER_ID)
 
 describe('面板鉴权', () => {
@@ -168,6 +181,7 @@ describe('面板鉴权', () => {
       getPanelSeries(deps, { chatId, days: null, initData: null }),
       getPanelDecisions(deps, { initData: null, chatId: null, action: null, limit: null, before: null, beforeId: null }),
       getPanelAppeals(deps, { initData: null, state: null, limit: null }),
+      getPanelChatConfig(deps, { chatId, initData: null }),
     ])
 
     for (const response of responses) {
@@ -183,6 +197,16 @@ describe('面板鉴权', () => {
       body: { error: 'init_data_invalid' },
     })
     expect(await getPanelOverview(deps, { initData: signInitData(USER_ID) })).toEqual({
+      status: 403,
+      body: { error: 'forbidden' },
+    })
+
+    // 配置端点走同一套鉴权：PUT 体里带非 owner 的 initData 也是 403，且不落库。
+    const config = configPayload()
+    expect(
+      await putPanelChatConfig(deps, { chatId, body: { initData: signInitData(USER_ID), config } }),
+    ).toEqual({ status: 403, body: { error: 'forbidden' } })
+    expect(await getPanelChatConfig(deps, { chatId, initData: signInitData(USER_ID) })).toEqual({
       status: 403,
       body: { error: 'forbidden' },
     })
@@ -625,5 +649,206 @@ describe('面板结案', () => {
     const result = await resolvePanelAppeal(deps, { appealId, body: { initData: ownerInitData() } })
     expect(result.status).toBe(400)
     expect(result.body).toMatchObject({ error: 'invalid_request' })
+  })
+})
+
+describe('面板规则配置', () => {
+  test('读取：返回与 ChatConfig 同形的字段', async () => {
+    const { deps, store } = setup()
+    const seeded = chatConfigFor(chatId, '甲群')
+    await store.repos.chats.upsert(seeded)
+
+    const result = await getPanelChatConfig(deps, { chatId, initData: ownerInitData() })
+
+    expect(result).toEqual({ status: 200, body: seeded })
+  })
+
+  test('读取：未登记的群 404', async () => {
+    const { deps } = setup()
+
+    expect(await getPanelChatConfig(deps, { chatId, initData: ownerInitData() })).toEqual({
+      status: 404,
+      body: { error: 'chat_not_found' },
+    })
+  })
+
+  test('保存：全量替换规则与阈值，保留 title/language，缺省 id 由服务端分配', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({
+          passThreshold: 0.25,
+          llmThreshold: 0.7,
+          muteDurationMinutes: 120,
+          rules: [
+            { id: 'keep-me', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
+            { id: '', kind: 'regex', pattern: String.raw`t\.me/\+[a-z0-9_-]{16}`, score: 0.4, actionHint: 'delete', enabled: true },
+            { kind: 'custom-emoji', pattern: '6', score: 0.4, actionHint: 'delete', enabled: false },
+          ],
+        }),
+      },
+    })
+
+    expect(result.status).toBe(200)
+    const config = (result.body as { config: ChatConfig }).config
+    expect(config).toMatchObject({
+      chatId,
+      title: '甲群',
+      language: 'zh',
+      passThreshold: 0.25,
+      llmThreshold: 0.7,
+      muteDurationMinutes: 120,
+    })
+    // 全量相等：显式 id 保留，缺省与空串各分配一个 custom id，其余字段一项不漏。
+    expect(config.rules).toEqual([
+      { id: 'keep-me', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
+      {
+        id: expect.stringMatching(/^custom-[0-9a-f]{8}$/),
+        kind: 'regex',
+        pattern: String.raw`t\.me/\+[a-z0-9_-]{16}`,
+        score: 0.4,
+        actionHint: 'delete',
+        enabled: true,
+      },
+      {
+        id: expect.stringMatching(/^custom-[0-9a-f]{8}$/),
+        kind: 'custom-emoji',
+        pattern: '6',
+        score: 0.4,
+        actionHint: 'delete',
+        enabled: false,
+      },
+    ])
+    expect(config.rules[1]?.id).not.toBe(config.rules[2]?.id)
+    // 落库的就是返回的那份：管线每条消息读它，「保存后立即生效」由此成立。
+    expect(await store.repos.chats.findByChatId(chatId)).toEqual(config)
+  })
+
+  test('保存：未知群 404，且不隐式创建', async () => {
+    const { deps, store } = setup()
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload() },
+    })
+
+    expect(result).toEqual({ status: 404, body: { error: 'chat_not_found' } })
+    expect(await store.repos.chats.findByChatId(chatId)).toBeNull()
+  })
+
+  test('保存：未知群即使配置明显非法也先 404（结构 → 鉴权 → 群存在 → 语义）', async () => {
+    const { deps, store } = setup()
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload({ passThreshold: 0.9, llmThreshold: 0.1 }) },
+    })
+
+    expect(result).toEqual({ status: 404, body: { error: 'chat_not_found' } })
+    expect(await store.repos.chats.findByChatId(chatId)).toBeNull()
+  })
+
+  /** 校验用例的规则基线；覆盖某一字段时用 `{ ...ruleBase, ... }`。 */
+  const ruleBase = { id: 'rule-1', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true }
+
+  test('阈值越界：400 的 detail 与契约文案逐字一致', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload({ passThreshold: -0.1 }) },
+    })
+
+    expect(result).toEqual({
+      status: 400,
+      body: { error: 'invalid_request', details: ['阈值：需要满足 0 ≤ passThreshold ≤ llmThreshold ≤ 1'] },
+    })
+  })
+
+  test.each<[string, Record<string, unknown>, string]>([
+    ['阈值乱序', { passThreshold: 0.9, llmThreshold: 0.3 }, '阈值：需要满足'],
+    ['时长非整数', { muteDurationMinutes: 1.5 }, 'muteDurationMinutes：需要 1..43200'],
+    ['时长超上限', { muteDurationMinutes: 43_201 }, 'muteDurationMinutes：需要 1..43200'],
+    [
+      '规则超过 100 条',
+      { rules: Array.from({ length: 101 }, (_, index) => ({ ...ruleBase, id: `r-${index}` })) },
+      'rules：至多 100 条，收到 101 条',
+    ],
+    ['规则 id 重复', { rules: [ruleBase, { ...ruleBase }] }, '第 2 条规则 id 重复'],
+    ['kind 非法', { rules: [{ ...ruleBase, kind: 'fuzzy' }] }, '第 1 条规则 kind 非法'],
+    ['正则无法编译', { rules: [{ ...ruleBase, kind: 'regex', pattern: '(' }] }, '第 1 条规则正则无法编译'],
+    ['sender-name 正则无法编译', { rules: [{ ...ruleBase, kind: 'sender-name', pattern: '(' }] }, '第 1 条规则正则无法编译'],
+    [
+      'custom-emoji pattern 非计数',
+      { rules: [{ ...ruleBase, kind: 'custom-emoji', pattern: 'abc' }] },
+      '第 1 条规则 custom-emoji',
+    ],
+    ['pattern 为空', { rules: [{ ...ruleBase, pattern: '' }] }, '第 1 条规则 pattern 不能为空'],
+    ['pattern 纯空白', { rules: [{ ...ruleBase, pattern: '   ' }] }, '第 1 条规则 pattern 不能为空'],
+    ['score 越界', { rules: [{ ...ruleBase, score: 1.5 }] }, '第 1 条规则 score 需要 0..1'],
+    ['actionHint 非法', { rules: [{ ...ruleBase, actionHint: 'banana' }] }, '第 1 条规则 actionHint 非法'],
+  ])('校验失败：%s → 400 且 details 指位', async (_name, overrides, expected) => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload(overrides) },
+    })
+
+    expect(result.status).toBe(400)
+    expect((result.body as { details: string[] }).details.join('\n')).toContain(expected)
+    // 校验失败不落库：群配置还是原样。
+    expect((await store.repos.chats.findByChatId(chatId))?.passThreshold).toBe(0.3)
+  })
+
+  test('校验错误超过 50 条：截断并追加汇总行', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+    // 60 条坏规则 × 3 个字段错误 = 180 条，足以触发截断。
+    const badRules = Array.from({ length: 60 }, (_, index) => ({
+      id: `bad-${index}`,
+      kind: 'fuzzy',
+      pattern: 'x',
+      score: 1.5,
+      actionHint: 'banana',
+      enabled: true,
+    }))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload({ rules: badRules }) },
+    })
+
+    expect(result.status).toBe(400)
+    const details = (result.body as { details: string[] }).details
+    // 保留前 50 条，最后一行是汇总（50 + 1）。
+    expect(details).toHaveLength(51)
+    expect(details[0]).toBe('第 1 条规则 kind 非法：fuzzy')
+    expect(details[49]).toBe('第 17 条规则 score 需要 0..1：1.5')
+    expect(details.at(-1)).toBe('…等 130 条其他错误')
+  })
+
+  test('保存：请求体结构不对 400（缺 config / rules 不是数组）', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const missing = await putPanelChatConfig(deps, { chatId, body: { initData: ownerInitData() } })
+    expect(missing.status).toBe(400)
+    expect(missing.body).toMatchObject({ error: 'invalid_request' })
+    // 结构错误同样给出字段路径，前端能指到具体位置。
+    expect((missing.body as { details: string[] }).details.some((detail) => detail.startsWith('config:'))).toBe(true)
+
+    const wrongType = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload({ rules: '不是数组' }) },
+    })
+    expect(wrongType.status).toBe(400)
+    expect((wrongType.body as { details: string[] }).details.some((detail) => detail.startsWith('config.rules'))).toBe(true)
   })
 })

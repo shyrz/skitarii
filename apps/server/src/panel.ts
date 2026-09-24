@@ -1,9 +1,13 @@
+import { randomBytes } from 'node:crypto'
 import {
   asChatId,
   type AppealState,
+  type ChatConfig,
   type DailyAggregate,
   type ModerationDecision,
+  type Rule,
   type RuleAction,
+  type RuleKind,
   type Signal,
   type UserId,
 } from '@skitarii/core'
@@ -14,7 +18,7 @@ import type { ApiResponse } from './api.js'
 import { verifyInitData } from './init-data.js'
 
 /**
- * Mini App 面板 API（owner 专属）：跨群概览、报表序列、处置队列、申诉队列与网页内结案。
+ * Mini App 面板 API（owner 专属）：跨群概览、报表序列、处置队列、申诉队列、网页内结案与群配置编辑。
  *
  * 与 `api.ts` 同一套写法：端点逻辑是返回 `{ status, body }` 的纯函数，`index.ts` 只做路由与
  * HTTP 翻译，这样鉴权、过滤、分页、状态码映射都能脱离服务器做行为测试。
@@ -57,6 +61,21 @@ const ACTION_FILTERS: ReadonlySet<string> = new Set(['pass', 'warn', 'delete', '
 
 /** 申诉状态过滤取值。 */
 const APPEAL_STATES: ReadonlySet<string> = new Set(['open', 'upheld', 'overturned'])
+
+/** 保存配置时接受的规则条数上限：再多就该换配置方式，而不是继续手改面板。 */
+const MAX_RULES = 100
+
+/** 禁言时长上限（分钟）：30 天。防误输入，也避免成员被无限期留在禁言里。 */
+const MAX_MUTE_DURATION_MINUTES = 43_200
+
+/** 合法规则种类，与 `RuleKind` 一致。保存边界必须与引擎的认识一致，否则写进去的规则不会命中。 */
+const RULE_KINDS: ReadonlySet<string> = new Set(['keyword', 'regex', 'link-domain', 'sender-name', 'custom-emoji'])
+
+/** 合法处置档位，与 `RuleAction` 一致。 */
+const RULE_ACTIONS: ReadonlySet<string> = new Set(['pass', 'warn', 'delete', 'mute', 'ban'])
+
+/** `custom-emoji` 的 pattern 形态：十进制最小计数。 */
+const CUSTOM_EMOJI_PATTERN = /^\d+$/u
 
 /** 面板聚合计数。与 `DailyAggregate` 去掉主键字段后一一对应。 */
 type DailyCounts = Omit<DailyAggregate, 'chatId' | 'date'>
@@ -324,6 +343,220 @@ export async function resolvePanelAppeal(
 }
 
 /**
+ * 读取某群的审核配置（面板「规则」页签的初始数据）。
+ *
+ * 响应就是 `ChatConfig` 本体（字段与 `packages/core` 一一对应）；PUT 的响应按契约把同一形状包在
+ * `config` 键下，两处不要混淆。
+ *
+ * @param deps 面板依赖。
+ * @param query `chatId` 来自路径，`initData` 来自查询串。
+ * @returns 200 配置；401 / 403 鉴权失败；404 群未登记。
+ */
+export async function getPanelChatConfig(
+  deps: PanelApiDeps,
+  query: { chatId: string; initData: string | null },
+): Promise<ApiResponse> {
+  const auth = verifyOwner(deps, query.initData)
+  if (!auth.ok) return auth.response
+
+  const config = await deps.repos.chats.findByChatId(asChatId(query.chatId))
+  if (config === null) return { status: 404, body: { error: 'chat_not_found' } }
+
+  return { status: 200, body: config }
+}
+
+/** PUT 请求体的结构校验。语义校验（阈值、时长、逐条规则）在 {@link validateConfigData} 里给可读 details。 */
+const chatConfigBodySchema = z.object({
+  initData: z.string().min(1),
+  config: z.object({
+    passThreshold: z.number(),
+    llmThreshold: z.number(),
+    muteDurationMinutes: z.number(),
+    rules: z.array(
+      z.object({
+        id: z.string().optional(),
+        kind: z.string(),
+        pattern: z.string(),
+        score: z.number(),
+        actionHint: z.string(),
+        enabled: z.boolean(),
+      }),
+    ),
+  }),
+})
+
+/**
+ * 保存某群的审核配置：全量替换规则与阈值，保留 `title` / `language`。
+ *
+ * 为什么全量替换：面板持有整份配置，逐条 diff 需要版本号与并发协调；单 owner 场景下
+ * 「最后写入胜」更简单，也让「保存后立即生效」的语义没有中间态（管线每条消息读配置）。
+ *
+ * 校验分两层：结构（类型、必需字段）由 zod 挡；语义与规则内容由 {@link validateConfigData}
+ * 逐条给 details（指出第几条规则的哪个字段），与 README「规则编译失败在保存接口暴露」的口径一致。
+ *
+ * @param deps 面板依赖。
+ * @param input `chatId` 来自路径，`body` 为未解析的请求体。
+ * @returns 200 保存后的配置（含服务端分配的规则 id）；400 校验失败；401 / 403 鉴权失败；404 群未登记。
+ */
+export async function putPanelChatConfig(
+  deps: PanelApiDeps,
+  input: { chatId: string; body: unknown },
+): Promise<ApiResponse> {
+  const parsed = chatConfigBodySchema.safeParse(input.body)
+  if (!parsed.success) {
+    return invalidRequest(parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`))
+  }
+
+  const auth = verifyOwner(deps, parsed.data.initData)
+  if (!auth.ok) return auth.response
+
+  // 契约顺序：结构 → 鉴权 → 群存在 → 语义。未知群优先于语义校验（bad config 的未知群也是 404），
+  // 也不会在校验上白花时间。
+  const existing = await deps.repos.chats.findByChatId(asChatId(input.chatId))
+  if (existing === null) return { status: 404, body: { error: 'chat_not_found' } }
+
+  const validation = validateConfigData(parsed.data.config)
+  if (validation.details.length > 0) return invalidRequest(validation.details)
+
+  // 保留面板不管理的字段：群标题与语言（语言切换不在本批范围内）。
+  const next: ChatConfig = {
+    ...existing,
+    rules: validation.rules,
+    passThreshold: parsed.data.config.passThreshold,
+    llmThreshold: parsed.data.config.llmThreshold,
+    muteDurationMinutes: parsed.data.config.muteDurationMinutes,
+  }
+  await deps.repos.chats.upsert(next)
+
+  return { status: 200, body: { config: next } }
+}
+
+/** 语义校验的输入形状（zod 解析后的 config 部分）。 */
+interface ConfigData {
+  passThreshold: number
+  llmThreshold: number
+  muteDurationMinutes: number
+  rules: Array<{
+    id?: string | undefined
+    kind: string
+    pattern: string
+    score: number
+    actionHint: string
+    enabled: boolean
+  }>
+}
+
+/** 语义校验结果：`details` 非空即拒绝；成功时 `rules` 是补齐 id 后的规则集。 */
+interface ConfigValidation {
+  details: string[]
+  rules: Rule[]
+}
+
+/**
+ * 逐项校验配置数据，错误按「第 N 条规则的哪个字段」归位。
+ *
+ * 校验口径与引擎一致而不是更宽：`regex` / `sender-name` 必须能按 `u` 标志编译（引擎就这么编译），
+ * `custom-emoji` 的 pattern 是十进制最小计数。不在保存边界挡住，坏规则写进去只会在运行时静默失效。
+ *
+ * @param data 解析后的 config。
+ * @returns 错误清单（空即通过）与补齐 id 的规则集（仅通过时有意义）。
+ */
+function validateConfigData(data: ConfigData): ConfigValidation {
+  const details: string[] = []
+  const { passThreshold, llmThreshold, muteDurationMinutes, rules } = data
+
+  if (!(Number.isFinite(passThreshold) && Number.isFinite(llmThreshold) && 0 <= passThreshold && passThreshold <= llmThreshold && llmThreshold <= 1)) {
+    details.push('阈值：需要满足 0 ≤ passThreshold ≤ llmThreshold ≤ 1')
+  }
+  if (!Number.isInteger(muteDurationMinutes) || muteDurationMinutes < 1 || muteDurationMinutes > MAX_MUTE_DURATION_MINUTES) {
+    details.push(`muteDurationMinutes：需要 1..${MAX_MUTE_DURATION_MINUTES} 的整数（分钟）`)
+  }
+  if (rules.length > MAX_RULES) details.push(`rules：至多 ${MAX_RULES} 条，收到 ${rules.length} 条`)
+
+  // 第一遍：校验 + 收集显式 id（重复只在显式 id 之间判定；缺省 id 在通过后才分配）。
+  const usedIds = new Set<string>()
+  for (const [index, rule] of rules.entries()) {
+    const position = index + 1
+
+    if (!RULE_KINDS.has(rule.kind)) details.push(`第 ${position} 条规则 kind 非法：${rule.kind}`)
+
+    if (rule.pattern.trim().length === 0) {
+      details.push(`第 ${position} 条规则 pattern 不能为空`)
+    } else if (rule.kind === 'regex' || rule.kind === 'sender-name') {
+      if (!compilesUnicodeRegex(rule.pattern)) details.push(`第 ${position} 条规则正则无法编译：${rule.pattern}`)
+    } else if (rule.kind === 'custom-emoji' && !CUSTOM_EMOJI_PATTERN.test(rule.pattern)) {
+      details.push(`第 ${position} 条规则 custom-emoji 的 pattern 需为十进制最小计数：${rule.pattern}`)
+    }
+
+    if (!(Number.isFinite(rule.score) && rule.score >= 0 && rule.score <= 1)) {
+      details.push(`第 ${position} 条规则 score 需要 0..1：${rule.score}`)
+    }
+    if (!RULE_ACTIONS.has(rule.actionHint)) {
+      details.push(`第 ${position} 条规则 actionHint 非法：${rule.actionHint}`)
+    }
+
+    const id = rule.id?.trim() ?? ''
+    if (id.length > 0) {
+      if (usedIds.has(id)) details.push(`第 ${position} 条规则 id 重复：${id}`)
+      usedIds.add(id)
+    }
+  }
+
+  if (details.length > 0) return { details, rules: [] }
+
+  // 第二遍：分配缺省 id 并落成领域类型（kind/actionHint 已在上面的集合里校验过）。
+  const assigned = rules.map((rule) => {
+    const id = rule.id?.trim() ?? ''
+    return {
+      id: id.length > 0 ? id : allocateCustomRuleId(usedIds),
+      kind: rule.kind as RuleKind,
+      pattern: rule.pattern,
+      score: rule.score,
+      actionHint: rule.actionHint as RuleAction,
+      enabled: rule.enabled,
+    }
+  })
+
+  return { details, rules: assigned }
+}
+
+/** 按引擎的方式编译规则正则（`u` 标志）。坏正则在引擎里是静默不命中，保存边界必须显式拒绝。 */
+function compilesUnicodeRegex(pattern: string): boolean {
+  try {
+    new RegExp(pattern, 'u')
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 规则 id 单级熵内的分配重试上限；理论上不可达，防御的是随机源异常。 */
+const ALLOCATE_ID_MAX_ATTEMPTS = 100
+
+/**
+ * 分配 `custom-<8位十六进制>` 形态的规则 id，并登记进已用集合。
+ *
+ * 先按 8 位十六进制（4 字节）重试最多 {@link ALLOCATE_ID_MAX_ATTEMPTS} 次；单次提交至多 100 条规则，
+ * 正常随机源下连续撞满 100 次理论上不可达，真发生说明随机源异常，此时把熵扩到 16 位（8 字节）再试
+ * 同样次数。两级都撞满才抛错——那是坏掉的随机源才会走到的路径，调用方按 500 处理。
+ *
+ * @param used 本次提交里已出现（或已分配）的 id 集合（会被就地更新）。
+ * @returns 未占用过的 id。
+ */
+function allocateCustomRuleId(used: Set<string>): string {
+  for (const bytes of [4, 8] as const) {
+    for (let attempt = 0; attempt < ALLOCATE_ID_MAX_ATTEMPTS; attempt += 1) {
+      const candidate = `custom-${randomBytes(bytes).toString('hex')}`
+      if (!used.has(candidate)) {
+        used.add(candidate)
+        return candidate
+      }
+    }
+  }
+  throw new Error('规则 id 分配失败：随机源连续给出重复值')
+}
+
+/**
  * 验签并判定 owner。
  *
  * 401 与 403 分开：401 的前端动作是「重新从 Telegram 打开」（凭据无效/过期），
@@ -430,9 +663,21 @@ function clampSeriesDays(raw: string | null): number {
   return Math.min(MAX_SERIES_DAYS, Math.max(MIN_SERIES_DAYS, parsed))
 }
 
-/** 400 响应。字段错误清单与 `api.ts` 的 `invalid_request` 同形。 */
+/** 400 响应里 `details` 的条数上限；超出时截断并追加一行汇总，避免把整份请求体回显给前端。 */
+const MAX_DETAILS = 50
+
+/** 400 响应。字段错误清单与 `api.ts` 的 `invalid_request` 同形，超过上限时截断并汇总。 */
 function invalidRequest(details: string[]): ApiResponse {
-  return { status: 400, body: { error: 'invalid_request', details } }
+  if (details.length <= MAX_DETAILS) return { status: 400, body: { error: 'invalid_request', details } }
+
+  const kept = details.slice(0, MAX_DETAILS)
+  return {
+    status: 400,
+    body: {
+      error: 'invalid_request',
+      details: [...kept, `…等 ${details.length - MAX_DETAILS} 条其他错误`],
+    },
+  }
 }
 
 /** UTC 切日的 `YYYY-MM-DD`。 */

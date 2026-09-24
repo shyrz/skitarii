@@ -3,13 +3,16 @@ import {
   AuthError,
   ConflictError,
   ForbiddenError,
+  InvalidRequestError,
   NotFoundError,
   fetchAppeal,
   fetchPanelAppeals,
+  fetchPanelConfig,
   fetchPanelDecisions,
   fetchPanelOverview,
   fetchPanelSeries,
   resolvePanelAppeal,
+  savePanelConfig,
   submitAppeal,
 } from './api.js'
 
@@ -239,5 +242,110 @@ describe('面板接口客户端', () => {
     stubFetch(500)
 
     await expect(fetchPanelDecisions('i')).rejects.toThrow('HTTP 500')
+  })
+})
+
+describe('规则配置客户端', () => {
+  const CONFIG = {
+    chatId: '-1001',
+    title: '测试群',
+    language: 'zh',
+    passThreshold: 0.3,
+    llmThreshold: 0.8,
+    muteDurationMinutes: 60,
+    rules: [
+      { id: 'custom-a1b2c3d4', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
+    ],
+  }
+
+  test('GET：chatId 进路径，解析阈值与规则表', async () => {
+    const spy = vi.fn(async () => new Response(JSON.stringify(CONFIG), { status: 200 }))
+    vi.stubGlobal('fetch', spy)
+
+    const config = await fetchPanelConfig('-1001', 'init')
+
+    expect(String((spy.mock.calls[0] as unknown[])[0])).toBe('/api/panel/chats/-1001/config?initData=init')
+    expect(config.rules[0]?.actionHint).toBe('delete')
+    expect(config.muteDurationMinutes).toBe(60)
+  })
+
+  test('PUT：Content-Type 与 body 全字段，返回服务端分配 id 后的完整 config', async () => {
+    const spy = vi.fn(async () => new Response(JSON.stringify({ config: CONFIG }), { status: 200 }))
+    vi.stubGlobal('fetch', spy)
+
+    const input = {
+      passThreshold: 0.3,
+      llmThreshold: 0.8,
+      muteDurationMinutes: 60,
+      rules: [{ id: '', kind: 'keyword' as const, pattern: '加微信', score: 0.4, actionHint: 'delete' as const, enabled: true }],
+    }
+    const config = await savePanelConfig('-1001', 'init', input)
+
+    const [url, init] = spy.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/panel/chats/-1001/config')
+    expect(init.method).toBe('PUT')
+    expect(init.headers).toEqual({ 'Content-Type': 'application/json' })
+    // body 全字段：initData + 完整 config 结构（阈值、禁言时长、整条规则）
+    expect(JSON.parse(String(init.body))).toEqual({ initData: 'init', config: input })
+    // 响应解析含 chatId/title/language，且空串 id 已被分配为正式 id
+    expect(config.chatId).toBe('-1001')
+    expect(config.title).toBe('测试群')
+    expect(config.language).toBe('zh')
+    expect(config.rules[0]?.id).toBe('custom-a1b2c3d4')
+  })
+
+  test('400 且 error=invalid_request 归为 InvalidRequestError，details 完整数组相等（顺序保留）', async () => {
+    const details = ['第 2 条规则正则无法编译', 'llmThreshold 不能小于 passThreshold', '第 2 条规则正则无法编译']
+    stubFetch(400, { error: 'invalid_request', details })
+
+    const error = await savePanelConfig('-1001', 'i', {
+      passThreshold: 0.9,
+      llmThreshold: 0.8,
+      muteDurationMinutes: 60,
+      rules: [],
+    }).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(InvalidRequestError)
+    expect((error as InvalidRequestError).details).toEqual(details)
+  })
+
+  test('400 但 error 不是 invalid_request（如代理产生）按通用错误处理', async () => {
+    stubFetch(400, { error: 'bad_request' })
+
+    await expect(
+      savePanelConfig('-1001', 'i', { passThreshold: 0.3, llmThreshold: 0.8, muteDurationMinutes: 60, rules: [] }),
+    ).rejects.toThrow('HTTP 400')
+  })
+
+  test('400 invalid_request 无 details 时回退为空数组', async () => {
+    stubFetch(400, { error: 'invalid_request' })
+
+    const error = await savePanelConfig('-1001', 'i', {
+      passThreshold: 0.3,
+      llmThreshold: 0.8,
+      muteDurationMinutes: 60,
+      rules: [],
+    }).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(InvalidRequestError)
+    expect((error as InvalidRequestError).details).toEqual([])
+  })
+
+  test('保存路径的错误归类：404 → NotFoundError，403 → ForbiddenError', async () => {
+    const input = { passThreshold: 0.3, llmThreshold: 0.8, muteDurationMinutes: 60, rules: [] }
+
+    stubFetch(404)
+    await expect(savePanelConfig('-9999', 'i', input)).rejects.toBeInstanceOf(NotFoundError)
+
+    stubFetch(403)
+    await expect(savePanelConfig('-1001', 'i', input)).rejects.toBeInstanceOf(ForbiddenError)
+  })
+
+  test('读取路径的错误归类：未知群 404 → NotFoundError；非 owner 403 → ForbiddenError', async () => {
+    stubFetch(404)
+    await expect(fetchPanelConfig('-9999', 'i')).rejects.toBeInstanceOf(NotFoundError)
+
+    stubFetch(403)
+    await expect(fetchPanelConfig('-1001', 'i')).rejects.toBeInstanceOf(ForbiddenError)
   })
 })
