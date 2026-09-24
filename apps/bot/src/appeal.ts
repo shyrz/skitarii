@@ -5,6 +5,7 @@ import type { Repos } from '@skitarii/db'
 import type { Logger } from './logger.js'
 import { callWithRetry } from './telegram-call.js'
 import { GRANT_ALL_PERMISSIONS } from './permissions.js'
+import { isUnpunishableTarget } from './telegram-errors.js'
 
 /**
  * 申诉闭环：群内申诉入口、owner 私聊通知、owner 的「维持 / 撤销」回调。
@@ -15,6 +16,8 @@ import { GRANT_ALL_PERMISSIONS } from './permissions.js'
  *
  * 撤销的回滚口径：`mute` 解禁、`ban` 解封，`delete` 与 `warn` 没有可回滚的权限状态
  * （消息已删除无法恢复），只把申诉状态改成 `overturned`，让误伤率统计与人工复盘能看到它。
+ * 不可罚目标（管理员/群主）同样没有可回滚的状态：executor 会把这类目标的禁言/封禁降级为删除，
+ * 回滚时的「不可被限制」拒绝按无可恢复处理，不阻断结案（见 {@link rollbackAction}）。
  *
  * 通知的送达回执：`notifyOwnerOfAppeal` 返回 Telegram 是否接受，调用方据此回填
  * `appeals.notified_at`；没回填成功的申诉由 {@link createAppealNotificationService} 在调度器里补发。
@@ -301,6 +304,10 @@ export function createAppealCallbackHandler(deps: AppealDeps): MiddlewareFn<Cont
 /**
  * 回滚处置带来的权限状态。
  *
+ * 不可罚目标（管理员/群主）没有可回滚的权限状态：executor 已把这类目标的禁言/封禁降级为删除，
+ * 撤销时解禁/解封必然被 Telegram 以「不可被限制」拒绝。此时记日志后正常返回，不让申诉结案中途失败；
+ * 其余错误照旧抛出，由调用方走「已结案但恢复失败」分支提示 owner 手动处理。
+ *
  * @param deps api 与日志。
  * @param decision 原决策。
  */
@@ -308,16 +315,30 @@ async function rollbackAction(deps: AppealDeps, decision: ModerationDecision): P
   const call = deps.api
   switch (decision.action.kind) {
     case 'mute':
-      await callWithRetry(
-        () => call.restrictChatMember(decision.chatId, decision.userId, GRANT_ALL_PERMISSIONS),
-        { logger: deps.logger, label: 'restrictChatMember(unmute)' },
-      )
+      try {
+        await callWithRetry(
+          () => call.restrictChatMember(decision.chatId, decision.userId, GRANT_ALL_PERMISSIONS),
+          { logger: deps.logger, label: 'restrictChatMember(unmute)' },
+        )
+      } catch (error) {
+        if (!isUnpunishableTarget(error)) throw error
+        deps.logger.info(
+          `目标不可被限制（管理员/群主），没有可恢复的权限状态，跳过解禁 decisionId=${decision.id} chatId=${decision.chatId}`,
+        )
+      }
       return
     case 'ban':
-      await callWithRetry(() => call.unbanChatMember(decision.chatId, decision.userId, { only_if_banned: true }), {
-        logger: deps.logger,
-        label: 'unbanChatMember',
-      })
+      try {
+        await callWithRetry(() => call.unbanChatMember(decision.chatId, decision.userId, { only_if_banned: true }), {
+          logger: deps.logger,
+          label: 'unbanChatMember',
+        })
+      } catch (error) {
+        if (!isUnpunishableTarget(error)) throw error
+        deps.logger.info(
+          `目标不可被限制（管理员/群主），没有可恢复的权限状态，跳过解封 decisionId=${decision.id} chatId=${decision.chatId}`,
+        )
+      }
       return
     case 'pass':
     case 'warn':

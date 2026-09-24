@@ -144,6 +144,8 @@ describe('处置执行', () => {
     expect(args[2]).toMatchObject({ can_send_messages: false })
     expect(args[3]).toEqual({ until_date: Math.floor(until.getTime() / 1_000) })
     expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toContain('已禁言违规用户 60 分钟')
+    // 禁言成功就没有降级：消息本身不删。
+    expect(recording.countOf('deleteMessage')).toBe(0)
   })
 
   test('封禁走 banChatMember，警示不发任何 API 动作', async () => {
@@ -324,6 +326,85 @@ describe('处置执行', () => {
 
     await executor.execute(decision, { messageId: 42 })
 
+    expect(recording.countOf('sendMessage')).toBe(0)
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+  })
+
+  test('禁言被「用户是管理员」拒绝：降级为删除消息并通知「已删除」', async () => {
+    const { executor, recording, store } = setup({
+      handlers: {
+        restrictChatMember: () => {
+          throw new GrammyError(
+            'Call to restrictChatMember failed',
+            { ok: false, error_code: 400, description: 'Bad Request: user is an administrator of the chat' },
+            'restrictChatMember',
+            {},
+          )
+        },
+      },
+    })
+    const decision = decisionFixture({ action: { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') } })
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    // 管理员不可被禁言，但广告消息仍能删掉：通知按实际生效的动作说「已删除」。
+    expect(recording.lastArgsOf('deleteMessage')).toEqual([chatId, 42])
+    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toBe('🚫 已删除一条违规消息。')
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+  })
+
+  test('封禁被「不能移除群主」拒绝：同样降级为删除', async () => {
+    const { executor, recording, store } = setup({
+      handlers: {
+        banChatMember: () => {
+          throw new GrammyError(
+            'Call to banChatMember failed',
+            { ok: false, error_code: 400, description: "Bad Request: can't remove chat owner" },
+            'banChatMember',
+            {},
+          )
+        },
+      },
+    })
+    const decision = decisionFixture({ action: { kind: 'ban' } })
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    expect(recording.lastArgsOf('deleteMessage')).toEqual([chatId, 42])
+    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toBe('🚫 已删除一条违规消息。')
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+  })
+
+  test('禁言被拒且降级删除也被终结拒绝：不发通知，仍回填已执行', async () => {
+    const { executor, recording, store } = setup({
+      handlers: {
+        restrictChatMember: () => {
+          throw new GrammyError(
+            'Call to restrictChatMember failed',
+            { ok: false, error_code: 400, description: 'Bad Request: user is an administrator of the chat' },
+            'restrictChatMember',
+            {},
+          )
+        },
+        deleteMessage: () => {
+          throw new GrammyError(
+            'Call to deleteMessage failed',
+            { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete the message' },
+            'deleteMessage',
+            {},
+          )
+        },
+      },
+    })
+    const decision = decisionFixture({ action: { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') } })
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    // 降级删除也没成功：不误报「已删除」，决策仍是终态，不再无限重试。
+    expect(recording.countOf('deleteMessage')).toBe(1)
     expect(recording.countOf('sendMessage')).toBe(0)
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
   })

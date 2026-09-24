@@ -7,6 +7,7 @@ import type { IdempotencyRegistry } from './idempotency.js'
 import type { Logger } from './logger.js'
 import { MUTE_ALL_PERMISSIONS } from './permissions.js'
 import { callWithRetry } from './telegram-call.js'
+import { isUnpunishableTarget } from './telegram-errors.js'
 import type { TokenBucket } from './token-bucket.js'
 
 /**
@@ -18,11 +19,14 @@ import type { TokenBucket } from './token-bucket.js'
  * 执行序：先施加动作，再发通知，最后回填 `executed`。
  * - 动作失败（非终态）时不回填，决策留成「未执行」，重投递或人工补偿还能再试一次。
  * - 通知失败（限流桶空、编辑失败）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
+ * - 动作被 Telegram 终结性拒绝时不发通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
+ *   留着不填只会让补偿扫描反复重投递。
  *
  * 幂等：动作与通知都在 `eventId:action` 的闸门内执行；决策已 `executed` 时直接跳过。
  *
- * 终态判定里有一个刻意保留的例外：删除动作拿到「消息已不存在」的 400 时按成功处理，
- * 详见 {@link isAlreadyGoneTarget}。
+ * 终态判定里有两个刻意保留的例外：
+ * - 删除动作拿到「消息已不存在」的 400 时按成功处理，详见 {@link isAlreadyGoneTarget}；
+ * - 禁言/封禁的目标是管理员或群主时降级为删除同一条消息，详见 {@link applyAction}。
  */
 
 /**
@@ -63,6 +67,15 @@ export interface ActionExecutor {
 }
 
 /**
+ * 一次动作施加的结果。
+ *
+ * `applied` 带的是实际生效的动作：禁言/封禁遇到不可罚目标时会降级为删除，
+ * 此时通知与完成日志都必须按这个动作说，不能看决策上的原动作（见 {@link applyAction}）。
+ * `rejected` 表示 Telegram 终结性拒绝，决策可以回填 `executed` 但没有可通知的内容。
+ */
+export type ApplyOutcome = { kind: 'applied'; action: Action } | { kind: 'rejected' }
+
+/**
  * 决策的幂等键。
  *
  * 执行器与补偿扫描必须用同一个键：补偿扫描若用另一个键去查闸门，就会把「本进程已经施加过、
@@ -99,13 +112,18 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
       }
 
       await deps.idempotency.run(idempotencyKeyOf(decision), async () => {
-        const applied = await applyAction(deps, decision, context)
-        // 动作没生效（被 Telegram 终结性拒绝）时不发通知：说「已删除」而实际没删是误导群成员，
-        // 而且会给出一个指向不存在的处置的申诉入口。
-        if (applied) await sendNotice(deps, decision, now())
+        const outcome = await applyAction(deps, decision, context)
+        // 终结性拒绝时不发通知：说「已删除」而实际没删是误导群成员，而且会给出一个指向不存在的处置的申诉入口。
+        // 降级为删除时 outcome 带着实际生效的动作，文案随之改成「已删除」。
+        if (outcome.kind === 'applied') await sendNotice(deps, decision, outcome.action, now())
         await deps.repos.decisions.markExecuted(decision.id)
+        // 降级时把实际动作也写进日志（如 action=mute effective=delete），否则日志会让人以为禁言真的生效了。
+        const effective =
+          outcome.kind === 'applied' && outcome.action.kind !== decision.action.kind
+            ? ` effective=${outcome.action.kind}`
+            : ''
         deps.logger.info(
-          `处置完成 decisionId=${decision.id} chatId=${decision.chatId} action=${decision.action.kind}`,
+          `处置完成 decisionId=${decision.id} chatId=${decision.chatId} action=${decision.action.kind}${effective}`,
         )
       })
     },
@@ -114,29 +132,33 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
   /**
    * 施加动作到 Telegram。
    *
+   * 两个成功特例都源于「目标已经达成」：删除时消息已不存在（见 {@link isAlreadyGoneTarget}）；
+   * 禁言/封禁时目标不可被限制（管理员/群主，见 {@link isUnpunishableTarget}），降级为删除消息。
+   *
    * @param executorDeps 执行器依赖。
    * @param decision 决策。
    * @param context 执行上下文（删除动作需要消息 id）。
-   * @returns 动作是否生效：被 Telegram 终结性拒绝（400）时为 `false`，删除时目标消息已不存在时为 `true`。
+   * @returns 实际生效的动作；被 Telegram 终结性拒绝时为 `rejected`。
+   * @throws {unknown} 非终结错误（网络错误、非 GrammyError）原样抛出，决策保持「未执行」等待重试。
    */
   async function applyAction(
     executorDeps: ActionExecutorDeps,
     decision: ModerationDecision,
     context: ExecutionContext,
-  ): Promise<boolean> {
+  ): Promise<ApplyOutcome> {
     const { api, logger } = executorDeps
     try {
       switch (decision.action.kind) {
         case 'pass':
         case 'warn':
           // 放行与警示都不需要 API 调用：警示语就是处置通知本身（见 sendNotice）。
-          return true
+          return { kind: 'applied', action: decision.action }
         case 'delete':
           await callWithRetry(() => api.deleteMessage(decision.chatId, context.messageId), {
             ...retryOptions,
             label: 'deleteMessage',
           })
-          return true
+          return { kind: 'applied', action: decision.action }
         case 'mute': {
           const untilSeconds = Math.floor(decision.action.until.getTime() / 1_000)
           await callWithRetry(
@@ -146,14 +168,14 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
               }),
             { ...retryOptions, label: 'restrictChatMember' },
           )
-          return true
+          return { kind: 'applied', action: decision.action }
         }
         case 'ban':
           await callWithRetry(() => api.banChatMember(decision.chatId, decision.userId), {
             ...retryOptions,
             label: 'banChatMember',
           })
-          return true
+          return { kind: 'applied', action: decision.action }
         default: {
           const exhaustive: never = decision.action
           throw new Error(`未知处置: ${JSON.stringify(exhaustive)}`)
@@ -165,13 +187,21 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
         logger.info(
           `消息已不存在，删除目标视为达成 decisionId=${decision.id} chatId=${decision.chatId}：${error.description}`,
         )
-        return true
+        return { kind: 'applied', action: decision.action }
+      }
+      // 管理员与群主不可被禁言/封禁（Telegram 平台限制），但消息本身仍可删除。降级 = 改用 delete 动作
+      // 重新执行一次：删除路径的「已不存在」与终结判定原样复用，通知文案也随生效动作改成「已删除」。
+      if (isUnpunishableTarget(error) && (decision.action.kind === 'mute' || decision.action.kind === 'ban')) {
+        logger.info(
+          `目标不可被限制（管理员/群主），${decision.action.kind === 'mute' ? '禁言' : '封禁'}降级为删除 decisionId=${decision.id} chatId=${decision.chatId}`,
+        )
+        return await applyAction(executorDeps, { ...decision, action: { kind: 'delete' } }, context)
       }
       if (isTerminalTelegramError(error)) {
         logger.warn(
           `Telegram 拒绝该动作，按终结处理 decisionId=${decision.id} action=${decision.action.kind}：${error.description}`,
         )
-        return false
+        return { kind: 'rejected' }
       }
       throw error
     }
@@ -185,16 +215,22 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
  * 通知不重复消息正文：群成员看得到原消息，摘要摘录属于申诉页面与 owner。
  *
  * @param deps 执行器依赖。
- * @param decision 决策。
+ * @param decision 决策（取群与 decisionId）。
+ * @param action 实际生效的动作；降级时它与决策上的原动作不同（见 {@link applyAction}）。
  * @param instant 当前时刻（渲染禁言剩余分钟数）。
  */
-async function sendNotice(deps: ActionExecutorDeps, decision: ModerationDecision, instant: Date): Promise<void> {
+async function sendNotice(
+  deps: ActionExecutorDeps,
+  decision: ModerationDecision,
+  action: Action,
+  instant: Date,
+): Promise<void> {
   if (!deps.outbound.tryTake(decision.chatId)) {
     deps.logger.warn(`出站限流，跳过处置通知 chatId=${decision.chatId} decisionId=${decision.id}`)
     return
   }
 
-  const text = noticeText(decision.action, instant)
+  const text = noticeText(action, instant)
   try {
     await callWithRetry(
       () => deps.api.sendMessage(decision.chatId, text, { reply_markup: appealKeyboard(deps.miniAppUrl, decision.id) }),
@@ -239,7 +275,8 @@ export function noticeText(action: Action, instant: Date): string {
  * 400 覆盖了这些终结场景：消息过旧无法删除、bot 权限不足、用户是匿名管理员。
  * 区别对待它们能让决策不再无限重试，同时把原因留在日志里。
  *
- * 调用方必须先问 {@link isAlreadyGoneTarget}：那类 400 的目标已经达成，不算失败。
+ * 调用方必须先问 {@link isAlreadyGoneTarget} 与 {@link isUnpunishableTarget}：那两类 400 分别代表
+ * 「目标已达成」与「可以降级为删除」，都不该按终结失败处理。
  *
  * @param error 捕获到的异常。
  * @returns 非 400 的 API 错误与网络错误返回 `false`。

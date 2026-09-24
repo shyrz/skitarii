@@ -1,5 +1,6 @@
 import { asChatId, asUserId, type Appeal, type ModerationDecision } from '@skitarii/core'
 import { createInMemoryRepos, type InMemoryRepos } from '@skitarii/db'
+import { GrammyError } from 'grammy'
 import type { Context } from 'grammy'
 import { describe, expect, test } from 'vitest'
 import { createAppealCallbackHandler, createAppealNotificationService, notifyOwnerOfAppeal } from './appeal.js'
@@ -134,6 +135,35 @@ describe('owner 处理申诉', () => {
 
     expect(recording.lastArgsOf('unbanChatMember')).toEqual([chatId, userId, { only_if_banned: true }])
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
+  })
+
+  test('撤销禁言遇到不可罚目标：没有权限可恢复，仍结案为 overturned', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const recording: RecordingApi = createRecordingApi({
+      restrictChatMember: () => {
+        throw new GrammyError(
+          'Call to restrictChatMember failed',
+          { ok: false, error_code: 400, description: 'Bad Request: user is an administrator of the chat' },
+          'restrictChatMember',
+          {},
+        )
+      },
+    })
+    const handler = createAppealCallbackHandler({
+      api: recording.api,
+      repos: store.repos,
+      ownerUserId: ownerId,
+      logger: silentLogger,
+    })
+    const { ctx, answers, edits } = createContext(`appeal:${appealId}:overturn`, ownerId)
+
+    await handler(ctx, async () => {})
+
+    // executor 本就禁言不了这个管理员，撤销时没有权限可恢复：结案照常，不落进「回滚失败」分支。
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
+    expect(answers.at(-1)?.text).toBe('已撤销并恢复权限')
+    expect(edits.at(-1)).toContain('已撤销（误判成立）')
   })
 
   test('撤销删除：消息无法恢复，只结案不调 Telegram', async () => {
