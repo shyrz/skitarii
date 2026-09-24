@@ -39,7 +39,15 @@ const ownerUserId = asUserId(env.OWNER_USER_ID)
 // webhook 与申诉通知共用同一个 bot 实例：回调按钮由 Telegram 投递到 webhook，
 // 通知则用同一个 token 发出，两者必须是同一个 bot。
 // 运行时同时交出两个维护服务：补偿扫描与 bot 共享执行器/幂等闸门，补发扫描与申诉通知同源。
-const runtime = createBotRuntime({ botToken: env.BOT_TOKEN, repos, llm, miniAppUrl: env.MINI_APP_URL, ownerUserId, logger })
+const runtime = createBotRuntime({
+  botToken: env.BOT_TOKEN,
+  repos,
+  llm,
+  miniAppUrl: env.MINI_APP_URL,
+  ownerUserId,
+  ownerFeed: env.OWNER_DEBUG_NOTIFY,
+  logger,
+})
 const bot = runtime.bot
 
 const appealApi: AppealApiDeps = {

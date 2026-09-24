@@ -27,6 +27,11 @@ const serverEnvSchema = z.object({
     .transform((value) => (value === undefined || value.trim() === '' ? undefined : value.trim())),
   /** 申诉处理的唯一负责人（Telegram 用户 id），与 bot 进程同一个值。 */
   OWNER_USER_ID: z.coerce.number().int().positive(),
+  /**
+   * owner 判定 feed 开关（测试期观察用）。未设置或 `true` 开启，`false` 关闭；
+   * 只接受 'true' / 'false'，其他取值在启动阶段报错。
+   */
+  OWNER_DEBUG_NOTIFY: z.enum(['true', 'false']).optional().transform((value) => value !== 'false'),
   LLM_BASE_URL: z.string().min(1).optional(),
   LLM_API_KEY: z.string().min(1).optional(),
   LLM_MODEL: z.string().min(1).optional(),

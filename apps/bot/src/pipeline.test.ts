@@ -7,7 +7,7 @@ import { deriveDecisionId, deriveEventId } from './ids.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createInMemoryRepos, type InMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
-import { handleIncomingMessage } from './pipeline.js'
+import { handleIncomingMessage, type DecisionObservation } from './pipeline.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
 import { createTokenBucket } from './token-bucket.js'
 
@@ -309,6 +309,83 @@ describe('消息管线', () => {
     expect(attachCalls).toBe(1)
     expect(store.sampleOf(eventId)).toBe('这个键盘手感不错')
     expect(recording.calls).toEqual([])
+  })
+
+  test('配置 notifyOwner：判定摘要在施加动作前发出，字段取库里的权威决策', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const observations: DecisionObservation[] = []
+    const deletesAtNotify: number[] = []
+
+    await handleIncomingMessage(
+      {
+        repos: store.repos,
+        judge,
+        executor,
+        logger: silentLogger,
+        now: fixedNow,
+        notifyOwner: async (observation) => {
+          observations.push(observation)
+          // 时序：摘要在执行器施加动作之前发出。
+          deletesAtNotify.push(recording.countOf('deleteMessage'))
+        },
+      },
+      incoming({ text: '加v推荐一个渠道', messageId: 111 }),
+    )
+
+    expect(observations).toEqual([
+      {
+        chatId,
+        chatTitle: '测试群',
+        messageId: 111,
+        userId,
+        // feed 看原文，不是送审的归一化文本。
+        text: '加v推荐一个渠道',
+        signals: [
+          { kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 },
+          { kind: 'llm', verdict: 'spam', confidence: 0.9 },
+        ],
+        score: 1,
+        action: { kind: 'delete' },
+        decisionId: deriveDecisionId(deriveEventId(chatId, 111)),
+      },
+    ])
+    expect(deletesAtNotify).toEqual([0])
+    expect(recording.countOf('deleteMessage')).toBe(1)
+  })
+
+  test('重投递同一条消息：判定摘要只发一次', async () => {
+    const { store, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const observations: DecisionObservation[] = []
+    const deps = {
+      repos: store.repos,
+      judge,
+      executor,
+      logger: silentLogger,
+      now: fixedNow,
+      notifyOwner: async (observation: DecisionObservation) => {
+        observations.push(observation)
+      },
+    }
+
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 112 }))
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 112 }))
+
+    expect(observations).toHaveLength(1)
+  })
+
+  test('未配置 notifyOwner：审核与执行路径照常', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 113 }),
+    )
+
+    expect(recording.countOf('deleteMessage')).toBe(1)
+    expect(recording.countOf('sendMessage')).toBe(1)
   })
 })
 

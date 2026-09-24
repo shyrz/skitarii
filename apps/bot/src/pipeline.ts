@@ -1,4 +1,15 @@
-import { decide, matchRules, normalize, scoreOf, type ChatConfig, type ChatId, type MessageFeatures, type Signal, type UserId } from '@skitarii/core'
+import {
+  decide,
+  matchRules,
+  normalize,
+  scoreOf,
+  type Action,
+  type ChatConfig,
+  type ChatId,
+  type MessageFeatures,
+  type Signal,
+  type UserId,
+} from '@skitarii/core'
 import type { Repos } from '@skitarii/db'
 import type { CachedJudge } from '@skitarii/llm'
 import { defaultChatConfig } from './defaults.js'
@@ -19,6 +30,8 @@ import type { Logger } from './logger.js'
  *    复核不可用时绝不能按 `actionHint` 直接动手，那等价于悄悄把 `llmThreshold` 降到 `passThreshold`。
  * 4. `decide` 出最终处置，落决策（同样用派生 id，重放不产生第二条）。
  * 5. 非放行处置补写正文摘录（是否补写以库里那条决策为准，不用本轮重算的档位），再交给执行器施加到 Telegram。
+ * 6. 若配置了 `notifyOwner`，在施加动作前私聊 owner 一条判定摘要：摘要是「判定」而非「执行结果」，
+ *    动作被 Telegram 拒绝也不改变它；只在决策尚未执行时发，重投递不会重复通知。
  */
 
 /**
@@ -51,8 +64,36 @@ export interface PipelineDeps {
   judge: CachedJudge | null
   executor: ActionExecutor
   logger: Logger
+  /**
+   * 判定摘要的接收方（owner 判定 feed）。缺省时不发。实现必须自行吞掉发送失败，
+   * 不能让它影响审核链路；见 `owner-feed.ts` 的 `createOwnerFeed`。
+   */
+  notifyOwner?: ((observation: DecisionObservation) => Promise<void>) | undefined
   /** 时间源，默认系统时间。显式允许 `undefined`，让调用方可以直接透传可选配置。 */
   now?: (() => Date) | undefined
+}
+
+/**
+ * 一条判定的摘要数据，供 owner 判定 feed 渲染。
+ *
+ * 字段一律取读回的权威决策（`stored`）：重投递时本轮重算的档位与分数可能已经变化，
+ * feed 说的是库里那条判定。`text` 是消息原文而非归一化文本，也不是落库摘录：
+ * 放行消息不落摘录，但 feed 同样要能看到它。
+ */
+export interface DecisionObservation {
+  chatId: ChatId
+  chatTitle: string
+  messageId: number
+  userId: UserId
+  /** 消息原文（正文或 caption）。 */
+  text: string
+  /** 判定信号，按产生顺序：规则命中在前、（灰色地带的）复核结论在后。 */
+  signals: Signal[]
+  /** 违规总分，0..1。 */
+  score: number
+  /** 最终处置。 */
+  action: Action
+  decisionId: string
 }
 
 /**
@@ -125,6 +166,22 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
   // 本轮算出的档位与库里那条可以不同，跟着重算结果走会出现「库里是放行却写了正文」或反之。
   if (stored.action.kind !== 'pass' && message.text.trim().length > 0) {
     await deps.repos.events.attachSample(eventId, message.text)
+  }
+
+  // 判定摘要发在动作之前：它反映「判定」本身，动作被 Telegram 拒绝（含降级为删除）都不应改变摘要内容。
+  // 只在 `stored.executed === false` 时发：重投递时首投已经通知过，不重复发。
+  if (deps.notifyOwner !== undefined && !stored.executed) {
+    await deps.notifyOwner({
+      chatId: stored.chatId,
+      chatTitle: message.chatTitle,
+      messageId: message.messageId,
+      userId: stored.userId,
+      text: message.text,
+      signals: stored.signals,
+      score: stored.score,
+      action: stored.action,
+      decisionId: stored.id,
+    })
   }
 
   await deps.executor.execute(stored, { messageId: message.messageId })

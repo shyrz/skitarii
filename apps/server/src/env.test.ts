@@ -19,3 +19,18 @@ describe('PORT 解析', () => {
     expect(parseServerEnv({ ...requiredEnv, PORT: '8123' }).PORT).toBe(8123)
   })
 })
+
+describe('OWNER_DEBUG_NOTIFY 解析', () => {
+  test('未设置与 true 均视为开启', () => {
+    expect(parseServerEnv(requiredEnv).OWNER_DEBUG_NOTIFY).toBe(true)
+    expect(parseServerEnv({ ...requiredEnv, OWNER_DEBUG_NOTIFY: 'true' }).OWNER_DEBUG_NOTIFY).toBe(true)
+  })
+
+  test('false 关闭', () => {
+    expect(parseServerEnv({ ...requiredEnv, OWNER_DEBUG_NOTIFY: 'false' }).OWNER_DEBUG_NOTIFY).toBe(false)
+  })
+
+  test('其他取值报错', () => {
+    expect(() => parseServerEnv({ ...requiredEnv, OWNER_DEBUG_NOTIFY: 'no' })).toThrow(/OWNER_DEBUG_NOTIFY/)
+  })
+})

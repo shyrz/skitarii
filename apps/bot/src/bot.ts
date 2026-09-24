@@ -14,6 +14,7 @@ import { createActionExecutor } from './executor.js'
 import { extractFeatures } from './features.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createLogger, type Logger } from './logger.js'
+import { createOwnerFeed } from './owner-feed.js'
 import { handleIncomingMessage, type PipelineDeps } from './pipeline.js'
 import { createTokenBucket } from './token-bucket.js'
 
@@ -51,6 +52,11 @@ export interface CreateBotOptions {
   miniAppUrl: string
   /** 申诉处理的唯一负责人：只有这个用户能点「维持 / 撤销」。 */
   ownerUserId: UserId
+  /**
+   * owner 判定 feed 开关。测试期默认开启：每条过审消息（含放行）私聊 owner 一条判定摘要；
+   * 显式传 `false` 关闭（对应 `OWNER_DEBUG_NOTIFY=false`）。
+   */
+  ownerFeed?: boolean
   logger?: Logger
   /** 时间源，默认系统时间。 */
   now?: (() => Date) | undefined
@@ -105,6 +111,11 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
     executor,
     logger,
     now: options.now,
+    // 判定 feed 默认开启：测试期 owner 要逐条核对判定结果，显式 false 才关闭。
+    notifyOwner:
+      options.ownerFeed === false
+        ? undefined
+        : createOwnerFeed({ api: bot.api, ownerUserId: options.ownerUserId, logger, now: options.now }),
   }
 
   bot.command('start', async (ctx) => {

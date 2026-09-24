@@ -24,6 +24,11 @@ const botEnvSchema = z.object({
   MINI_APP_URL: z.string().min(1),
   /** 申诉处理的唯一负责人（Telegram 用户 id）。 */
   OWNER_USER_ID: z.coerce.number().int().positive(),
+  /**
+   * owner 判定 feed 开关（测试期观察用）。未设置或 `true` 开启，`false` 关闭；
+   * 只接受 'true' / 'false'，其他取值在启动阶段报错。
+   */
+  OWNER_DEBUG_NOTIFY: z.enum(['true', 'false']).optional().transform((value) => value !== 'false'),
 })
 
 /** 已校验的 bot 环境变量。 */
