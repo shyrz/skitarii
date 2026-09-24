@@ -7,12 +7,14 @@ import { asUserId, type UserId } from '@skitarii/core'
  * 协议（Bot API 文档的 Validating data received via the Mini App）：Telegram 用 bot token 派生的密钥
  * 对一组字段做 HMAC-SHA256，签名放在 `hash` 字段里。校验步骤：
  * 1. `secret_key = HMAC_SHA256(key="WebAppData", message=bot_token)`，注意密钥与消息的位置是反的。
- * 2. `data_check_string` = 除 `hash` 与 `signature` 外的字段按 `key=value` 排序后用 `\n` 连接。
+ * 2. `data_check_string` = 除 `hash` 外的**全部**收到字段（含 `signature`）按 `key=value` 排序后用 `\n` 连接。
  * 3. `HMAC_SHA256(key=secret_key, message=data_check_string)` 的十六进制值必须等于 `hash`。
  *
  * 两个容易踩的点：
- * - `signature`（Telegram 给第三方校验用的 Ed25519 签名）不参与 data-check-string，必须排除，
- *   否则带 signature 的 initData 一律验不过。
+ * - `signature` 必须参与 HMAC 的拼串。文档里「排除 hash 与 signature」只适用于第三方 Ed25519 校验
+ *   （Validating data for Third-Party Use，它签的是另一串），两套规则不能混用：把 signature 排除会让
+ *   所有带该字段的 initData（Bot API 8.0 起真实客户端一律携带）验签失败。判据是官方仓库
+ *   Telegram-Mini-Apps/init-data-golang 的真实向量，只有包含 signature 的拼串能对上其中的 hash。
  * - 字段值要按 `decodeURIComponent` 解码后再拼串，且**不能**把 `+` 当成空格
  *   （`URLSearchParams` 会这么做，所以这里手写解析）；Telegram 用 `encodeURIComponent` 编码。
  *
@@ -68,7 +70,7 @@ export function verifyInitData(
   if (hash === undefined || hash.length === 0) return { ok: false, reason: 'missing-hash' }
 
   const dataCheckString = [...fields.entries()]
-    .filter(([key]) => key !== 'hash' && key !== 'signature')
+    .filter(([key]) => key !== 'hash')
     .map(([key, value]) => `${key}=${value}`)
     .sort()
     .join('\n')
