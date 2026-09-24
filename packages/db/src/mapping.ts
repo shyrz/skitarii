@@ -29,7 +29,7 @@ import { SAMPLE_TEXT_MAX_LENGTH, type AppealRow, type ChatRow, type DailyAggrega
 /** `Rule[]` 的 JSONB 形状。与领域 `Rule` 的字段一一对应。 */
 const ruleSchema = z.object({
   id: z.string().min(1),
-  kind: z.enum(['keyword', 'regex', 'link-domain']),
+  kind: z.enum(['keyword', 'regex', 'link-domain', 'sender-name', 'custom-emoji']),
   pattern: z.string(),
   score: z.number().min(0).max(1),
   actionHint: z.enum(['pass', 'warn', 'delete', 'mute', 'ban']),
@@ -90,7 +90,12 @@ export function toMessageEvent(row: MessageEventRow): MessageEvent {
     userId: asUserId(row.userId),
     messageId: row.messageId,
     contentHash: row.contentHash,
-    features: { hasLink: row.hasLink, mediaType: row.mediaType, length: row.length },
+    features: {
+      hasLink: row.hasLink,
+      mediaType: row.mediaType,
+      length: row.length,
+      customEmojiCount: row.customEmojiCount,
+    },
     createdAt: row.createdAt,
   }
 }

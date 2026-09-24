@@ -2,6 +2,7 @@ import { asChatId, asUserId, type UserId } from '@skitarii/core'
 import type { Repos } from '@skitarii/db'
 import { createCachedJudge, createOpenAiJudge, type LlmConfig } from '@skitarii/llm'
 import { Bot, type Context } from 'grammy'
+import type { Message } from 'grammy/types'
 import {
   APPEAL_CALLBACK_PATTERN,
   createAppealCallbackHandler,
@@ -11,10 +12,10 @@ import {
 } from './appeal.js'
 import { createDecisionRetryService, type DecisionRetryService } from './decision-retry.js'
 import { createActionExecutor } from './executor.js'
-import { extractFeatures } from './features.js'
+import { contentHashOf, extractFeatures, extractSenderIdentity } from './features.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createLogger, type Logger } from './logger.js'
-import { createOwnerFeed } from './owner-feed.js'
+import { createOwnerFailureNotifier, createOwnerFeed } from './owner-feed.js'
 import { handleIncomingMessage, type PipelineDeps } from './pipeline.js'
 import { createTokenBucket } from './token-bucket.js'
 
@@ -77,6 +78,14 @@ export interface BotRuntime {
 }
 
 /**
+ * Telegram 官方服务账号的用户 id（777000）。
+ *
+ * 频道自动转发到讨论组的消息以它作为发送者：内容来自频道帖子本身，审核它既没有意义也删不掉原帖，
+ * 因此在新消息与编辑消息的处理入口一并过滤（来源 n8n 工作流同样排除该账号）。
+ */
+const TELEGRAM_SERVICE_ACCOUNT_ID = 777_000
+
+/**
  * 建立 bot 运行时。webhook 与补偿扫描都要用 bot 的进程，因此这里一次性把两者组装出来。
  *
  * @param options bot token、仓储、复核配置与运行参数。
@@ -103,6 +112,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
     logger,
     now: options.now,
     sleep: options.sleep,
+    // 终结性拒绝后补偿扫描不会再接这条决策，私聊 owner 让失败有人看见。
+    notifyOwnerFailure: createOwnerFailureNotifier({ api: bot.api, ownerUserId: options.ownerUserId, logger }),
   })
 
   const pipelineDeps: PipelineDeps = {
@@ -128,17 +139,36 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
     )
   })
 
-  bot.on('message', async (ctx) => {
-    const message = ctx.message
+  /**
+   * 审核一条群消息：过滤、提取、提交管线。新消息与编辑消息共用同一个入口，避免两份过滤逻辑漂移。
+   *
+   * 只审群与超级群：私聊是命令与申诉通知的通道，频道消息（`channel_post`）不属于本节。
+   * 其他 bot 的消息不审：既避免 bot 互相触发，也避免把审核结果反馈给自动化流程。
+   * Telegram 服务账号（777000）的消息不审：那是频道自动转发到讨论组的形态，审核它没有意义。
+   *
+   * @param ctx 更新上下文。
+   * @param message 待审消息（新消息或编辑后的消息）。
+   * @param editDate 编辑时间（Unix 秒）；新消息为 `null`。
+   */
+  async function moderateMessage(ctx: Context, message: Message, editDate: number | null): Promise<void> {
     const chat = ctx.chat
     const from = ctx.from
-
-    // 只审群与超级群：私聊是命令与申诉通知的通道，频道消息（channel_post）不属于本节。
+    if (chat === undefined) return
     if (chat.type !== 'group' && chat.type !== 'supergroup') return
-    // 其他 bot 的消息不审：既避免 bot 互相触发，也避免把审核结果反馈给自动化流程。
     if (from === undefined || from.is_bot) return
+    // 777000 是 Telegram 自己的服务账号：频道自动转发到讨论组的消息以它作为发送者，
+    // 审核它没有意义（内容来自频道帖子本身，且删不掉原帖）。与 is_bot 并列放在入口过滤。
+    if (from.id === TELEGRAM_SERVICE_ACCOUNT_ID) return
 
     const text = message.text ?? message.caption ?? ''
+    // 频道评论：讨论组里的评论通过回复一条「频道帖子转发」挂到原帖下，只有频道用户名 + 帖子 id
+    // 拼出的深链才点得进评论上下文（t.me/c 链接在评论区打不开目标）。拿不到频道用户名时退回 null。
+    const forwardOrigin = message.reply_to_message?.forward_origin
+    const commentThread =
+      forwardOrigin?.type === 'channel' && forwardOrigin.chat.username !== undefined
+        ? { channelUsername: forwardOrigin.chat.username, postId: forwardOrigin.message_id }
+        : null
+
     await handleIncomingMessage(pipelineDeps, {
       chatId: asChatId(String(chat.id)),
       chatTitle: chat.title,
@@ -146,7 +176,24 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       userId: asUserId(from.id),
       text,
       features: extractFeatures(message, text),
+      editDate,
+      senderIdentity: extractSenderIdentity(from),
+      commentThread,
     })
+  }
+
+  bot.on('message', async (ctx) => {
+    await moderateMessage(ctx, ctx.message, null)
+  })
+
+  bot.on('edited_message', async (ctx) => {
+    const message = ctx.editedMessage
+    const text = message.text ?? message.caption ?? ''
+    // Telegram 的编辑更新必带 edit_date；若协议退化导致缺失，用内容哈希前 16 位构造稳定数值兜底：
+    // 管线随后还会在判别符里拼上内容哈希（`edit:${editDate}:${内容哈希前 16 位}`），两项组合后
+    // 同一编辑的重投递仍得到同一事件 id，内容不同的编辑各自成事件。
+    const editDate = message.edit_date ?? Number.parseInt(contentHashOf(text).slice(0, 16), 16)
+    await moderateMessage(ctx, message, editDate)
   })
 
   const appealDeps: AppealDeps = {
@@ -184,6 +231,7 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
  *
  * 中间件：
  * - `message`：群与超级群里的每条消息走审核管线。私聊与频道消息不在 Phase 1 范围内。
+ * - `edited_message`：编辑后的群消息重走同一条管线；每次编辑产生独立事件与决策。
  * - `callbackQuery`：owner 的申诉处理回调。
  * - `command('start')`：介绍语与申诉说明。
  * - `catch`：单条更新失败不退出进程。

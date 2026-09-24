@@ -17,14 +17,21 @@ export function sha256Hex(text: string): string {
 }
 
 /**
- * 由 `(chatId, messageId)` 派生事件 id。同一群同一条消息永远得到同一个 id。
+ * 由 `(chatId, messageId, discriminator?)` 派生事件 id。
+ *
+ * 同一条新消息永远得到同一个 id。编辑消息由管线传入判别符（`edit:<编辑时间>:<内容哈希前 16 位>`）：
+ * 同一编辑的 Telegram 重投递得到同一 id（幂等），同秒内不同内容的编辑各自得到不同 id。
+ * 判别符为 `null` / `undefined` 时哈希输入与不带判别符的历史实现完全一致，既有事件 id 不变。
  *
  * @param chatId 群标识（字符串形态的 Telegram chat id）。
  * @param messageId 消息 id。
+ * @param discriminator 编辑等「同一条消息的多个版本」的判别符；新消息省略。
  * @returns uuid 形态的事件 id。
  */
-export function deriveEventId(chatId: ChatId, messageId: number): string {
-  return uuidFromHash(sha256Hex(`message-event:${chatId}:${messageId}`))
+export function deriveEventId(chatId: ChatId, messageId: number, discriminator?: string | null): string {
+  const base = `message-event:${chatId}:${messageId}`
+  const input = discriminator === undefined || discriminator === null ? base : `${base}:${discriminator}`
+  return uuidFromHash(sha256Hex(input))
 }
 
 /**

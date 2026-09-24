@@ -16,7 +16,10 @@ import type { ChatConfig, ChatId, Rule } from '@skitarii/core'
  * 默认规则。两条约定：
  * - `id` 用固定字符串：重建配置时不会产生新 id，历史信号仍能还原出规则。
  * - `pattern` 一律按**归一化后**的形态书写：`normalize` 会把「加v」改写成「加微信」，
- *   按原始写法写规则会永远匹配不上。新增规则前先本地跑一遍 `normalize`。
+ *   按原始写法写规则会永远匹配不上。新增规则前先本地跑一遍 `normalize`（身份同样会被归一化）。
+ *
+ * 名字信号与来源工具的差异：n8n 工作流对可疑名字（Cyrillic/Arabic/中文广告词、用户名含 USDT）
+ * 是命中即封，误杀面过大；这里只作 0.4 的计分信号，单条命中落在灰色地带，由 LLM 结合上下文判。
  */
 const DEFAULT_RULES: readonly Rule[] = [
   { id: 'default-ad-wechat', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
@@ -27,6 +30,43 @@ const DEFAULT_RULES: readonly Rule[] = [
   { id: 'default-scam-gamble', kind: 'keyword', pattern: '带单', score: 0.5, actionHint: 'mute', enabled: true },
   { id: 'default-link-telegram', kind: 'link-domain', pattern: 't.me', score: 0.4, actionHint: 'delete', enabled: true },
   { id: 'default-link-shortener', kind: 'link-domain', pattern: 'bit.ly', score: 0.5, actionHint: 'delete', enabled: true },
+  {
+    id: 'default-name-ad',
+    kind: 'sender-name',
+    pattern: '助手|速查|客服|空投|红包|内幕|主页|点我|资料|转账|返利|稳赚|必赢|带单',
+    score: 0.4,
+    actionHint: 'delete',
+    enabled: true,
+  },
+  { id: 'default-name-crypto', kind: 'sender-name', pattern: 'usdt|usdc', score: 0.4, actionHint: 'delete', enabled: true },
+  // 自定义表情堆砌。来源工具的实测阈值是 >5，这里取 6 作最小计数；单条命中 0.4，落在灰色地带。
+  {
+    id: 'default-emoji-burst',
+    kind: 'custom-emoji',
+    pattern: '6',
+    score: 0.4,
+    actionHint: 'delete',
+    enabled: true,
+  },
+  // 私有邀请链接比通用 t.me 域名（default-link-telegram）强得多：两条规则叠加命中 0.8 直接处置；
+  // 该规则自身只贡献 0.4，单独命中（链接特征缺失时）仍落在灰色地带。
+  {
+    id: 'default-link-private-invite',
+    kind: 'regex',
+    pattern: String.raw`t\.me/\+[a-z0-9_-]{16}`,
+    score: 0.4,
+    actionHint: 'delete',
+    enabled: true,
+  },
+  // bot 拉人头模式：`/start <推荐码> @xxxbot`。命中 0.5，单独落在灰色地带。
+  {
+    id: 'default-bot-referral',
+    kind: 'regex',
+    pattern: '/start [a-z0-9_-]+ @[a-z0-9_]*bot',
+    score: 0.5,
+    actionHint: 'delete',
+    enabled: true,
+  },
 ]
 
 /** 默认禁言时长（分钟）。一小时足够让刷屏者停下，又不至于误伤后长时间无法发言。 */

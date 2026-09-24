@@ -30,6 +30,11 @@ export interface JudgeInput {
   language: ChatConfig['language']
   /** 该群的规则集，帮助模型对齐本群的判定口径。 */
   rules: Rule[]
+  /**
+   * 归一化后的发送者身份（显示名与 `@用户名`）。可选：调用方拿不到身份时不带。
+   * 身份是用户可自设的内容，提示词侧必须与消息正文同等对待（注入防护）。
+   */
+  senderIdentity?: string
 }
 
 /** 复核结论。`rationale` 只用于申诉复盘与人工排查，不进任何自动化判定。 */

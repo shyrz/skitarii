@@ -23,8 +23,14 @@ import type { Logger } from './logger.js'
  *
  * 顺序（每一步的理由）：
  * 1. 落 MessageEvent。先落库再判定：判定崩了消息还在，事后能复盘，也不会因为群配置缺失丢事件。
- *    事件 id 由 `(chatId, messageId)` 派生，重投递天然幂等。
+ *    事件 id 由 `(chatId, messageId)` 派生，重投递天然幂等；编辑消息额外带
+ *    `edit:${editDate}:${内容哈希前 16 位}` 判别符，每次编辑是独立事件（各自产生决策），
+ *    同一编辑的重投递仍幂等。`edit_date` 只有秒级粒度，必须把内容哈希一起放进判别符：
+ *    同一秒内先编辑成正常内容、再改成违规内容时，若两次共用判别符，第二个事件会与第一个碰撞、
+ *    被静默去重，违规内容留在群里却不再被处置。代价是编辑回退到早前内容时 id 与早前那次相同、
+ *    跳过重审（同一状态已经审过，视为幂等）。
  * 2. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
+ *    规则匹配同时看正文与发送者身份（后者只服务 sender-name 规则，不落库）。
  * 3. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
  *    复核失败只记日志，不追加信号，让 `decide` 走「待复核」的 warn 分支且不计累犯。这是既定口径：
  *    复核不可用时绝不能按 `actionHint` 直接动手，那等价于悄悄把 `llmThreshold` 降到 `passThreshold`。
@@ -46,6 +52,19 @@ export const RECIDIVISM_WINDOW_DAYS = 7
 /** 一天的毫秒数，用于把窗口天数换算成时间戳。 */
 const DAY_MS = 24 * 60 * 60 * 1_000
 
+/**
+ * 频道评论场景的深链锚点。
+ *
+ * 讨论组里的评论通过回复一条「频道帖子的转发」挂到原帖下；只有用频道用户名 + 帖子 id 拼出的
+ * `t.me/<channel>/<post>?comment=<messageId>` 才能点进评论上下文，`t.me/c/` 链接在评论场景打不开目标。
+ */
+export interface CommentThread {
+  /** 被评论频道的公开用户名（不含 `@`）。 */
+  channelUsername: string
+  /** 原频道帖子的消息 id。 */
+  postId: number
+}
+
 /** 管线输入：由 bot 适配层从更新里提取的字段。刻意不传 grammY 的上下文，便于测试直接构造。 */
 export interface IncomingMessage {
   chatId: ChatId
@@ -55,6 +74,16 @@ export interface IncomingMessage {
   /** 原文（正文或 caption）。是内容哈希与摘录的唯一来源。 */
   text: string
   features: MessageFeatures
+  /**
+   * Telegram `edit_date`（Unix 秒）；新消息为 `null`。编辑更新缺失该字段时，
+   * bot 层会给出内容哈希派生的兜底值，保证同一编辑的重投递幂等（见 `bot.ts`）。
+   * 它只参与事件判别符（与内容哈希前 16 位拼接），不参与判定。
+   */
+  editDate: number | null
+  /** 发送者身份原文（显示名与 `@用户名`）；由管线负责 `normalize`，不落库。 */
+  senderIdentity: string
+  /** 评论的深链锚点；非评论场景为 `null`。 */
+  commentThread: CommentThread | null
 }
 
 /** 管线依赖。 */
@@ -94,6 +123,8 @@ export interface DecisionObservation {
   /** 最终处置。 */
   action: Action
   decisionId: string
+  /** 评论的深链锚点；由入站消息透传，非评论场景为 `null`。 */
+  commentThread: CommentThread | null
 }
 
 /**
@@ -105,7 +136,11 @@ export interface DecisionObservation {
 export async function handleIncomingMessage(deps: PipelineDeps, message: IncomingMessage): Promise<void> {
   const now = deps.now ?? (() => new Date())
   const contentHash = contentHashOf(message.text)
-  const eventId = deriveEventId(message.chatId, message.messageId)
+  const eventId = deriveEventId(
+    message.chatId,
+    message.messageId,
+    message.editDate === null ? undefined : `edit:${message.editDate}:${contentHash.slice(0, 16)}`,
+  )
   const decisionId = deriveDecisionId(eventId)
 
   await deps.repos.events.insert({
@@ -120,13 +155,15 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
 
   const config = await loadConfig(deps, message)
   const normalized = normalize(message.text)
-  const ruleSignals = matchRules(normalized, message.features, config.rules)
+  const identity = normalize(message.senderIdentity)
+  const ruleSignals = matchRules(normalized, message.features, config.rules, identity)
   const ruleScore = scoreOf(ruleSignals)
 
   const signals = await collectSignals(deps, {
     message,
     config,
     normalized,
+    identity,
     ruleSignals,
     ruleScore,
     contentHash,
@@ -181,6 +218,7 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
       score: stored.score,
       action: stored.action,
       decisionId: stored.id,
+      commentThread: message.commentThread,
     })
   }
 
@@ -217,12 +255,13 @@ async function collectSignals(
     message: IncomingMessage
     config: ChatConfig
     normalized: string
+    identity: string
     ruleSignals: Signal[]
     ruleScore: number
     contentHash: string
   },
 ): Promise<Signal[]> {
-  const { config, normalized, ruleSignals, ruleScore, contentHash, message } = context
+  const { config, normalized, identity, ruleSignals, ruleScore, contentHash, message } = context
 
   const inGreyZone = ruleScore >= config.passThreshold && ruleScore < config.llmThreshold
   if (!inGreyZone) return ruleSignals
@@ -239,6 +278,8 @@ async function collectSignals(
       signals: ruleSignals,
       language: config.language,
       rules: config.rules,
+      // 空身份不带：让「没有身份可用」与「身份是空串」在送审材料里表现一致。
+      ...(identity.length > 0 ? { senderIdentity: identity } : {}),
     })
     return [...ruleSignals, { kind: 'llm', verdict: result.verdict, confidence: result.confidence }]
   } catch (error) {

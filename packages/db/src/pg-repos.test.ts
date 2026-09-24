@@ -74,7 +74,7 @@ describe('写入语句的形状与参数化', () => {
       userId: asUserId(7_000_000_001),
       messageId: 42,
       contentHash: 'a'.repeat(64),
-      features: { hasLink: true, mediaType: 'photo', length: 18 },
+      features: { hasLink: true, mediaType: 'photo', length: 18, customEmojiCount: 2 },
       createdAt: new Date('2026-09-23T10:00:00Z'),
     })
 
@@ -91,6 +91,7 @@ describe('写入语句的形状与参数化', () => {
       true,
       'photo',
       18,
+      2,
       '2026-09-23T10:00:00.000Z',
     ])
   })
@@ -296,6 +297,7 @@ describe('迁移产物', () => {
     expect(sql).toContain('ADD COLUMN "sample_text" text;')
     expect(sql).toContain('ADD COLUMN "resolved_by" bigint;')
     expect(sql).toContain('ADD COLUMN "notified_at" timestamp with time zone;')
+    expect(sql).toContain('ADD COLUMN "custom_emoji_count" integer DEFAULT 0 NOT NULL;')
     expect(sql).toContain(`char_length("message_events"."sample_text") <= ${SAMPLE_TEXT_MAX_LENGTH}`)
     expect(sql).toContain('CREATE UNIQUE INDEX "appeals_decision_unique"')
   })

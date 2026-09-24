@@ -3,11 +3,13 @@ import { createCachedJudge, LlmError, type CachedJudge, type JudgeInput, type Ju
 import { describe, expect, test, vi } from 'vitest'
 import type { ActionExecutor } from './executor.js'
 import { createActionExecutor } from './executor.js'
+import { defaultChatConfig } from './defaults.js'
+import { contentHashOf } from './features.js'
 import { deriveDecisionId, deriveEventId } from './ids.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createInMemoryRepos, type InMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
-import { handleIncomingMessage, type DecisionObservation } from './pipeline.js'
+import { handleIncomingMessage, type CommentThread, type DecisionObservation } from './pipeline.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
 import { createTokenBucket } from './token-bucket.js'
 
@@ -203,9 +205,11 @@ describe('消息管线', () => {
     expect(store.sampleOf(eventId)).toBe('加v推荐一个渠道')
   })
 
-  test('相同内容在另一个群命中复核缓存，不再调用模型', async () => {
+  test('相同内容在另一个群、规则信号也相同：命中复核缓存，不再调用模型', async () => {
     const { store, judgeStub, executor, judge } = setup({ cacheJudge: true })
     await store.repos.chats.upsert(chatConfig)
+    // 指纹覆盖语言与规则信号：只有两群的配置一致（命中同一条规则、同分、同语言）时才应命中缓存。
+    await store.repos.chats.upsert({ ...chatConfig, chatId: asChatId('-1009999999999') })
 
     await handleIncomingMessage(
       { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
@@ -217,6 +221,24 @@ describe('消息管线', () => {
     )
 
     expect(judgeStub.calls).toHaveLength(1)
+  })
+
+  test('相同内容但另一群的规则不同：信号进入指纹，缓存不复用（两次都调模型）', async () => {
+    const { store, judgeStub, executor, judge } = setup({ cacheJudge: true })
+    await store.repos.chats.upsert(chatConfig)
+    // 第二个群用默认规则：同一条正文命中的 ruleId 与分数不同，送审材料不同，不该复用结论。
+    await store.repos.chats.upsert(defaultChatConfig(asChatId('-1009999999999'), '另一个群', 'zh'))
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 106 }),
+    )
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 107, chatId: asChatId('-1009999999999') }),
+    )
+
+    expect(judgeStub.calls).toHaveLength(2)
   })
 
   test('未登记的群写入默认配置后照常审核', async () => {
@@ -348,10 +370,34 @@ describe('消息管线', () => {
         score: 1,
         action: { kind: 'delete' },
         decisionId: deriveDecisionId(deriveEventId(chatId, 111)),
+        commentThread: null,
       },
     ])
     expect(deletesAtNotify).toEqual([0])
     expect(recording.countOf('deleteMessage')).toBe(1)
+  })
+
+  test('评论场景：commentThread 随判定摘要透传给 owner', async () => {
+    const { store, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const observations: DecisionObservation[] = []
+    const commentThread: CommentThread = { channelUsername: 'chan_pub', postId: 77 }
+
+    await handleIncomingMessage(
+      {
+        repos: store.repos,
+        judge,
+        executor,
+        logger: silentLogger,
+        now: fixedNow,
+        notifyOwner: async (observation) => {
+          observations.push(observation)
+        },
+      },
+      incoming({ text: '加v推荐一个渠道', messageId: 121, commentThread }),
+    )
+
+    expect(observations[0]?.commentThread).toEqual(commentThread)
   })
 
   test('重投递同一条消息：判定摘要只发一次', async () => {
@@ -386,6 +432,142 @@ describe('消息管线', () => {
 
     expect(recording.countOf('deleteMessage')).toBe(1)
     expect(recording.countOf('sendMessage')).toBe(1)
+  })
+})
+
+describe('编辑消息审核', () => {
+  test('每次编辑产生独立事件与决策，同一编辑重投递不重复落库与执行', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const deps = { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow }
+    const editDate = 1_758_627_000
+    // 判别符的固定形态：编辑时间 + 内容哈希前 16 位。
+    const discriminator = `edit:${editDate}:${contentHashOf('加v推荐一个渠道').slice(0, 16)}`
+
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 120 }))
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 120, editDate }))
+    // 同一编辑的 Telegram 重投递：派生 id 相同，事件与决策都是静默无操作。
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 120, editDate }))
+
+    const counts = await store.repos.aggregates.countForDay(
+      chatId,
+      new Date('2026-09-01T00:00:00Z'),
+      new Date('2026-10-01T00:00:00Z'),
+    )
+    // 原始消息 + 一次编辑共两条事件，重投递没有写出第三条。
+    expect(counts.messageCount).toBe(2)
+    expect(counts.actionCount).toBe(2)
+
+    const editDecision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 120, discriminator)))
+    expect(editDecision?.action).toEqual({ kind: 'delete' })
+    expect(recording.countOf('deleteMessage')).toBe(2)
+  })
+
+  test('同一秒内两次不同内容的编辑：判别符含内容哈希，各自成事件与决策', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const deps = { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow }
+    const editDate = 1_758_627_000
+
+    // 绕过形态：先编辑成正常内容（放行），再在同一个 edit_date 秒内改成违规内容。
+    // 两次判别符必须不同，否则第二次事件与第一次决策 id 碰撞、被静默去重，违规内容不再被处置。
+    await handleIncomingMessage(deps, incoming({ text: '这个键盘手感不错', messageId: 121, editDate }))
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 121, editDate }))
+
+    const counts = await store.repos.aggregates.countForDay(
+      chatId,
+      new Date('2026-09-01T00:00:00Z'),
+      new Date('2026-10-01T00:00:00Z'),
+    )
+    expect(counts.messageCount).toBe(2)
+
+    const benignId = deriveDecisionId(
+      deriveEventId(chatId, 121, `edit:${editDate}:${contentHashOf('这个键盘手感不错').slice(0, 16)}`),
+    )
+    const adId = deriveDecisionId(deriveEventId(chatId, 121, `edit:${editDate}:${contentHashOf('加v推荐一个渠道').slice(0, 16)}`))
+    expect(benignId).not.toBe(adId)
+    expect((await store.repos.decisions.findById(benignId))?.action).toEqual({ kind: 'pass' })
+    expect((await store.repos.decisions.findById(adId))?.action).toEqual({ kind: 'delete' })
+    expect(recording.countOf('deleteMessage')).toBe(1)
+  })
+
+  test('编辑回退到早前内容：复用当时的事件 id，跳过重审（幂等）', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const deps = { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow }
+    const editDate = 1_758_627_000
+
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 122, editDate }))
+    await handleIncomingMessage(deps, incoming({ text: '这个键盘手感不错', messageId: 122, editDate }))
+    // 回到与第一次相同的内容：判别符与第一次相同，决策已存在且已执行，不再重审、不重复施加动作。
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 122, editDate }))
+
+    const counts = await store.repos.aggregates.countForDay(
+      chatId,
+      new Date('2026-09-01T00:00:00Z'),
+      new Date('2026-10-01T00:00:00Z'),
+    )
+    expect(counts.messageCount).toBe(2)
+    expect(recording.countOf('deleteMessage')).toBe(1)
+  })
+})
+
+describe('默认规则：名字信号与高精度正则', () => {
+  test('私有邀请链接叠加 t.me 域名规则，0.8 直接处置', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: 't.me/+AbCdEf1234567890xy', messageId: 130, hasLink: true }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 130)))
+    // 归一化后为 t.me/+abcdef1234567890xy：两条规则各 0.4，越过 llmThreshold 后直接处置。
+    expect(decision?.signals).toEqual([
+      { kind: 'rule-hit', ruleId: 'default-link-telegram', score: 0.4 },
+      { kind: 'rule-hit', ruleId: 'default-link-private-invite', score: 0.4 },
+    ])
+    expect(decision?.score).toBe(0.8)
+    expect(decision?.action).toEqual({ kind: 'delete' })
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.countOf('deleteMessage')).toBe(1)
+  })
+
+  test('bot 拉人头模式命中 0.5 送审，复核收到归一化发送者身份', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '/start abc123 @SomeBot', messageId: 131, senderIdentity: '张三' }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 131)))
+    expect(decision?.signals).toEqual([
+      { kind: 'rule-hit', ruleId: 'default-bot-referral', score: 0.5 },
+      { kind: 'llm', verdict: 'spam', confidence: 0.9 },
+    ])
+    expect(judgeStub.calls).toHaveLength(1)
+    expect(judgeStub.calls[0]?.senderIdentity).toBe('张三')
+    expect(decision?.action).toEqual({ kind: 'delete' })
+  })
+
+  test('名字命中与正文命中叠加到 0.8，不消耗复核调用', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加微信', messageId: 132, senderIdentity: '速查小助手' }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 132)))
+    expect(decision?.signals).toEqual([
+      { kind: 'rule-hit', ruleId: 'default-ad-wechat', score: 0.4 },
+      { kind: 'rule-hit', ruleId: 'default-name-ad', score: 0.4 },
+    ])
+    expect(decision?.score).toBe(0.8)
+    expect(decision?.action).toEqual({ kind: 'delete' })
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.countOf('deleteMessage')).toBe(1)
   })
 })
 
@@ -441,7 +623,16 @@ async function withPipeline(
  * @param overrides 覆盖字段。
  * @returns 管线输入。
  */
-function incoming(overrides: { text: string; messageId: number; chatId?: ReturnType<typeof asChatId> }) {
+function incoming(overrides: {
+  text: string
+  messageId: number
+  chatId?: ReturnType<typeof asChatId>
+  editDate?: number
+  senderIdentity?: string
+  hasLink?: boolean
+  customEmojiCount?: number
+  commentThread?: CommentThread
+}) {
   const text = overrides.text
   return {
     chatId: overrides.chatId ?? chatId,
@@ -449,7 +640,15 @@ function incoming(overrides: { text: string; messageId: number; chatId?: ReturnT
     messageId: overrides.messageId,
     userId,
     text,
-    features: { hasLink: false, mediaType: 'text' as const, length: Array.from(text).length },
+    features: {
+      hasLink: overrides.hasLink ?? false,
+      mediaType: 'text' as const,
+      length: Array.from(text).length,
+      customEmojiCount: overrides.customEmojiCount ?? 0,
+    },
+    editDate: overrides.editDate ?? null,
+    senderIdentity: overrides.senderIdentity ?? '',
+    commentThread: overrides.commentThread ?? null,
   }
 }
 

@@ -1,5 +1,5 @@
 import type { MessageFeatures } from '@skitarii/core'
-import type { Message } from 'grammy/types'
+import type { Message, User } from 'grammy/types'
 import { sha256Hex } from './ids.js'
 
 /**
@@ -32,6 +32,7 @@ export function extractFeatures(message: Message, text: string): MessageFeatures
     hasLink: hasLink(message, text),
     mediaType: mediaTypeOf(message, text),
     length: Array.from(text).length,
+    customEmojiCount: customEmojiCount(message),
   }
 }
 
@@ -46,6 +47,21 @@ export function contentHashOf(text: string): string {
 }
 
 /**
+ * 提取发送者身份文本：`first_name`、`last_name`、`@username` 用空格连接，空段省略。
+ *
+ * 返回的是**未归一化**的原文，由管线调用 `normalize` 后再交给 `sender-name` 规则，
+ * 与正文共享同一套归一化口径。身份只存在于运行时：它不进 `MessageFeatures`、不落库，
+ * 只有规则匹配与灰色地带的复核提示词会读到它。
+ *
+ * @param from 消息发送者。
+ * @returns 身份文本；无 username 时只有显示名。
+ */
+export function extractSenderIdentity(from: User): string {
+  const username = from.username === undefined || from.username.length === 0 ? '' : `@${from.username}`
+  return [from.first_name, from.last_name ?? '', username].filter((part) => part.length > 0).join(' ')
+}
+
+/**
  * 判定是否含链接。
  *
  * @param message 消息对象。
@@ -56,6 +72,21 @@ function hasLink(message: Message, text: string): boolean {
   const entities = [...(message.entities ?? []), ...(message.caption_entities ?? [])]
   if (entities.some((entity) => LINK_ENTITY_TYPES.has(entity.type))) return true
   return BARE_HOST.test(text)
+}
+
+/**
+ * 统计自定义表情数量。
+ *
+ * `custom_emoji` 是 Telegram 的付费自定义表情（任何用户可买的合法功能），
+ * 单独出现不说明什么；但广告号常用它们把消息堆成一条表情墙来抢视觉，来源工作流的实测阈值是 >5。
+ * 与 `hasLink` 一样同时数正文与 caption 上的实体。
+ *
+ * @param message 消息对象。
+ * @returns `entities` 与 `caption_entities` 中 `custom_emoji` 实体的总数。
+ */
+function customEmojiCount(message: Message): number {
+  const entities = [...(message.entities ?? []), ...(message.caption_entities ?? [])]
+  return entities.filter((entity) => entity.type === 'custom_emoji').length
 }
 
 /**

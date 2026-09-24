@@ -9,7 +9,7 @@
 ```
 packages/core   领域层。类型权威、归一化、规则匹配、处置决策，纯函数，无 I/O 无框架依赖
 packages/db     Postgres 存储层。drizzle schema、迁移、连接工厂、7 个仓储的 PG 实现与内存实现
-packages/llm    云端 LLM 复核。OpenAI 兼容协议的调用实现、提示词、按内容哈希的缓存包装
+packages/llm    云端 LLM 复核。OpenAI 兼容协议的调用实现、提示词、按判定指纹的缓存包装
 apps/bot        审核运行时。createBot 工厂、消息管线、动作执行器、申诉回调（长轮询入口在 src/index.ts）
 apps/server     node:http 进程。Telegram webhook、Mini App API、静态托管、维护调度器的宿主
 apps/web        Mini App（Vite + React）
@@ -26,7 +26,8 @@ Telegram ──update──▶ apps/server /telegram/webhook ──▶ grammY we
                                                           │
    ┌──────────────────────────────────────────────────────▼───────────────────────────────────┐
    │ 消息管线 apps/bot/src/pipeline.ts                                                         │
-   │ 1 落 MessageEvent（id 由 chatId+messageId 派生，重投递幂等）                              │
+   │ 1 落 MessageEvent（id 由 chatId+messageId 派生，重投递幂等；编辑消息带编辑时间+内容哈希   │
+   │   判别符，每次编辑独立成事件）                                                            │
    │ 2 normalize → matchRules → scoreOf 分带                                                   │
    │     分数 < passThreshold        → 直接放行，不花钱                                        │
    │     score >= llmThreshold       → 直接按命中规则的 actionHint 处置                        │
@@ -55,7 +56,7 @@ Telegram ──update──▶ apps/server /telegram/webhook ──▶ grammY we
 
 - 灰色地带拿不到复核结论（LLM 未配置、超时、限流、解析失败）时 `decide` 返回 `warn`，**且不计累犯**。理由见 `packages/core/src/decide.ts`：直接按 `actionHint` 动手等于悄悄把 `llmThreshold` 降到 `passThreshold`。
 - 复核失败只记日志不上报错误：审核链路必须能只靠规则层运转。
-- 同一个 `contentHash` 的复核结论在 `llm_cache` 里复用（30 天后清理）。缓存只替代复核这一步，规则命中与 `decide` 每次都照常执行，因此群与群之间的配置差异不会被抹平。
+- 复核结论在 `llm_cache` 里按判定指纹复用（30 天后清理）：指纹覆盖正文哈希、发送者身份、语言、消息特征与规则命中信号，同一段正文换身份或换命中组合会重新复核，身份原文不落库。缓存只替代复核这一步，规则命中与 `decide` 每次都照常执行，因此群与群之间的配置差异不会被缓存抹平。
 
 ## 环境要求
 
@@ -246,11 +247,11 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **正文默认不留存，处置对象留摘录。** `message_events` 只有 `content_hash` 与特征列；唯一的正文落地形态是 `sample_text`，一条被判非放行的消息的原文摘录（≤280 字符），用于申诉复核与事后复盘。它由 SQL 条件强制：只有同事件存在非 `pass` 决策时才允许写入，放行消息的正文没有任何写入路径。
 
-**归一化是所有匹配的前提。** 文本先过 `normalize`，规则 pattern 按归一化后的形态编写（小写、简体、无拆词标点）。`normalize` 会把「加v」改写成「加微信」，按原始写法写规则永远匹配不上，新增规则前先跑一遍归一化。绕过词表在 `packages/core/src/normalize-map.ts`，扩充只改数据。
+**归一化是所有匹配的前提。** 文本先过 `normalize`，规则 pattern 按归一化后的形态编写（小写、简体、无拆词标点）。`normalize` 会把「加v」改写成「加微信」，按原始写法写规则永远匹配不上，新增规则前先跑一遍归一化。发送者身份（显示名与 `@用户名`）走同一套归一化，`kind: 'sender-name'` 的规则匹配的是身份而非正文；身份只存在于运行时，不落库。绕过词表在 `packages/core/src/normalize-map.ts`，扩充只改数据。
 
 **双阈值决定要不要花钱。** `passThreshold` 以下直接放行；`llmThreshold` 以上直接按命中的规则处置；只有落在中间的样本才调用 LLM。灰色地带没拿到复核结论时返回 `warn`，不执行破坏性动作。
 
-**重复投递不重复处置。** 事件 id 与决策 id 都由 `(chatId, messageId)` 派生（确定性的 uuid），落库用 `on conflict do nothing`；执行侧再叠一层 `eventId + action` 的进程内幂等闸门与 `moderation_decisions.executed` 回填。Telegram 重投递同一 update 的效果是「什么都不再发生」。
+**重复投递不重复处置。** 事件 id 由 `(chatId, messageId)` 派生（编辑消息附加 `edit:${edit_date}:${内容哈希前 16 位}` 判别符：同一秒内不同内容的编辑各自成事件，编辑回退到早前内容时复用当时的事件 id、不再重审），决策 id 由事件 id 派生，落库用 `on conflict do nothing`；执行侧再叠一层 `eventId + action` 的进程内幂等闸门与 `moderation_decisions.executed` 回填。Telegram 重投递同一 update 的效果是「什么都不再发生」。
 
 **不变量尽量进 DDL。** 阈值必须有序、`mute` 才带解禁时刻、置信度与分数限定在 0..1、结案状态与结案时间/结案人必须一致、一条处置至多一条申诉，这些都写成 CHECK 与唯一索引，绕过应用的写入同样会被拒绝。
 
@@ -267,3 +268,4 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 - 单进程假设：幂等闸门与令牌桶都在进程内，多实例部署前需要把它们挪到共享存储。
 - 累犯计数在并发处理下的阈值竞态：`countPriorViolations` 读的是已落库的决策数，同一用户两条消息被并发处理时，两边都可能数到「还差一条」而不加重档位（漏加重）。窗口内累计三次的判定因此是尽力而为，不保证严格；要严格需要给 `(chatId, userId)` 加锁或改成数据库侧的原子计数。
 - 时间源没有贯穿 `decide`：`mute` 的解禁时刻由 `packages/core` 的 `decide` 直接读 `Date.now()` 算出，不经过管线注入的 `now`。正常运行时两者是同一个挂钟，影响只在测试与本地跑批：要用自定义时间源断言 `mute.until` 时得先冻结 `Date`。
+- 同一消息的每次编辑产生独立事件与决策，频繁编辑会加速累犯计数（设计取舍：每次编辑是独立违规事件，不合并计数）。判别符是 `edit:${edit_date}:${内容哈希前 16 位}`：同一秒内不同内容的编辑各自成事件；编辑回退到早前内容时复用当时的事件 id，跳过重审（该状态已审过，代价是回退后不会按新语境重新判定）。

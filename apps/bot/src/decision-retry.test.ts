@@ -67,7 +67,7 @@ async function seedEvent(store: InMemoryRepos, id: string, messageId: number): P
     userId,
     messageId,
     contentHash: id,
-    features: { hasLink: false, mediaType: 'text', length: 4 },
+    features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0 },
     createdAt: new Date('2026-09-23T10:00:00Z'),
   })
 }

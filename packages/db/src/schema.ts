@@ -107,6 +107,8 @@ export const messageEvents = pgTable(
     hasLink: boolean('has_link').notNull(),
     mediaType: mediaType('media_type').notNull(),
     length: integer('length').notNull(),
+    /** `custom_emoji` 实体数量（`MessageFeatures['customEmojiCount']`）。付费表情堆砌是广告信号的来源。 */
+    customEmojiCount: integer('custom_emoji_count').notNull().default(0),
     /**
      * 正文摘录（去掉首尾空白后截到 {@link SAMPLE_TEXT_MAX_LENGTH}）。空值表示「本条没有留下摘录」：
      * 放行的消息不留、纯媒体无文本的消息也没有。仅当该事件存在非 pass 决策时才允许写入。
@@ -232,12 +234,14 @@ export const dailyAggregates = pgTable(
 )
 
 /**
- * 复核缓存。键是消息内容哈希：同一段文本在任何一个群被判定过一次，就不再消耗第二次 LLM 调用。
- * 缓存命中仍会走 `decide`，因此规则集的差异不会被缓存抹平。
+ * 复核缓存。键是判定指纹，不是裸内容哈希：指纹覆盖正文哈希、发送者身份、语言、消息特征与
+ * 规则信号（派生见 `packages/llm/src/cached-judge.ts`），因此同一段正文换发送者或换命中组合
+ * 会重新复核，身份原文不落库。缓存命中仍会走 `decide`，规则集的差异不会被缓存抹平。
  */
 export const llmCache = pgTable(
   'llm_cache',
   {
+    /** 判定指纹（sha256 摘要）；列名沿用 `content_hash`。 */
     contentHash: text('content_hash').primaryKey(),
     verdict: llmVerdict('verdict').notNull(),
     confidence: real('confidence').notNull(),

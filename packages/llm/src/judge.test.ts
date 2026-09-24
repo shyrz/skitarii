@@ -1,4 +1,4 @@
-import type { JudgeInput, JudgeResult, LlmConfig } from './types.js'
+import type { JudgeInput, LlmConfig } from './types.js'
 import { describe, expect, test, vi } from 'vitest'
 import { createCachedJudge, type JudgeCache, type JudgeCacheRecord } from './cached-judge.js'
 import { createOpenAiJudge } from './openai-judge.js'
@@ -12,7 +12,7 @@ const config: LlmConfig = {
 
 const input: JudgeInput = {
   text: '全网最低价会员年卡，需要的加v私聊',
-  features: { hasLink: false, mediaType: 'text', length: 18 },
+  features: { hasLink: false, mediaType: 'text', length: 18, customEmojiCount: 0 },
   signals: [{ kind: 'rule-hit', ruleId: 'rule-1', score: 0.4 }],
   language: 'zh',
   rules: [{ id: 'rule-1', kind: 'keyword', pattern: '加v', score: 0.4, actionHint: 'delete', enabled: true }],
@@ -172,13 +172,31 @@ describe('OpenAI 兼容复核器', () => {
     // few-shot 三对 + system + 本次 user
     expect(body.messages).toHaveLength(8)
   })
+
+  test('带发送者身份时请求体渲染身份标签与内容', async () => {
+    const { stub, calls } = createFetchStub(() => completionResponse('{"verdict":"legit","confidence":0.5}'))
+    await createOpenAiJudge(config, { fetch: stub }).judge({ ...input, senderIdentity: '客服小美 @official_usdt' })
+
+    const body = JSON.parse(String(calls[0]?.init?.body))
+    const last = body.messages.at(-1)
+    expect(last.content).toContain('【发送者】客服小美 @official_usdt')
+    // 注入防护声明覆盖身份字段。
+    expect(body.messages[0].content).toContain('【发送者】')
+  })
+
+  test('不带发送者身份时请求体没有身份标签', async () => {
+    const { stub, calls } = createFetchStub(() => completionResponse('{"verdict":"legit","confidence":0.5}'))
+    await createOpenAiJudge(config, { fetch: stub }).judge(input)
+
+    const body = JSON.parse(String(calls[0]?.init?.body))
+    expect(body.messages.at(-1).content).not.toContain('【发送者】')
+  })
 })
 
 describe('带缓存的复核器', () => {
-  /** 内存缓存替身，记录读写次数。 */
-  function createMemoryCache(seed: JudgeCacheRecord | null = null) {
+  /** 内存缓存替身，记录写入。 */
+  function createMemoryCache() {
     const store = new Map<string, JudgeCacheRecord>()
-    if (seed !== null) store.set(seed.contentHash, seed)
     const puts: JudgeCacheRecord[] = []
     const cache: JudgeCache = {
       async get(contentHash) {
@@ -193,15 +211,18 @@ describe('带缓存的复核器', () => {
   }
 
   test('命中缓存时不调用复核器，直接复用结论且不带理由', async () => {
-    const { cache } = createMemoryCache({
-      contentHash: 'hash-1',
-      verdict: 'scam',
-      confidence: 0.91,
-      model: 'gpt-4o-mini-2024-07-18',
-    })
-    const judge = { judge: vi.fn<() => Promise<JudgeResult>>() }
+    const { cache } = createMemoryCache()
+    const judge = {
+      judge: vi.fn(async () => ({
+        verdict: 'scam' as const,
+        confidence: 0.91,
+        model: 'gpt-4o-mini-2024-07-18',
+        rationale: '引流',
+      })),
+    }
     const cached = createCachedJudge({ judge, cache })
 
+    await cached('hash-1', input)
     const result = await cached('hash-1', input)
 
     expect(result).toEqual({
@@ -210,10 +231,10 @@ describe('带缓存的复核器', () => {
       model: 'gpt-4o-mini-2024-07-18',
       rationale: null,
     })
-    expect(judge.judge).not.toHaveBeenCalled()
+    expect(judge.judge).toHaveBeenCalledTimes(1)
   })
 
-  test('未命中时调用复核器并按 contentHash 回写', async () => {
+  test('未命中时调用复核器，回写的是判定指纹而非裸内容哈希', async () => {
     const { cache, puts } = createMemoryCache()
     const judge = {
       judge: vi.fn(async () => ({ verdict: 'spam' as const, confidence: 0.77, model: 'gpt-4o-mini', rationale: '推广' })),
@@ -224,7 +245,12 @@ describe('带缓存的复核器', () => {
 
     expect(result).toEqual({ verdict: 'spam', confidence: 0.77, model: 'gpt-4o-mini', rationale: '推广' })
     expect(judge.judge).toHaveBeenCalledTimes(1)
-    expect(puts).toEqual([{ contentHash: 'hash-2', verdict: 'spam', confidence: 0.77, model: 'gpt-4o-mini' }])
+    expect(puts).toHaveLength(1)
+    expect(puts[0]).toMatchObject({ verdict: 'spam', confidence: 0.77, model: 'gpt-4o-mini' })
+    // 键是 sha256 摘要：不可逆，也不等于送进来的正文哈希。
+    expect(puts[0]?.contentHash).toMatch(/^[0-9a-f]{64}$/u)
+    expect(puts[0]?.contentHash).not.toBe('hash-2')
+    expect(await cache.get('hash-2')).toBeNull()
   })
 
   test('第二次相同内容直接走缓存，不再调用复核器', async () => {
@@ -245,6 +271,32 @@ describe('带缓存的复核器', () => {
     expect(judge.judge).toHaveBeenCalledTimes(1)
     expect(puts).toHaveLength(1)
     expect(second).toEqual({ ...first, rationale: null })
+  })
+
+  test('同正文不同发送者身份：不复用缓存，两次都调模型', async () => {
+    const { cache } = createMemoryCache()
+    const judge = {
+      judge: vi.fn(async () => ({ verdict: 'legit' as const, confidence: 0.6, model: 'gpt-4o-mini', rationale: null })),
+    }
+    const cached = createCachedJudge({ judge, cache })
+
+    await cached('hash-5', { ...input, senderIdentity: '普通用户' })
+    await cached('hash-5', { ...input, senderIdentity: '客服小美 @official_usdt' })
+
+    expect(judge.judge).toHaveBeenCalledTimes(2)
+  })
+
+  test('同正文同身份但规则信号不同：不复用缓存', async () => {
+    const { cache } = createMemoryCache()
+    const judge = {
+      judge: vi.fn(async () => ({ verdict: 'spam' as const, confidence: 0.8, model: 'gpt-4o-mini', rationale: null })),
+    }
+    const cached = createCachedJudge({ judge, cache })
+
+    await cached('hash-6', { ...input, signals: [{ kind: 'rule-hit', ruleId: 'rule-1', score: 0.4 }] })
+    await cached('hash-6', { ...input, signals: [{ kind: 'rule-hit', ruleId: 'rule-2', score: 0.5 }] })
+
+    expect(judge.judge).toHaveBeenCalledTimes(2)
   })
 
   test('复核失败时不写缓存，错误原样抛出', async () => {

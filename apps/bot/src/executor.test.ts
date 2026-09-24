@@ -42,7 +42,14 @@ function decisionFixture(overrides: Partial<ModerationDecision> = {}): Moderatio
  * @param overrides 覆盖 api 处理器、限流桶容量等。
  * @returns 执行器、录制 api、内存仓储与依赖观察口。
  */
-function setup(overrides: { handlers?: Parameters<typeof createRecordingApi>[0]; capacity?: number } = {}) {
+function setup(
+  overrides: {
+    handlers?: Parameters<typeof createRecordingApi>[0]
+    capacity?: number
+    logger?: Logger
+    notifyOwnerFailure?: (decision: ModerationDecision, description: string) => Promise<void>
+  } = {},
+) {
   const recording: RecordingApi = createRecordingApi(overrides.handlers ?? {})
   const store = createInMemoryRepos()
   const idempotency = createIdempotencyRegistry()
@@ -54,11 +61,12 @@ function setup(overrides: { handlers?: Parameters<typeof createRecordingApi>[0];
     idempotency,
     outbound,
     miniAppUrl: 'https://mini.example.com/app',
-    logger: silentLogger,
+    logger: overrides.logger ?? silentLogger,
     now: () => new Date('2026-09-23T10:00:00Z'),
     sleep: async (ms) => {
       sleeps.push(ms)
     },
+    notifyOwnerFailure: overrides.notifyOwnerFailure,
   })
 
   return { executor, recording, store, idempotency, outbound, sleeps }
@@ -407,6 +415,97 @@ describe('处置执行', () => {
     expect(recording.countOf('deleteMessage')).toBe(1)
     expect(recording.countOf('sendMessage')).toBe(0)
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+  })
+
+  test('终结性拒绝时私聊 owner：带决策与拒绝原因', async () => {
+    const failures: Array<{ decision: ModerationDecision; description: string }> = []
+    const { executor, recording, store } = setup({
+      handlers: {
+        deleteMessage: () => {
+          throw new GrammyError(
+            'Call to deleteMessage failed',
+            { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete the message' },
+            'deleteMessage',
+            {},
+          )
+        },
+      },
+      notifyOwnerFailure: async (decision, description) => {
+        failures.push({ decision, description })
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    expect(failures).toEqual([
+      { decision, description: 'Bad Request: not enough rights to delete the message' },
+    ])
+    // 群内不发假通知；决策仍是终态。
+    expect(recording.countOf('sendMessage')).toBe(0)
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+  })
+
+  test('失败通知自身抛错不影响 executed 回填', async () => {
+    const warnings: Array<{ message: string; error: unknown }> = []
+    const logger: Logger = {
+      info: () => {},
+      warn: (message, error) => warnings.push({ message, error }),
+      error: () => {},
+    }
+    const { executor, store } = setup({
+      handlers: {
+        deleteMessage: () => {
+          throw new GrammyError(
+            'Call to deleteMessage failed',
+            { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete the message' },
+            'deleteMessage',
+            {},
+          )
+        },
+      },
+      logger,
+      notifyOwnerFailure: async () => {
+        throw new Error('owner 私聊不可达')
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await expect(executor.execute(decision, { messageId: 42 })).resolves.toBeUndefined()
+
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+    expect(warnings.map((warning) => warning.message)).toEqual([
+      expect.stringContaining('Telegram 拒绝该动作'),
+      `处置失败通知失败 decisionId=${decision.id}`,
+    ])
+  })
+
+  test('非终态错误不触发失败通知（抛出交给补偿扫描重试）', async () => {
+    const failures: unknown[] = []
+    const { executor, store } = setup({
+      handlers: {
+        deleteMessage: () => {
+          throw new GrammyError(
+            'Call to deleteMessage failed',
+            { ok: false, error_code: 403, description: 'Forbidden: bot is not a member of the chat' },
+            'deleteMessage',
+            {},
+          )
+        },
+      },
+      notifyOwnerFailure: async (decision, description) => {
+        failures.push({ decision, description })
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await expect(executor.execute(decision, { messageId: 42 })).rejects.toThrow('Forbidden')
+
+    expect(failures).toEqual([])
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: false })
   })
 })
 

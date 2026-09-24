@@ -1,0 +1,1 @@
+ALTER TABLE "message_events" ADD COLUMN "custom_emoji_count" integer DEFAULT 0 NOT NULL;

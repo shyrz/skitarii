@@ -48,7 +48,7 @@ async function seedEvent(store: InMemoryRepos, chatId: ChatId, id: string, creat
     userId,
     messageId: Number(id.replaceAll('-', '').slice(-4)) || 1,
     contentHash: id,
-    features: { hasLink: false, mediaType: 'text', length: 4 },
+    features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0 },
     createdAt,
   })
 }

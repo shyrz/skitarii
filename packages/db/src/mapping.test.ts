@@ -45,6 +45,7 @@ const eventRowFixture: MessageEventRow = {
   hasLink: true,
   mediaType: 'photo',
   length: 18,
+  customEmojiCount: 3,
   sampleText: '低价出售会员，需要的私聊',
   createdAt: new Date('2026-09-23T10:00:00Z'),
 }
@@ -76,6 +77,18 @@ describe('JSONB 解析与行映射', () => {
     expect(() => parseChatRules([{ ...ruleFixture, kind: 'fuzzy' }])).toThrow(ZodError)
   })
 
+  test('sender-name 是合法的匹配方式（身份规则与正文规则共用一张表）', () => {
+    expect(parseChatRules([{ ...ruleFixture, kind: 'sender-name', pattern: '客服|助手' }])).toEqual([
+      { ...ruleFixture, kind: 'sender-name', pattern: '客服|助手' },
+    ])
+  })
+
+  test('custom-emoji 是合法的匹配方式（pattern 为最小计数）', () => {
+    expect(parseChatRules([{ ...ruleFixture, kind: 'custom-emoji', pattern: '6' }])).toEqual([
+      { ...ruleFixture, kind: 'custom-emoji', pattern: '6' },
+    ])
+  })
+
   test('分数越界的规则被拒（阈值口径不允许脏数据进入判定）', () => {
     expect(() => parseChatRules([{ ...ruleFixture, score: 1.5 }])).toThrow(ZodError)
   })
@@ -95,7 +108,7 @@ describe('JSONB 解析与行映射', () => {
 
   test('事件行映射出特征对象，且不带出正文摘录', () => {
     const event = toMessageEvent(eventRowFixture)
-    expect(event.features).toEqual({ hasLink: true, mediaType: 'photo', length: 18 })
+    expect(event.features).toEqual({ hasLink: true, mediaType: 'photo', length: 18, customEmojiCount: 3 })
     expect(event.chatId).toBe(asChatId('-1001234567890'))
     expect(event.userId).toBe(asUserId(7_000_000_001))
     expect(Object.keys(event)).not.toContain('sampleText')

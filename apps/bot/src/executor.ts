@@ -19,8 +19,8 @@ import type { TokenBucket } from './token-bucket.js'
  * 执行序：先施加动作，再发通知，最后回填 `executed`。
  * - 动作失败（非终态）时不回填，决策留成「未执行」，重投递或人工补偿还能再试一次。
  * - 通知失败（限流桶空、编辑失败）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
- * - 动作被 Telegram 终结性拒绝时不发通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
- *   留着不填只会让补偿扫描反复重投递。
+ * - 动作被 Telegram 终结性拒绝时不发群内通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
+ *   留着不填只会让补偿扫描反复重投递。配置了 `notifyOwnerFailure` 时私聊 owner 一条失败通知。
  *
  * 幂等：动作与通知都在 `eventId:action` 的闸门内执行；决策已 `executed` 时直接跳过。
  *
@@ -53,6 +53,12 @@ export interface ActionExecutorDeps {
   now?: (() => Date) | undefined
   /** 429 退避用的 sleep，测试注入以避免真实等待。 */
   sleep?: ((ms: number) => Promise<void>) | undefined
+  /**
+   * 终结性拒绝后的私聊通知（处置失败通知）。缺省时不发。
+   * 实现必须自行吞掉发送失败（见 `owner-feed.ts` 的 `createOwnerFailureNotifier`），
+   * 这里还会再兜一层：通知是旁路，不能让它的异常打断 `executed` 回填。
+   */
+  notifyOwnerFailure?: ((decision: ModerationDecision, description: string) => Promise<void>) | undefined
 }
 
 /** 处置执行器。 */
@@ -71,9 +77,10 @@ export interface ActionExecutor {
  *
  * `applied` 带的是实际生效的动作：禁言/封禁遇到不可罚目标时会降级为删除，
  * 此时通知与完成日志都必须按这个动作说，不能看决策上的原动作（见 {@link applyAction}）。
- * `rejected` 表示 Telegram 终结性拒绝，决策可以回填 `executed` 但没有可通知的内容。
+ * `rejected` 表示 Telegram 终结性拒绝，决策可以回填 `executed` 但没有可通知的内容；
+ * `description` 是拒绝原因，进入失败日志与 owner 私聊。
  */
-export type ApplyOutcome = { kind: 'applied'; action: Action } | { kind: 'rejected' }
+export type ApplyOutcome = { kind: 'applied'; action: Action } | { kind: 'rejected'; description: string }
 
 /**
  * 决策的幂等键。
@@ -113,9 +120,13 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
 
       await deps.idempotency.run(idempotencyKeyOf(decision), async () => {
         const outcome = await applyAction(deps, decision, context)
-        // 终结性拒绝时不发通知：说「已删除」而实际没删是误导群成员，而且会给出一个指向不存在的处置的申诉入口。
+        // 终结性拒绝时不发群内通知：说「已删除」而实际没删是误导群成员，而且会给出一个指向不存在的处置的申诉入口。
         // 降级为删除时 outcome 带着实际生效的动作，文案随之改成「已删除」。
-        if (outcome.kind === 'applied') await sendNotice(deps, decision, outcome.action, now())
+        if (outcome.kind === 'applied') {
+          await sendNotice(deps, decision, outcome.action, now())
+        } else {
+          await notifyFailure(deps, decision, outcome.description)
+        }
         await deps.repos.decisions.markExecuted(decision.id)
         // 降级时把实际动作也写进日志（如 action=mute effective=delete），否则日志会让人以为禁言真的生效了。
         const effective =
@@ -201,7 +212,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
         logger.warn(
           `Telegram 拒绝该动作，按终结处理 decisionId=${decision.id} action=${decision.action.kind}：${error.description}`,
         )
-        return { kind: 'rejected' }
+        return { kind: 'rejected', description: error.description }
       }
       throw error
     }
@@ -238,6 +249,26 @@ async function sendNotice(
     )
   } catch (error) {
     deps.logger.warn(`处置通知发送失败 decisionId=${decision.id}`, error)
+  }
+}
+
+/**
+ * 终结性拒绝后私聊 owner。
+ *
+ * 迟到的失败通知比不通知好：终态决策不再被补偿扫描接手，owner 只能靠这条私聊知道有人需要人工处理。
+ * 通知是旁路：未配置时跳过，实现抛错时吞掉并记 warn，`executed` 回填不受影响。
+ *
+ * @param deps 执行器依赖。
+ * @param decision 被拒绝的决策。
+ * @param description Telegram 返回的拒绝原因。
+ */
+async function notifyFailure(deps: ActionExecutorDeps, decision: ModerationDecision, description: string): Promise<void> {
+  if (deps.notifyOwnerFailure === undefined) return
+
+  try {
+    await deps.notifyOwnerFailure(decision, description)
+  } catch (error) {
+    deps.logger.warn(`处置失败通知失败 decisionId=${decision.id}`, error)
   }
 }
 
