@@ -92,6 +92,8 @@ const ROUTES: readonly Route[] = [
   { method: 'POST', target: { kind: 'exact', path: '/telegram/webhook' }, handler: handleWebhook },
   { method: 'POST', target: { kind: 'exact', path: '/api/appeals' }, handler: handleCreateAppeal },
   { method: 'GET', target: { kind: 'prefix', path: '/api/appeals/' }, handler: handleGetAppeal },
+  { method: 'GET', target: { kind: 'exact', path: '/' }, handler: handleStaticAlias },
+  { method: 'GET', target: { kind: 'exact', path: '/app' }, handler: handleStaticAlias },
   { method: 'GET', target: { kind: 'prefix', path: STATIC_PREFIX }, handler: handleStatic },
 ]
 
@@ -126,6 +128,22 @@ async function handleCreateAppeal(request: IncomingMessage, response: ServerResp
 async function handleStatic(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? '/', 'http://localhost')
   await serveStatic({ root: WEB_DIST, pathname: url.pathname, prefix: STATIC_PREFIX, response })
+}
+
+/**
+ * 入口别名 `/` 与 `/app` 到规范地址 `/app/` 的重定向。
+ *
+ * 申诉按钮的地址由 `MINI_APP_URL` 拼出，BotFather 注册的 Mini App 地址也是人工填写，
+ * 少一个尾斜杠就会落到 404 JSON（症状与产物缺失无法区分）。两个别名统一 302 到 `/app/`，
+ * 查询串原样带上：`?startapp=` 承载 decisionId，丢了申诉页就打不开。
+ *
+ * @param request 入站请求（用它的查询串拼目标地址）。
+ * @param response 出站响应。
+ */
+function handleStaticAlias(request: IncomingMessage, response: ServerResponse): void {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  response.writeHead(302, { location: `${STATIC_PREFIX}${url.search}` })
+  response.end()
 }
 
 /**

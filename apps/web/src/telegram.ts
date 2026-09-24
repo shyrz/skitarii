@@ -31,6 +31,10 @@ export function getWebApp(): TelegramWebApp | null {
 
 /** 取申诉链接参数（startapp=decisionId）。 */
 export function getDecisionId(): string | null {
-  const param = getWebApp()?.initDataUnsafe.start_param
-  return param != null && param !== '' ? param : null
+  // 优先取 Telegram 注入的 start_param（t.me 直链形态），再回退到查询串（按钮地址自带的 ?startapp=）。
+  // 只读其一的话，另一种入口形态拿不到 decisionId，申诉页会当成「缺参数」。
+  const fromTelegram = getWebApp()?.initDataUnsafe.start_param
+  if (fromTelegram != null && fromTelegram !== '') return fromTelegram
+  const fromQuery = new URLSearchParams(window.location.search).get('startapp')
+  return fromQuery != null && fromQuery !== '' ? fromQuery : null
 }
