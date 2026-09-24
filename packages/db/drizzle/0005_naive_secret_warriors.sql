@@ -1,0 +1,1 @@
+ALTER TABLE "appeals" ADD COLUMN "rollback_pending" boolean DEFAULT false NOT NULL;

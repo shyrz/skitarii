@@ -1,4 +1,4 @@
-import { asUserId, type Action, type Appeal, type ModerationDecision, type UserId } from '@skitarii/core'
+import { type Action, type Appeal, type ModerationDecision, type UserId } from '@skitarii/core'
 import type { Api, Context, MiddlewareFn } from 'grammy'
 import type { InlineKeyboardMarkup } from 'grammy/types'
 import type { Repos } from '@skitarii/db'
@@ -12,12 +12,14 @@ import { isUnpunishableTarget } from './telegram-errors.js'
  *
  * 链路：非放行处置在群里发一条带申诉按钮的通知（按钮 URL 携带 decisionId）→
  * 用户在 Mini App 里提交申诉 → server 落库并调用 {@link notifyOwnerOfAppeal} 私聊 owner →
- * owner 点按钮 → {@link createAppealCallbackHandler} 撤销（回滚权限）或维持。
+ * owner 点按钮或在面板里结案 → {@link resolveAppeal} 撤销（回滚权限）或维持。
  *
  * 撤销的回滚口径：`mute` 解禁、`ban` 解封，`delete` 与 `warn` 没有可回滚的权限状态
  * （消息已删除无法恢复），只把申诉状态改成 `overturned`，让误伤率统计与人工复盘能看到它。
  * 不可罚目标（管理员/群主）同样没有可回滚的状态：executor 会把这类目标的禁言/封禁降级为删除，
  * 回滚时的「不可被限制」拒绝按无可恢复处理，不阻断结案（见 {@link rollbackAction}）。
+ * 结案与回滚是两步动作，中间崩溃会留下 `rollback_pending` 标记，
+ * 由 {@link createAppealRollbackService} 在调度器里补跑。
  *
  * 通知的送达回执：`notifyOwnerOfAppeal` 返回 Telegram 是否接受，调用方据此回填
  * `appeals.notified_at`；没回填成功的申诉由 {@link createAppealNotificationService} 在调度器里补发。
@@ -229,11 +231,165 @@ async function rebuildNotification(deps: AppealDeps, appeal: Appeal): Promise<Ap
 }
 
 /**
+ * 结案结果。回调处理器与 server 面板 API 共用：
+ * 面板把它映射成 200 / 409 / 404，回调把它映射成 owner 能看懂的中文提示。
+ *
+ * `resolved` 带 `resolvedAt`：它就是写库的那次结案时刻，调用方（回调的私聊修订）渲染时间戳必须用它，
+ * 不能各自再取一次当前时间，否则同一次结案会出现两个时刻。
+ */
+export type AppealResolution =
+  | { kind: 'resolved'; rollbackFailed: boolean; resolvedAt: Date }
+  | { kind: 'already_resolved' }
+  | { kind: 'missing' }
+
+/**
+ * 结案一条申诉：先条件更新抢结案，`overturn` 时回滚权限状态。
+ *
+ * 这是申诉结案的唯一权威入口：Telegram 回调按钮与 Mini App 面板都走它，两条路径的
+ * 权限回滚口径必须一致，不能各写一遍。
+ *
+ * 崩溃窗口的处理：`overturn` 的结案与回滚不是原子操作，两者之间进程崩溃会让用户停在受限状态。
+ * 因此 claim 时在同一条 UPDATE 里写入「待回滚」标记，回滚成功后才清除；中间崩溃留下的标记
+ * 由 {@link createAppealRollbackService} 在调度器里补跑（解禁/解封都是幂等动作）。
+ *
+ * 语义：
+ * - 申诉不存在，或关联决策不存在 → `missing`（面板按 404 回答，回调按对应文案提示）。
+ * - 申诉已不是 `open`，或条件更新没抢到（并发点击）→ `already_resolved`，不写状态、不回滚权限。
+ * - `overturn` 的回滚失败不抛出：结案已经写库，把 `rollbackFailed=true` 交给调用方提示人工处理，
+ *   同时记 error 日志并保留「待回滚」标记等扫描重试。不可罚目标（管理员/群主）没有可回滚的状态，
+ *   按成功处理（见 {@link rollbackAction}）。
+ *
+ * @param deps api、仓储、owner 与日志；结案人固定为 owner。
+ * @param appealId 申诉 id。
+ * @param outcome `uphold` 维持原处置，`overturn` 撤销并回滚权限。
+ * @returns 三态结案结果。
+ */
+export async function resolveAppeal(
+  deps: AppealDeps,
+  appealId: string,
+  outcome: AppealOutcome,
+): Promise<AppealResolution> {
+  const appeal = await deps.repos.appeals.findById(appealId)
+  if (appeal === null) return { kind: 'missing' }
+  // 已结案时不再查决策：调用方按「已被处理」回答，不需要知道决策是否还在。
+  if (appeal.state !== 'open') return { kind: 'already_resolved' }
+
+  const decision = await deps.repos.decisions.findById(appeal.decisionId)
+  if (decision === null) return { kind: 'missing' }
+
+  const resolvedAt = new Date()
+  // 先抢结案再动手：上面的读是快照，两条路径可能同时通过它。
+  // 条件更新（只有 open 才影响到行）是权威判定，抢不到的那次不写状态、不回滚权限，也不报成功。
+  // `overturn` 时同一条 UPDATE 写入待回滚标记：没有它，结案与回滚之间的崩溃会永远留在受限状态。
+  const claimed = await deps.repos.appeals.resolve(
+    appealId,
+    outcome === 'overturn' ? 'overturned' : 'upheld',
+    resolvedAt,
+    deps.ownerUserId,
+    outcome === 'overturn',
+  )
+  if (!claimed) return { kind: 'already_resolved' }
+
+  if (outcome === 'overturn') {
+    try {
+      await rollbackAction(deps, decision)
+    } catch (error) {
+      // 结案已经写入，权限回滚失败：不能报「已恢复」。把可执行的处置方向交给调用方，
+      // 否则用户会一直停在禁言/封禁状态而没人知道。待回滚标记保持置位，扫描会继续重试。
+      deps.logger.error(`申诉已结案但权限回滚失败 appealId=${appealId} decisionId=${decision.id}`, error)
+      return { kind: 'resolved', rollbackFailed: true, resolvedAt }
+    }
+
+    try {
+      await deps.repos.appeals.clearRollbackPending(appealId)
+    } catch (error) {
+      // 清除失败不改变结案结论：标记留着最多让扫描再回滚一次（解禁/解封幂等）。
+      deps.logger.warn(`回滚标记清除失败，待扫描兜底 appealId=${appealId}`, error)
+    }
+  }
+
+  deps.logger.info(`申诉已结案 appealId=${appealId} outcome=${outcome} by=${deps.ownerUserId}`)
+  return { kind: 'resolved', rollbackFailed: false, resolvedAt }
+}
+
+/** 回滚补偿一轮最多处理的申诉数。没清掉标记的记录会一直留在候选集里，因此必须有上界。 */
+export const APPEAL_ROLLBACK_SCAN_LIMIT = 20
+
+/** 一轮回滚补偿的结果，用于日志与测试断言。 */
+export interface AppealRollbackResult {
+  /** 扫描到的候选数。 */
+  scanned: number
+  /** 清除标记的条数（回滚成功，或决策缺失被清掉）。 */
+  cleared: number
+  /** 回滚失败、留待下一轮的条数。 */
+  failed: number
+}
+
+/** 权限回滚的补偿服务。 */
+export interface AppealRollbackService {
+  /** 扫一轮「已撤销但权限未回滚」的申诉并补跑回滚。 */
+  runOnce(): Promise<AppealRollbackResult>
+}
+
+/**
+ * 建立权限回滚的补偿服务。
+ *
+ * 为什么需要它：`resolveAppeal` 的撤销是先结案、后回滚的两步动作，中途崩溃（进程被杀、数据库抖动）
+ * 会让申诉停在 `overturned + rollback_pending`，权限永远不恢复。这个扫描按标记找回它们。
+ *
+ * 幂等性：解禁（恢复全量权限）与解封（`only_if_banned`）都是可重复执行的动作，
+ * 即使与在途的 `resolveAppeal` 撞车、或对同一标记重跑多轮，结果都收敛到同一个终态。
+ * 决策缺失（外键级联下不应出现）时清标记并告警，避免永远重试。
+ *
+ * @param deps api、仓储、owner 与日志；`limit` 为单轮上限。`now` 与补发服务同形（调用方统一透传时间源），
+ *   本服务不写任何时间戳，读它与不读它结果一致。
+ * @returns 补偿服务。
+ */
+export function createAppealRollbackService(
+  deps: AppealDeps & { limit?: number | undefined; now?: (() => Date) | undefined },
+): AppealRollbackService {
+  const limit = deps.limit ?? APPEAL_ROLLBACK_SCAN_LIMIT
+
+  return {
+    async runOnce(): Promise<AppealRollbackResult> {
+      const pending = await deps.repos.appeals.listPendingRollback(limit)
+      let cleared = 0
+      let failed = 0
+
+      for (const appeal of pending) {
+        const decision = await deps.repos.decisions.findById(appeal.decisionId)
+        if (decision === null) {
+          // 申诉有外键级联（决策被删会连带删除申诉），正常路径不可达；清标记避免卡住队列。
+          deps.logger.warn(`待回滚申诉缺少关联决策，清除标记 appealId=${appeal.id}`)
+          await deps.repos.appeals.clearRollbackPending(appeal.id)
+          cleared += 1
+          continue
+        }
+
+        try {
+          await rollbackAction(deps, decision)
+        } catch (error) {
+          deps.logger.warn(`权限回滚补偿失败，留待下一轮 appealId=${appeal.id} decisionId=${decision.id}`, error)
+          failed += 1
+          continue
+        }
+
+        await deps.repos.appeals.clearRollbackPending(appeal.id)
+        cleared += 1
+      }
+
+      return { scanned: pending.length, cleared, failed }
+    },
+  }
+}
+
+/**
  * 建立 owner 回调处理器。挂在 `bot.callbackQuery(APPEAL_CALLBACK_PATTERN, handler)` 上。
  *
  * 权限：只有 `OWNER_USER_ID` 本人能处理，其他人点击得到一条弹出提示，不写库。
  * 幂等：结案是条件更新，只有抢到 `open → 终态` 的那次调用会回滚权限并回复「已处理」，
  * 重复点击（含并发点击）得到「这条申诉已被处理过」，不会翻转已结案的结论。
+ * 结案语义全部走 {@link resolveAppeal}，本函数只负责把结果翻译成按钮交互。
  *
  * @param deps api、仓储、owner 与日志。
  * @returns grammY 中间件。
@@ -252,6 +408,8 @@ export function createAppealCallbackHandler(deps: AppealDeps): MiddlewareFn<Cont
       return
     }
 
+    // 文案要区分「申诉不存在 / 决策不存在 / 已结案 / 并发抢不到」四种情况，而 resolveAppeal 只返回三态；
+    // 先做两处只读判断把前两种文案保住，状态变更（条件更新与回滚）仍全部由 resolveAppeal 执行。
     const appeal = await deps.repos.appeals.findById(appealId)
     if (appeal === null) {
       await ctx.answerCallbackQuery({ text: '这条申诉不存在', show_alert: true })
@@ -262,41 +420,23 @@ export function createAppealCallbackHandler(deps: AppealDeps): MiddlewareFn<Cont
       return
     }
 
-    const decision = await deps.repos.decisions.findById(appeal.decisionId)
-    if (decision === null) {
+    const resolution = await resolveAppeal(deps, appealId, outcome)
+    if (resolution.kind === 'missing') {
       await ctx.answerCallbackQuery({ text: '关联的处置记录已不存在', show_alert: true })
       return
     }
-
-    const resolvedAt = new Date()
-    // 先抢结案再动手：上面的 `state !== 'open'` 读到的是快照，两次点击可能都通过它。
-    // 条件更新（只有 open 才影响到行）是权威判定，抢不到的那次不写状态、不回滚权限，也不报成功。
-    const claimed = await deps.repos.appeals.resolve(
-      appealId,
-      outcome === 'overturn' ? 'overturned' : 'upheld',
-      resolvedAt,
-      asUserId(from.id),
-    )
-    if (!claimed) {
+    if (resolution.kind === 'already_resolved') {
       await ctx.answerCallbackQuery({ text: '这条申诉已被处理过' })
       return
     }
 
-    if (outcome === 'overturn') {
-      try {
-        await rollbackAction(deps, decision)
-      } catch (error) {
-        // 结案已经写入，权限回滚失败：不能报「已恢复」。把可执行的处置方向交给 owner，
-        // 否则用户会一直停在禁言/封禁状态而没人知道。
-        deps.logger.error(`申诉已结案但权限回滚失败 appealId=${appealId} decisionId=${decision.id}`, error)
-        await editOwnerMessage(ctx, outcome, resolvedAt)
-        await ctx.answerCallbackQuery({ text: '已结案，但恢复权限失败：请手动解禁或解封', show_alert: true })
-        return
-      }
+    if (resolution.rollbackFailed) {
+      await editOwnerMessage(ctx, outcome, resolution.resolvedAt)
+      await ctx.answerCallbackQuery({ text: '已结案，但恢复权限失败：请手动解禁或解封', show_alert: true })
+      return
     }
 
-    deps.logger.info(`申诉已结案 appealId=${appealId} outcome=${outcome} by=${from.id}`)
-    await editOwnerMessage(ctx, outcome, resolvedAt)
+    await editOwnerMessage(ctx, outcome, resolution.resolvedAt)
     await ctx.answerCallbackQuery({ text: outcome === 'overturn' ? '已撤销并恢复权限' : '已维持原处置' })
   }
 }

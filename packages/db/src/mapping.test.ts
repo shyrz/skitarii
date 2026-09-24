@@ -158,6 +158,7 @@ describe('申诉、订阅与聚合映射', () => {
     resolvedAt: new Date('2026-09-23T10:30:00Z'),
     resolvedBy: 1_000_000_001,
     notifiedAt: new Date('2026-09-23T10:05:01Z'),
+    rollbackPending: false,
   }
 
   test('申诉行映射成领域申诉，结案人列不进领域类型', () => {

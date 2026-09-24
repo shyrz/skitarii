@@ -1,4 +1,4 @@
-import { and, asc, count, eq, exists, gte, isNull, lt, lte, ne, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, exists, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm'
 import type { ChatConfig, ChatId } from '@skitarii/core'
 import type { Db } from './client.js'
 import {
@@ -130,6 +130,17 @@ function createMessageEventRepo(db: Db): MessageEventRepo {
       return { event: toMessageEvent(row), sampleText: row.sampleText }
     },
 
+    async findSamples(eventIds) {
+      // 空数组不发查询：`in ()` 在 SQL 里没有合法写法，直接给出空结果。
+      if (eventIds.length === 0) return new Map()
+
+      const rows = await db
+        .select({ id: messageEvents.id, sampleText: messageEvents.sampleText })
+        .from(messageEvents)
+        .where(inArray(messageEvents.id, eventIds))
+      return new Map(rows.map((row) => [row.id, row.sampleText]))
+    },
+
     async attachSample(eventId, sampleText): Promise<void> {
       // 隐私口径写成 SQL 条件而不是调用方纪律：只有该事件存在非 pass 决策时才允许补写摘录。
       // 条件不满足时是静默无操作，因此写错顺序（先补摘录后落决策）不会泄漏放行消息的正文。
@@ -212,6 +223,31 @@ function createDecisionRepo(db: Db): DecisionRepo {
       return rows.map(toModerationDecision)
     },
 
+    async listRecent(filter) {
+      const conditions = []
+      if (filter.chatId !== undefined) conditions.push(eq(moderationDecisions.chatId, filter.chatId))
+      // 缺省 = 非放行；'all' = 不过滤；具体档位 = 精确匹配。
+      if (filter.action === undefined) conditions.push(ne(moderationDecisions.action, 'pass'))
+      else if (filter.action !== 'all') conditions.push(eq(moderationDecisions.action, filter.action))
+      if (filter.before !== undefined) {
+        const cursor = filter.before
+        // 复合游标与排序键同形：先比时间，时间相同再比 id，保证同毫秒并列的记录不重不漏。
+        conditions.push(
+          or(
+            lt(moderationDecisions.decidedAt, cursor.decidedAt),
+            and(eq(moderationDecisions.decidedAt, cursor.decidedAt), lt(moderationDecisions.id, cursor.id)),
+          ),
+        )
+      }
+
+      const query = db.select().from(moderationDecisions)
+      const filtered = conditions.length === 0 ? query : query.where(and(...conditions))
+      const rows = await filtered
+        .orderBy(desc(moderationDecisions.decidedAt), desc(moderationDecisions.id))
+        .limit(filter.limit)
+      return rows.map(toModerationDecision)
+    },
+
     async countPriorViolations(chatId, userId, since): Promise<number> {
       const rows = await db
         .select({ total: count() })
@@ -264,14 +300,31 @@ function createAppealRepo(db: Db): AppealRepo {
       return row === undefined ? null : toAppeal(row)
     },
 
-    async resolve(appealId, state, resolvedAt, resolvedBy): Promise<boolean> {
+    async resolve(appealId, state, resolvedAt, resolvedBy, rollbackPending): Promise<boolean> {
       // `state = 'open'` 是条件更新：并发重复点击只有一个调用会影响到行，其余得到 0 行。
+      // rollback_pending 与状态同一条语句写入，结案与「待回滚」标记之间不留下不可见窗口。
       const updated = await db
         .update(appeals)
-        .set({ state, resolvedAt, resolvedBy })
+        .set({ state, resolvedAt, resolvedBy, rollbackPending })
         .where(and(eq(appeals.id, appealId), eq(appeals.state, 'open')))
         .returning({ id: appeals.id })
       return updated.length > 0
+    },
+
+    async clearRollbackPending(appealId): Promise<void> {
+      // 无条件写 false：重复清除是幂等的，也不需要先读一次。
+      await db.update(appeals).set({ rollbackPending: false }).where(eq(appeals.id, appealId))
+    },
+
+    async listPendingRollback(limit) {
+      // `appeals_state_idx` 覆盖 state 条件；pending 只是少数残留，不值得再加部分索引。
+      const rows = await db
+        .select()
+        .from(appeals)
+        .where(and(eq(appeals.state, 'overturned'), eq(appeals.rollbackPending, true)))
+        .orderBy(asc(appeals.resolvedAt))
+        .limit(limit)
+      return rows.map(toAppeal)
     },
 
     async listOpen(chatId) {
@@ -283,6 +336,17 @@ function createAppealRepo(db: Db): AppealRepo {
         .where(and(eq(moderationDecisions.chatId, chatId), eq(appeals.state, 'open')))
         .orderBy(asc(appeals.createdAt))
       return rows.map((row) => toAppeal(row.appeal))
+    },
+
+    async listByStateWithDecision(state, limit) {
+      // 单条 join 拿到申诉与它的决策：面板一次要一页，逐条回查决策就是 N+1。
+      const joined = db
+        .select({ appeal: appeals, decision: moderationDecisions })
+        .from(appeals)
+        .innerJoin(moderationDecisions, eq(appeals.decisionId, moderationDecisions.id))
+      const filtered = state === null ? joined : joined.where(eq(appeals.state, state))
+      const rows = await filtered.orderBy(desc(appeals.createdAt)).limit(limit)
+      return rows.map((row) => ({ appeal: toAppeal(row.appeal), decision: toModerationDecision(row.decision) }))
     },
 
     async markNotified(appealId, notifiedAt): Promise<void> {

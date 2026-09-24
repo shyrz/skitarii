@@ -1,12 +1,20 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { asUserId } from '@skitarii/core'
-import { createLogger, createBotRuntime, notifyOwnerOfAppeal } from '@skitarii/bot'
+import { createLogger, createBotRuntime, notifyOwnerOfAppeal, resolveAppeal } from '@skitarii/bot'
 import { createDb, createPgRepos } from '@skitarii/db'
 import type { LlmConfig } from '@skitarii/llm'
 import { webhookCallback } from 'grammy'
 import { createAppeal, getAppeal, type AppealApiDeps } from './api.js'
 import { parseServerEnv } from './env.js'
+import {
+  getPanelAppeals,
+  getPanelDecisions,
+  getPanelOverview,
+  getPanelSeries,
+  resolvePanelAppeal,
+  type PanelApiDeps,
+} from './panel.js'
 import { createScheduler } from './scheduler.js'
 import { serveStatic } from './static.js'
 import { registerWebhook } from './webhook.js'
@@ -14,8 +22,8 @@ import { registerWebhook } from './webhook.js'
 /**
  * HTTP 进程入口：Telegram webhook、Mini App API、Mini App 静态托管、维护调度器的宿主。
  *
- * 本文件保持「路由表 + 分发 + 生命周期」三段，业务判定在 `api.ts`（申诉端点）、`static.ts`（产物托管）
- * 与 `scheduler.ts`（聚合与清理）里，各自可脱离 HTTP 服务器测试。
+ * 本文件保持「路由表 + 分发 + 生命周期」三段，业务判定在 `api.ts`（申诉端点）、`panel.ts`（面板端点）、
+ * `static.ts`（产物托管）与 `scheduler.ts`（聚合与清理）里，各自可脱离 HTTP 服务器测试。
  *
  * 技术选型：用 `node:http` 而不是框架。本仓库冻结依赖，依赖清单里没有 HTTP 框架，
  * 而这一层只需要精确路由、前缀路由和 JSON 响应，不值得引入框架。
@@ -38,7 +46,8 @@ const ownerUserId = asUserId(env.OWNER_USER_ID)
 
 // webhook 与申诉通知共用同一个 bot 实例：回调按钮由 Telegram 投递到 webhook，
 // 通知则用同一个 token 发出，两者必须是同一个 bot。
-// 运行时同时交出两个维护服务：补偿扫描与 bot 共享执行器/幂等闸门，补发扫描与申诉通知同源。
+// 运行时同时交出三个维护服务：补偿扫描与 bot 共享执行器/幂等闸门，补发扫描与申诉通知同源，
+// 回滚补偿与回调解复用同一套 unmute/unban 逻辑。
 const runtime = createBotRuntime({
   botToken: env.BOT_TOKEN,
   repos,
@@ -55,6 +64,16 @@ const appealApi: AppealApiDeps = {
   botToken: env.BOT_TOKEN,
   ownerUserId,
   notifyAppeal: (notification) => notifyOwnerOfAppeal({ api: bot.api, repos, ownerUserId, logger }, notification),
+  logger,
+}
+
+// 面板结案与申诉通知同源：同一个 bot api、同一份 ownerUserId，撤销时的权限回滚口径与回调按钮完全一致。
+const panelApi: PanelApiDeps = {
+  repos,
+  botToken: env.BOT_TOKEN,
+  ownerUserId,
+  resolveAppeal: (appealId, outcome) =>
+    resolveAppeal({ api: bot.api, repos, ownerUserId, logger }, appealId, outcome),
   logger,
 }
 
@@ -100,6 +119,11 @@ const ROUTES: readonly Route[] = [
   { method: 'POST', target: { kind: 'exact', path: '/telegram/webhook' }, handler: handleWebhook },
   { method: 'POST', target: { kind: 'exact', path: '/api/appeals' }, handler: handleCreateAppeal },
   { method: 'GET', target: { kind: 'prefix', path: '/api/appeals/' }, handler: handleGetAppeal },
+  { method: 'GET', target: { kind: 'exact', path: '/api/panel/overview' }, handler: handlePanelOverview },
+  { method: 'GET', target: { kind: 'exact', path: '/api/panel/decisions' }, handler: handlePanelDecisions },
+  { method: 'GET', target: { kind: 'exact', path: '/api/panel/appeals' }, handler: handlePanelAppeals },
+  { method: 'GET', target: { kind: 'prefix', path: '/api/panel/chats/' }, handler: handlePanelSeries },
+  { method: 'POST', target: { kind: 'prefix', path: '/api/panel/appeals/' }, handler: handlePanelResolve },
   { method: 'GET', target: { kind: 'exact', path: '/' }, handler: handleStaticAlias },
   { method: 'GET', target: { kind: 'exact', path: '/app' }, handler: handleStaticAlias },
   { method: 'GET', target: { kind: 'prefix', path: STATIC_PREFIX }, handler: handleStatic },
@@ -130,6 +154,89 @@ async function handleCreateAppeal(request: IncomingMessage, response: ServerResp
   const body = await readJsonBody(request)
   const result = await createAppeal(appealApi, body)
   respondJson(response, result.status, result.body)
+}
+
+/** 面板概览：`GET /api/panel/overview?initData=...`。 */
+async function handlePanelOverview(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const result = await getPanelOverview(panelApi, { initData: url.searchParams.get('initData') })
+  respondJson(response, result.status, result.body)
+}
+
+/** 面板报表序列：`GET /api/panel/chats/:chatId/series?days=&initData=`。 */
+async function handlePanelSeries(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const chatId = tailSegment(url.pathname, '/api/panel/chats/', '/series')
+  if (chatId === null) {
+    respondJson(response, 404, { error: 'not found' })
+    return
+  }
+
+  const result = await getPanelSeries(panelApi, {
+    chatId,
+    days: url.searchParams.get('days'),
+    initData: url.searchParams.get('initData'),
+  })
+  respondJson(response, result.status, result.body)
+}
+
+/** 面板处置队列：`GET /api/panel/decisions?initData=&chatId=&action=&limit=&before=&beforeId=`。 */
+async function handlePanelDecisions(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const result = await getPanelDecisions(panelApi, {
+    initData: url.searchParams.get('initData'),
+    chatId: url.searchParams.get('chatId'),
+    action: url.searchParams.get('action'),
+    limit: url.searchParams.get('limit'),
+    before: url.searchParams.get('before'),
+    beforeId: url.searchParams.get('beforeId'),
+  })
+  respondJson(response, result.status, result.body)
+}
+
+/** 面板申诉队列：`GET /api/panel/appeals?initData=&state=&limit=`。 */
+async function handlePanelAppeals(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const result = await getPanelAppeals(panelApi, {
+    initData: url.searchParams.get('initData'),
+    state: url.searchParams.get('state'),
+    limit: url.searchParams.get('limit'),
+  })
+  respondJson(response, result.status, result.body)
+}
+
+/** 网页内结案：`POST /api/panel/appeals/:appealId/resolve`，body `{ initData, resolution }`。 */
+async function handlePanelResolve(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const appealId = tailSegment(url.pathname, '/api/panel/appeals/', '/resolve')
+  if (appealId === null) {
+    respondJson(response, 404, { error: 'not found' })
+    return
+  }
+
+  const body = await readJsonBody(request)
+  const result = await resolvePanelAppeal(panelApi, { appealId, body })
+  respondJson(response, result.status, result.body)
+}
+
+/**
+ * 取「固定前缀 + 固定尾段」路径中间的那一段。
+ *
+ * @param pathname 请求路径。
+ * @param prefix 已知前缀（含结尾斜杠）。
+ * @param suffix 已知尾段（含开头斜杠，如 `/series`）。
+ * @returns 中间段；形状不符（尾段不匹配、中间段为空或含多余 `/`）时为 `null`（调用方按 404 处理）。
+ */
+function tailSegment(pathname: string, prefix: string, suffix: string): string | null {
+  if (!pathname.startsWith(prefix)) return null
+
+  const rest = pathname.slice(prefix.length)
+  if (!rest.endsWith(suffix)) return null
+
+  const segment = rest.slice(0, -suffix.length)
+  // 中间段只允许一段：`/api/panel/chats/a/b/series` 这类多段路径不是合法端点，按未匹配处理。
+  if (segment.length === 0 || segment.includes('/')) return null
+  return segment
 }
 
 /** Mini App 静态产物。 */
@@ -231,6 +338,7 @@ const scheduler = createScheduler({
   intervalMs: env.MAINTENANCE_INTERVAL_MS,
   retryDecisions: runtime.retryDecisions,
   resendAppeals: runtime.resendAppeals,
+  retryRollbacks: runtime.retryRollbacks,
 })
 
 /**

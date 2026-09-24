@@ -1,9 +1,14 @@
 import type { DailyAggregate } from '@skitarii/core'
 import type { Repos } from '@skitarii/db'
-import type { AppealNotificationService, DecisionRetryService, Logger } from '@skitarii/bot'
+import type {
+  AppealNotificationService,
+  AppealRollbackService,
+  DecisionRetryService,
+  Logger,
+} from '@skitarii/bot'
 
 /**
- * 进程内调度器：日聚合重算、保留期清理，以及两条「兜底重试」扫描。
+ * 进程内调度器：日聚合重算、保留期清理，以及三条「兜底重试」扫描。
  *
  * 为什么放在 server 进程：它已经有数据库连接并且常驻，而 bot 进程可能以长轮询方式跑在开发机上。
  * 两个进程都跑调度器会重复计算（`upsert` 幂等，不致命但浪费连接），因此约定只有 server 启动它。
@@ -11,8 +16,8 @@ import type { AppealNotificationService, DecisionRetryService, Logger } from '@s
  * 两个维护任务不要求实时：重算是小时级，清理是天级。用 `setInterval` 而不是 cron 是刻意的选择：
  * 自用部署只有一两个进程，多引入一个调度组件不值得；`unref` 让定时器不阻止进程退出。
  *
- * 两条补偿扫描（未执行决策、未通知申诉）由 bot 侧提供：它们的实现要复用 bot 的执行器与申诉通知逻辑，
- * 见 `@skitarii/bot` 的 `createBotRuntime`。未提供时跳过对应步骤（测试与不驱动 bot 的场景）。
+ * 三条补偿扫描（未执行决策、未通知申诉、未完成回滚）由 bot 侧提供：它们的实现要复用 bot 的执行器、
+ * 申诉通知与权限回滚逻辑，见 `@skitarii/bot` 的 `createBotRuntime`。未提供时跳过对应步骤（测试与不驱动 bot 的场景）。
  */
 
 /**
@@ -44,6 +49,8 @@ export interface MaintenanceResult {
   retriedDecisions: number
   /** 补发成功的 owner 申诉通知数。 */
   resentAppeals: number
+  /** 权限回滚补偿清掉标记的申诉数。 */
+  retriedRollbacks: number
 }
 
 /** 调度器依赖。 */
@@ -54,6 +61,8 @@ export interface SchedulerDeps {
   retryDecisions?: DecisionRetryService | undefined
   /** 未通知申诉的补发扫描（bot 提供）。不提供则跳过。 */
   resendAppeals?: AppealNotificationService | undefined
+  /** 已撤销但权限未回滚的补偿扫描（bot 提供）。不提供则跳过。 */
+  retryRollbacks?: AppealRollbackService | undefined
   /** 时间源，默认系统时间。 */
   now?: (() => Date) | undefined
   /** 重算间隔，默认 {@link DEFAULT_ROLLUP_INTERVAL_MS}。 */
@@ -73,7 +82,7 @@ export interface Scheduler {
 /**
  * 建立调度器。
  *
- * @param deps 仓储、日志、两条补偿扫描与时间源。
+ * @param deps 仓储、日志、三条补偿扫描与时间源。
  * @returns 调度器。
  */
 export function createScheduler(deps: SchedulerDeps): Scheduler {
@@ -88,7 +97,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
    *
    * 为什么要守卫：一轮维护的耗时随群数量与 Telegram 延迟变化，可能超过间隔（尤其是把 `intervalMs`
    * 调小的排障场景）。不守卫的话，后一轮会在前一轮还没提交完时叠加执行，聚合与清理重复扫表，
-   * 两条补偿扫描还可能对同一条决策并发动手。宁可丢一拍，也不要并发跑两轮。
+   * 三条补偿扫描还可能对同一条决策/申诉并发动手。宁可丢一拍，也不要并发跑两轮。
    */
   const tick = (): void => {
     if (inFlight) {
@@ -126,7 +135,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 }
 
 /**
- * 跑一轮维护：重算昨天与今天的聚合，按保留期清理明细，然后跑两条补偿扫描。
+ * 跑一轮维护：重算昨天与今天的聚合，按保留期清理明细，然后跑三条补偿扫描。
  *
  * 单个群或单个步骤失败只记日志并继续：调度是尽力而为，下一轮会重来，
  * 不该因为一个群的坏数据让其他群的数据也停止更新。
@@ -200,7 +209,22 @@ export async function runMaintenance(deps: SchedulerDeps): Promise<MaintenanceRe
     }
   }
 
-  return { dates, rolledUp, purgedEvents, purgedCacheEntries, retriedDecisions, resentAppeals }
+  let retriedRollbacks = 0
+  if (deps.retryRollbacks !== undefined) {
+    try {
+      const result = await deps.retryRollbacks.runOnce()
+      retriedRollbacks = result.cleared
+      if (result.scanned > 0) {
+        deps.logger.info(
+          `权限回滚补偿完成 scanned=${result.scanned} cleared=${result.cleared} failed=${result.failed}`,
+        )
+      }
+    } catch (error) {
+      deps.logger.warn('权限回滚补偿扫描失败', error)
+    }
+  }
+
+  return { dates, rolledUp, purgedEvents, purgedCacheEntries, retriedDecisions, resentAppeals, retriedRollbacks }
 }
 
 /**
@@ -242,5 +266,6 @@ function formatResult(result: MaintenanceResult): string {
     `purgedCache=${result.purgedCacheEntries}`,
     `retriedDecisions=${result.retriedDecisions}`,
     `resentAppeals=${result.resentAppeals}`,
+    `retriedRollbacks=${result.retriedRollbacks}`,
   ].join(' ')
 }

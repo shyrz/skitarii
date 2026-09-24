@@ -47,6 +47,8 @@ export function createInMemoryRepos(): InMemoryRepos {
   const appeals = new Map<string, Appeal>()
   const resolvedBy = new Map<string, UserId>()
   const notifiedAtBy = new Map<string, Date>()
+  /** 撤销结案后权限尚未回滚的申诉 id。PG 里是 `appeals.rollback_pending` 列，这里旁存。 */
+  const rollbackPendingIds = new Set<string>()
   const subscriptions = new Map<string, Subscription>()
   const aggregates = new Map<string, DailyAggregate>()
   const cache = new Map<string, LlmCacheEntry>()
@@ -75,6 +77,14 @@ export function createInMemoryRepos(): InMemoryRepos {
       async findWithSample(eventId: string) {
         const stored = events.get(eventId)
         return stored === undefined ? null : { event: stored.event, sampleText: stored.sampleText }
+      },
+      async findSamples(eventIds: string[]): Promise<Map<string, string | null>> {
+        const samples = new Map<string, string | null>()
+        for (const eventId of eventIds) {
+          const stored = events.get(eventId)
+          if (stored !== undefined) samples.set(eventId, stored.sampleText)
+        }
+        return samples
       },
       async attachSample(eventId: string, sampleText: string): Promise<void> {
         const stored = events.get(eventId)
@@ -119,6 +129,22 @@ export function createInMemoryRepos(): InMemoryRepos {
           .sort((a, b) => a.decidedAt.getTime() - b.decidedAt.getTime())
           .slice(0, limit)
       },
+      async listRecent(filter): Promise<ModerationDecision[]> {
+        return [...decisions.values()]
+          .filter((decision) => {
+            if (filter.chatId !== undefined && decision.chatId !== filter.chatId) return false
+            // 缺省 = 非放行；'all' = 不过滤；具体档位 = 精确匹配。
+            if (filter.action === undefined) {
+              if (decision.action.kind === 'pass') return false
+            } else if (filter.action !== 'all' && decision.action.kind !== filter.action) {
+              return false
+            }
+            if (filter.before !== undefined && !isBeforeCursor(decision, filter.before)) return false
+            return true
+          })
+          .sort(compareRecentDesc)
+          .slice(0, filter.limit)
+      },
       async countPriorViolations(chatId: ChatId, userId: UserId, since: Date): Promise<number> {
         return [...decisions.values()].filter(
           (decision) =>
@@ -146,17 +172,40 @@ export function createInMemoryRepos(): InMemoryRepos {
         state: Exclude<AppealState, 'open'>,
         resolvedAt: Date,
         by: UserId,
+        rollbackPending: boolean,
       ): Promise<boolean> {
         const stored = appeals.get(appealId)
         if (stored === undefined || stored.state !== 'open') return false
         appeals.set(appealId, { ...stored, state, resolvedAt })
         resolvedBy.set(appealId, by)
+        // 「待回滚」标记旁存：领域类型不承载运维标记，与 resolvedBy / notifiedAt 同一先例。
+        if (rollbackPending) rollbackPendingIds.add(appealId)
+        else rollbackPendingIds.delete(appealId)
         return true
+      },
+      async clearRollbackPending(appealId: string): Promise<void> {
+        rollbackPendingIds.delete(appealId)
+      },
+      async listPendingRollback(limit: number): Promise<Appeal[]> {
+        return [...appeals.values()]
+          .filter((appeal) => appeal.state === 'overturned' && rollbackPendingIds.has(appeal.id))
+          .sort((a, b) => (a.resolvedAt?.getTime() ?? 0) - (b.resolvedAt?.getTime() ?? 0))
+          .slice(0, limit)
       },
       async listOpen(chatId: ChatId): Promise<Appeal[]> {
         return [...appeals.values()]
           .filter((appeal) => appeal.state === 'open' && decisions.get(appeal.decisionId)?.chatId === chatId)
           .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      },
+      async listByStateWithDecision(state, limit) {
+        return [...appeals.values()]
+          .filter((appeal) => state === null || appeal.state === state)
+          .flatMap((appeal) => {
+            const decision = decisions.get(appeal.decisionId)
+            return decision === undefined ? [] : [{ appeal, decision }]
+          })
+          .sort((a, b) => b.appeal.createdAt.getTime() - a.appeal.createdAt.getTime())
+          .slice(0, limit)
       },
       async markNotified(appealId: string, notifiedAt: Date): Promise<void> {
         if (appeals.has(appealId)) notifiedAtBy.set(appealId, notifiedAt)
@@ -250,4 +299,33 @@ export function createInMemoryRepos(): InMemoryRepos {
     notifiedAtOf: (appealId) => notifiedAtBy.get(appealId) ?? null,
     sampleOf: (eventId) => events.get(eventId)?.sampleText ?? null,
   }
+}
+
+/**
+ * 与 SQL 的 `ORDER BY decided_at DESC, id DESC` 同序。
+ *
+ * uuid 都是小写十六进制加固定位置的连字符，字符串比较即字节序比较，因此 JS 侧不需要额外规范化。
+ *
+ * @param a 左记录。
+ * @param b 右记录。
+ * @returns 排序比较值。
+ */
+function compareRecentDesc(a: ModerationDecision, b: ModerationDecision): number {
+  const byTime = b.decidedAt.getTime() - a.decidedAt.getTime()
+  if (byTime !== 0) return byTime
+  if (a.id === b.id) return 0
+  return a.id > b.id ? -1 : 1
+}
+
+/**
+ * 判断记录是否严格排在复合游标 `(decidedAt, id)` 之前。
+ *
+ * @param decision 记录。
+ * @param cursor 游标。
+ * @returns 时间更早，或时间相同但 id 更小时为 `true`。
+ */
+function isBeforeCursor(decision: ModerationDecision, cursor: { decidedAt: Date; id: string }): boolean {
+  const byTime = decision.decidedAt.getTime() - cursor.decidedAt.getTime()
+  if (byTime !== 0) return byTime < 0
+  return decision.id < cursor.id
 }

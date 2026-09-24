@@ -106,6 +106,8 @@ curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
 3. 容器启动 `deploy/entrypoint.sh`：先 `pnpm db:migrate`，失败即以非 0 退出，不会带着旧 schema 起服务；成功后 `exec node --import tsx src/index.ts`
 4. 进程监听 `PORT`（平台注入，缺省 3000）；`PUBLIC_URL` 非空时启动阶段调用 `setWebhook(${PUBLIC_URL}/telegram/webhook, { secret_token })`，幂等（每次启动重注册），失败只记日志、不阻断启动，Telegram 侧保留旧地址
 
+迁移按单实例、低流量假设执行：每个实例启动都会跑一遍 `pnpm db:migrate`，多实例同时启动会并发执行迁移；0004 的 `CREATE INDEX` 会短暂持有表级 SHARE 锁（阻塞写入、允许读取），自用规模下几乎无感。实例数或写入量上来后，应把迁移拆成独立的发布步骤，或改用手工执行的 `CREATE INDEX CONCURRENTLY`。
+
 ```bash
 docker build -t skitarii .
 docker run --rm --env-file .env -p 3000:3000 skitarii
@@ -179,7 +181,7 @@ Zeabur 的 README「Deploy to Zeabur」按钮走模板机制，模板内服务�
 
 ## HTTP 接口
 
-Mini App 的申诉接口是冻结契约，界面按这里实现。所有时间字段都是 ISO 8601 字符串（`JSON.stringify` 的 Date 形态）。
+Mini App 的申诉与面板接口是冻结契约，界面按这里实现。所有时间字段都是 ISO 8601 字符串（`JSON.stringify` 的 Date 形态）。
 
 ### `GET /healthz`
 
@@ -234,6 +236,118 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 提交成功后 bot 会私聊 owner 一条通知，附「维持原处置 / 撤销并恢复」两个按钮。撤销会回滚权限（mute 解禁、ban 解封），并把申诉置为 `overturned`，写 `resolvedAt` 与 `resolvedBy`；维持置为 `upheld`。已结案的申诉不会被重复点击翻转。
 
 通知没被 Telegram 接受时（owner 从未与 bot 私聊过、网络抖动）不会让提交失败：这条申诉留在 `notified_at` 为空的状态，调度器的补发扫描会重试。代价是极端情况下可能收到重复的同一条提醒，而不会出现「申诉静默地没人处理」。
+
+### 面板接口（owner 专属）
+
+跨群管理台（Mini App 面板视图）的数据面。所有 `/api/panel/*` 端点先验 initData，再要求 `userId === OWNER_USER_ID`；GET 的凭据在查询串，POST 的在 body。列表端点都在 SQL 侧完成过滤、排序与 limit，群标题与正文摘录批量取，不做 N+1 查询。
+
+鉴权失败的状态码对所有端点一致：
+
+- `401 {"error":"init_data_invalid"}`：缺凭据、验签失败或过期（前端提示重新从 Telegram 打开）
+- `403 {"error":"forbidden"}`：验签通过但不是 owner（前端提示仅管理员可用）
+
+#### `GET /api/panel/overview?initData=...`
+
+```json
+{
+  "totals": {
+    "today": { "messageCount": 12, "actionCount": 3, "appealCount": 1, "overturnedCount": 0 },
+    "last7d": { "messageCount": 80, "actionCount": 11, "appealCount": 4, "overturnedCount": 1 }
+  },
+  "chats": [
+    {
+      "chatId": "-1001234567890",
+      "title": "测试群",
+      "today": { "messageCount": 12, "actionCount": 3, "appealCount": 1, "overturnedCount": 0 },
+      "last7d": { "messageCount": 80, "actionCount": 11, "appealCount": 4, "overturnedCount": 1 },
+      "openAppeals": 2
+    }
+  ],
+  "serverTime": "2026-09-23T12:00:00.000Z"
+}
+```
+
+`chats` 按近 7 日 `actionCount` 降序，同分按 `chatId` 升序；`today` 与 `last7d` 按 UTC 切日，近 7 日含今天。`openAppeals` 是各群待处理申诉数。
+
+#### `GET /api/panel/chats/:chatId/series?days=30&initData=...`
+
+```json
+{ "chatId": "-1001234567890", "days": [ { "date": "2026-08-25", "messageCount": 0, "actionCount": 0, "appealCount": 0, "overturnedCount": 0 } ] }
+```
+
+序列升序且日期连续，缺失日补零。`days` 默认 30，clamp 到 [7, 90]。调度器每小时滚动日报，今天的数字可能滞后至多一小时。
+
+#### `GET /api/panel/decisions?initData=&chatId=&action=&limit=50&before=ISO&beforeId=uuid`
+
+```json
+{
+  "items": [
+    {
+      "id": "9c8b7a65-1111-4222-8333-999900001111",
+      "chatId": "-1001234567890",
+      "chatTitle": "测试群",
+      "userId": 7000000001,
+      "action": "delete",
+      "actionUntil": null,
+      "score": 0.9,
+      "executed": true,
+      "decidedAt": "2026-09-23T10:00:01.000Z",
+      "ruleIds": ["default-ad-wechat"],
+      "llm": { "verdict": "spam", "confidence": 0.92 },
+      "sampleText": "加微信推荐一个渠道"
+    }
+  ],
+  "nextBefore": { "decidedAt": "2026-09-23T10:00:01.000Z", "id": "9c8b7a65-1111-4222-8333-999900001111" }
+}
+```
+
+默认只返回非放行（`action != 'pass'`）；`action=all` 或具体档位（`pass | warn | delete | mute | ban`）可覆盖，非法取值 400。排序 `(decidedAt, id)` 倒序，`limit` 默认 50、上限 100。
+
+游标是复合的：`nextBefore` 非 `null` 时把 `decidedAt` 与 `id` 分别作为 `before` 与 `beforeId` 原样传回。两个参数必须成对出现且格式合法（`before` 为 ISO、`beforeId` 为 uuid），缺一或非法一律 400：同一毫秒可能有多条记录，只按时间翻页会静默漏条，因此后端不接受半截游标。`sampleText` 为 `null` 表示没有摘录（放行、纯媒体或已被保留期清理）。
+
+#### `GET /api/panel/appeals?initData=&state=open|upheld|overturned|all&limit=50`
+
+```json
+{
+  "items": [
+    {
+      "id": "a1b2c3d4-1111-4222-8333-555566667777",
+      "userId": 7000000001,
+      "state": "open",
+      "note": "这是我自己的闲置转让",
+      "createdAt": "2026-09-23T10:05:00.000Z",
+      "resolvedAt": null,
+      "decision": {
+        "id": "9c8b7a65-1111-4222-8333-999900001111",
+        "action": "mute",
+        "actionUntil": "2026-09-23T11:00:00.000Z",
+        "score": 0.8,
+        "chatId": "-1001234567890",
+        "chatTitle": "测试群",
+        "sampleText": "加微信推荐一个渠道"
+      }
+    }
+  ]
+}
+```
+
+默认 `state=open`，`all` 表示全部状态，非法取值 400。按申诉创建时间倒序，`limit` 默认 50、上限 100。
+
+#### `POST /api/panel/appeals/:appealId/resolve`
+
+```json
+{ "initData": "<Telegram.WebApp.initData>", "resolution": "upheld" }
+```
+
+- `200 {"state":"upheld"|"overturned","rollbackFailed":false}`：结案成功。`rollbackFailed=true` 表示撤销已生效但权限回滚失败（Telegram 拒绝），前端提示「已结案，但恢复权限失败，请手动解禁/解封」
+- `400 {"error":"invalid_request","details":[...]}`：请求体不合法（鉴权前先校验）
+- `401 {"error":"init_data_invalid"}` / `403 {"error":"forbidden"}`
+- `404 {"error":"appeal_not_found"}`：申诉或关联决策不存在，路径参数不是 uuid 也按此处理
+- `409 {"error":"appeal_resolved"}`：申诉已被处理（含并发点击）
+
+`404` 有两类，前端都按「记录不存在」处理：路径形状不对（如 `/api/panel/appeals/foo`，缺少 `/resolve` 尾段）由路由层返回 `{"error":"not found"}`，不会进到业务逻辑；形状正确但资源不存在（含非 uuid 的申诉 id）返回上面的 `appeal_not_found`。
+
+结案与 Telegram 回调按钮共用同一实现（`resolveAppeal`），撤销会回滚权限（mute 解禁、ban 解封；管理员/群主不可罚目标跳过），并把申诉置为 `overturned` 或 `upheld`。结案与回滚是两步：撤销时先写入 `appeals.rollback_pending` 标记再回滚，中途崩溃留下的标记由调度器的补偿扫描补跑（解禁/解封幂等）。
 
 ### `GET /app/*`
 

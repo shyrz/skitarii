@@ -1,9 +1,15 @@
 import { asChatId, asUserId, type Appeal, type ModerationDecision } from '@skitarii/core'
-import { createInMemoryRepos, type InMemoryRepos } from '@skitarii/db'
+import { createInMemoryRepos, type InMemoryRepos, type Repos } from '@skitarii/db'
 import { GrammyError } from 'grammy'
 import type { Context } from 'grammy'
-import { describe, expect, test } from 'vitest'
-import { createAppealCallbackHandler, createAppealNotificationService, notifyOwnerOfAppeal } from './appeal.js'
+import { describe, expect, test, vi } from 'vitest'
+import {
+  createAppealCallbackHandler,
+  createAppealNotificationService,
+  createAppealRollbackService,
+  notifyOwnerOfAppeal,
+  resolveAppeal,
+} from './appeal.js'
 import type { Logger } from './logger.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
 
@@ -254,6 +260,322 @@ describe('owner 处理申诉', () => {
   })
 })
 
+describe('resolveAppeal 结案语义', () => {
+  test('维持：resolved 且无需回滚，结案人与状态落库', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    const recording = createRecordingApi()
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger },
+      appealId,
+      'uphold',
+    )
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false, resolvedAt: expect.any(Date) })
+    expect(recording.calls).toEqual([])
+    const appeal = await store.repos.appeals.findById(appealId)
+    expect(appeal).toMatchObject({ state: 'upheld' })
+    expect(appeal?.resolvedAt).toBeInstanceOf(Date)
+    expect(store.resolvedByOf(appealId)).toBe(ownerId)
+  })
+
+  test('撤销禁言：回滚权限后 resolved', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const recording = createRecordingApi()
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger },
+      appealId,
+      'overturn',
+    )
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false, resolvedAt: expect.any(Date) })
+    expect(recording.lastArgsOf('restrictChatMember')?.[0]).toBe(chatId)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
+  })
+
+  test('已结案的申诉返回 already_resolved，不改状态', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    await store.repos.appeals.resolve(appealId, 'upheld', new Date('2026-09-23T10:10:00Z'), ownerId, false)
+    const recording = createRecordingApi()
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger },
+      appealId,
+      'overturn',
+    )
+
+    expect(resolution).toEqual({ kind: 'already_resolved' })
+    expect(recording.calls).toEqual([])
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'upheld' })
+  })
+
+  test('并发下抢不到条件更新：返回 already_resolved，不回滚权限', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const repos = {
+      ...store.repos,
+      appeals: { ...store.repos.appeals, resolve: async () => false },
+    }
+    const recording = createRecordingApi()
+
+    const resolution = await resolveAppeal({ api: recording.api, repos, ownerUserId: ownerId, logger: silentLogger }, appealId, 'overturn')
+
+    expect(resolution).toEqual({ kind: 'already_resolved' })
+    expect(recording.calls).toEqual([])
+  })
+
+  test('申诉不存在或关联决策不存在：返回 missing', async () => {
+    const store = createInMemoryRepos()
+    const recording = createRecordingApi()
+    const deps = { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger }
+
+    expect(await resolveAppeal(deps, appealId, 'uphold')).toEqual({ kind: 'missing' })
+
+    await seedAppeal(store, { kind: 'delete' })
+    const orphaned = { ...store.repos, decisions: { ...store.repos.decisions, findById: async () => null } }
+    expect(await resolveAppeal({ ...deps, repos: orphaned }, appealId, 'uphold')).toEqual({ kind: 'missing' })
+    // 决策缺失时连结案都不发生。
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'open' })
+  })
+
+  test('回滚失败不抛出：resolved 且 rollbackFailed=true，写 error 日志', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const errors: unknown[] = []
+    const logger: Logger = {
+      info: () => {},
+      warn: () => {},
+      error: (message, error) => errors.push({ message, error }),
+    }
+    const recording: RecordingApi = createRecordingApi({
+      restrictChatMember: () => {
+        throw new GrammyError(
+          'Call to restrictChatMember failed',
+          { ok: false, error_code: 503, description: 'Service Unavailable' },
+          'restrictChatMember',
+          {},
+        )
+      },
+    })
+
+    const resolution = await resolveAppeal({ api: recording.api, repos: store.repos, ownerUserId: ownerId, logger }, appealId, 'overturn')
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: true, resolvedAt: expect.any(Date) })
+    // 结案仍是终态：面板与回调都要提示「已结案但恢复失败，请手动处理」。
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
+    expect(errors).toHaveLength(1)
+    expect(String((errors[0] as { message: string }).message)).toContain('权限回滚失败')
+  })
+
+  test('回调的私聊修订使用结案时刻，不另取当前时间', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    // claim 之后、修订私聊之前把时钟推前一分钟：编辑文案里的时间必须仍是写库的那次结案时刻。
+    const repos: Repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        async resolve(appealId, state, resolvedAt, by, rollbackPending) {
+          const claimed = await store.repos.appeals.resolve(appealId, state, resolvedAt, by, rollbackPending)
+          vi.advanceTimersByTime(60_000)
+          return claimed
+        },
+      },
+    }
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-09-23T10:20:00Z') })
+    try {
+      const recording: RecordingApi = createRecordingApi()
+      const handler = createAppealCallbackHandler({ api: recording.api, repos, ownerUserId: ownerId, logger: silentLogger })
+      const { ctx, edits } = createContext(`appeal:${appealId}:overturn`, ownerId)
+
+      await handler(ctx, async () => {})
+
+      expect(edits.at(-1)).toContain('2026-09-23T10:20:00.000Z')
+      expect(await store.repos.appeals.findById(appealId)).toMatchObject({
+        resolvedAt: new Date('2026-09-23T10:20:00.000Z'),
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('回滚补偿（rollback_pending）', () => {
+  /** 建一个只记录 warn 的日志替身。 */
+  function warnCapture(): { logger: Logger; warnings: string[] } {
+    const warnings: string[] = []
+    return {
+      warnings,
+      logger: {
+        info: () => {},
+        warn: (message) => {
+          warnings.push(message)
+        },
+        error: () => {},
+      },
+    }
+  }
+
+  test('撤销在 claim 的同一次更新里置「待回滚」，回滚成功后清除', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const observed: boolean[] = []
+    const repos: Repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        async resolve(appealId, state, resolvedAt, by, rollbackPending) {
+          observed.push(rollbackPending)
+          return store.repos.appeals.resolve(appealId, state, resolvedAt, by, rollbackPending)
+        },
+      },
+    }
+    const recording = createRecordingApi()
+
+    await resolveAppeal({ api: recording.api, repos, ownerUserId: ownerId, logger: silentLogger }, appealId, 'overturn')
+
+    expect(observed).toEqual([true])
+    expect(await store.repos.appeals.listPendingRollback(10)).toEqual([])
+  })
+
+  test('维持不置「待回滚」标记', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    const observed: boolean[] = []
+    const repos: Repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        async resolve(appealId, state, resolvedAt, by, rollbackPending) {
+          observed.push(rollbackPending)
+          return store.repos.appeals.resolve(appealId, state, resolvedAt, by, rollbackPending)
+        },
+      },
+    }
+    const recording = createRecordingApi()
+
+    await resolveAppeal({ api: recording.api, repos, ownerUserId: ownerId, logger: silentLogger }, appealId, 'uphold')
+
+    expect(observed).toEqual([false])
+    expect(await store.repos.appeals.listPendingRollback(10)).toEqual([])
+  })
+
+  test('回滚失败：标记保留，补偿扫描补跑后清除', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    let failNext = true
+    const recording: RecordingApi = createRecordingApi({
+      restrictChatMember: () => {
+        if (failNext) {
+          throw new GrammyError(
+            'Call to restrictChatMember failed',
+            { ok: false, error_code: 503, description: 'Service Unavailable' },
+            'restrictChatMember',
+            {},
+          )
+        }
+        return { ok: true }
+      },
+    })
+    const deps = { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger }
+
+    const resolution = await resolveAppeal(deps, appealId, 'overturn')
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: true })
+    const pending = await store.repos.appeals.listPendingRollback(10)
+    expect(pending.map((appeal) => appeal.id)).toEqual([appealId])
+
+    failNext = false
+    const service = createAppealRollbackService({ ...deps, limit: 10 })
+    expect(await service.runOnce()).toEqual({ scanned: 1, cleared: 1, failed: 0 })
+    expect(await store.repos.appeals.listPendingRollback(10)).toEqual([])
+  })
+
+  test('清除标记失败只记 warn：结案结论不变，标记留给扫描兜底', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const repos: Repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        clearRollbackPending: async () => {
+          throw new Error('database is down')
+        },
+      },
+    }
+    const { logger, warnings } = warnCapture()
+    const recording = createRecordingApi()
+
+    const resolution = await resolveAppeal({ api: recording.api, repos, ownerUserId: ownerId, logger }, appealId, 'overturn')
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false })
+    expect(warnings.some((message) => message.includes('回滚标记清除失败'))).toBe(true)
+    // 底层标记仍在：扫描会再回滚一次，解禁/解封幂等。
+    expect((await store.repos.appeals.listPendingRollback(10)).map((appeal) => appeal.id)).toEqual([appealId])
+  })
+
+  test('补偿扫描：回滚失败留待下一轮，不清标记', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'ban' })
+    await store.repos.appeals.resolve(appealId, 'overturned', new Date('2026-09-23T10:10:00Z'), ownerId, true)
+    const recording: RecordingApi = createRecordingApi({
+      unbanChatMember: () => {
+        throw new GrammyError(
+          'Call to unbanChatMember failed',
+          { ok: false, error_code: 503, description: 'Service Unavailable' },
+          'unbanChatMember',
+          {},
+        )
+      },
+    })
+    const { logger, warnings } = warnCapture()
+    const service = createAppealRollbackService({ api: recording.api, repos: store.repos, ownerUserId: ownerId, logger, limit: 10 })
+
+    expect(await service.runOnce()).toEqual({ scanned: 1, cleared: 0, failed: 1 })
+    expect(warnings.some((message) => message.includes('权限回滚补偿失败'))).toBe(true)
+    expect((await store.repos.appeals.listPendingRollback(10)).map((appeal) => appeal.id)).toEqual([appealId])
+  })
+
+  test('补偿扫描：决策缺失时清标记并告警，不卡住队列', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    await store.repos.appeals.resolve(appealId, 'overturned', new Date('2026-09-23T10:10:00Z'), ownerId, true)
+    const repos: Repos = {
+      ...store.repos,
+      decisions: { ...store.repos.decisions, findById: async () => null },
+    }
+    const { logger, warnings } = warnCapture()
+    const recording = createRecordingApi()
+    const service = createAppealRollbackService({ api: recording.api, repos, ownerUserId: ownerId, logger, limit: 10 })
+
+    expect(await service.runOnce()).toEqual({ scanned: 1, cleared: 1, failed: 0 })
+    expect(warnings.some((message) => message.includes('缺少关联决策'))).toBe(true)
+    expect(recording.calls).toEqual([])
+    expect(await store.repos.appeals.listPendingRollback(10)).toEqual([])
+  })
+
+  test('补偿扫描只处理 pending，维持与已清除的申诉不在候选集', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    await store.repos.appeals.resolve(appealId, 'overturned', new Date('2026-09-23T10:10:00Z'), ownerId, false)
+    const recording = createRecordingApi()
+    const service = createAppealRollbackService({
+      api: recording.api,
+      repos: store.repos,
+      ownerUserId: ownerId,
+      logger: silentLogger,
+      limit: 10,
+    })
+
+    expect(await service.runOnce()).toEqual({ scanned: 0, cleared: 0, failed: 0 })
+    expect(recording.calls).toEqual([])
+  })
+})
+
 describe('owner 通知', () => {
   test('通知发到 owner 私聊，带维持与撤销按钮，返回已接受', async () => {
     const store = createInMemoryRepos()
@@ -372,7 +694,7 @@ describe('申诉通知补发', () => {
   test('已结案的申诉不再补发（owner 已经处理过它）', async () => {
     const store = createInMemoryRepos()
     await seedAppeal(store, { kind: 'delete' })
-    await store.repos.appeals.resolve(appealId, 'upheld', new Date('2026-09-23T10:10:00Z'), ownerId)
+    await store.repos.appeals.resolve(appealId, 'upheld', new Date('2026-09-23T10:10:00Z'), ownerId, false)
     const recording: RecordingApi = createRecordingApi()
     const service = createAppealNotificationService({
       api: recording.api,

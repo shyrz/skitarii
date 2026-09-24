@@ -7,8 +7,10 @@ import {
   APPEAL_CALLBACK_PATTERN,
   createAppealCallbackHandler,
   createAppealNotificationService,
+  createAppealRollbackService,
   type AppealDeps,
   type AppealNotificationService,
+  type AppealRollbackService,
 } from './appeal.js'
 import { createDecisionRetryService, type DecisionRetryService } from './decision-retry.js'
 import { createActionExecutor } from './executor.js'
@@ -28,17 +30,32 @@ import { createTokenBucket } from './token-bucket.js'
  *
  * 因此这里不做任何进程级副作用：不读环境变量、不建数据库连接、不 `start()`。
  *
- * 公开面同时提供 server 侧需要的运行时零件：`notifyOwnerOfAppeal`（申诉创建后私聊 owner）与
- * `createLogger`（两个进程共用同一套日志出口）。
+ * 公开面同时提供 server 侧需要的运行时零件：`notifyOwnerOfAppeal`（申诉创建后私聊 owner）、
+ * `resolveAppeal`（面板内结案，与回调按钮共用同一套权限回滚口径）与 `createLogger`（两个进程共用同一套日志出口）；
+ * `createBotRuntime` 另外交出三条补偿扫描（决策执行、申诉通知、权限回滚）。
  *
- * 需要补偿扫描的调用方用 {@link createBotRuntime}：它把 bot 与两个维护服务一起交出来，
+ * 需要补偿扫描的调用方用 {@link createBotRuntime}：它把 bot 与三个维护服务一起交出来，
  * 三者共享同一份执行器与幂等闸门（这是补偿不重复施加动作的前提）。
  */
 
 export { createLogger } from './logger.js'
 export type { Logger } from './logger.js'
-export { notifyOwnerOfAppeal, APPEAL_CALLBACK_PATTERN, createAppealNotificationService } from './appeal.js'
-export type { AppealDeps, AppealNotification, AppealNotificationService, AppealNotifyResult } from './appeal.js'
+export {
+  notifyOwnerOfAppeal,
+  resolveAppeal,
+  createAppealNotificationService,
+  createAppealRollbackService,
+  APPEAL_CALLBACK_PATTERN,
+} from './appeal.js'
+export type {
+  AppealDeps,
+  AppealNotification,
+  AppealNotificationService,
+  AppealNotifyResult,
+  AppealResolution,
+  AppealRollbackResult,
+  AppealRollbackService,
+} from './appeal.js'
 export { createDecisionRetryService, DECISION_RETRY_SCAN_LIMIT, STALE_DECISION_AGE_MS } from './decision-retry.js'
 export type { DecisionRetryResult, DecisionRetryService } from './decision-retry.js'
 
@@ -65,7 +82,7 @@ export interface CreateBotOptions {
   sleep?: ((ms: number) => Promise<void>) | undefined
 }
 
-/** bot 运行时：bot 实例与两个维护服务共用同一份执行器。 */
+/** bot 运行时：bot 实例与三个维护服务共用同一份执行器。 */
 export interface BotRuntime {
   bot: Bot
   /**
@@ -75,6 +92,8 @@ export interface BotRuntime {
   retryDecisions: DecisionRetryService
   /** owner 通知的补发扫描（`open && notified_at is null`），同样由调度器调用。 */
   resendAppeals: AppealNotificationService
+  /** 撤销结案后权限未回滚的补偿扫描（`overturned && rollback_pending`），同样由调度器调用。 */
+  retryRollbacks: AppealRollbackService
 }
 
 /**
@@ -89,7 +108,7 @@ const TELEGRAM_SERVICE_ACCOUNT_ID = 777_000
  * 建立 bot 运行时。webhook 与补偿扫描都要用 bot 的进程，因此这里一次性把两者组装出来。
  *
  * @param options bot token、仓储、复核配置与运行参数。
- * @returns bot 实例与两个维护服务。
+ * @returns bot 实例与三个维护服务。
  */
 export function createBotRuntime(options: CreateBotOptions): BotRuntime {
   const logger = options.logger ?? createLogger('bot')
@@ -223,6 +242,7 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       now: options.now,
     }),
     resendAppeals: createAppealNotificationService({ ...appealDeps, now: options.now }),
+    retryRollbacks: createAppealRollbackService({ ...appealDeps, now: options.now }),
   }
 }
 

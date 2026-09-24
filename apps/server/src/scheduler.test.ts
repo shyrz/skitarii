@@ -217,7 +217,7 @@ describe('维护任务', () => {
     expect(await store.repos.llmCache.get('new-hash')).not.toBeNull()
   })
 
-  test('补偿扫描与通知补发的结果进入本轮统计', async () => {
+  test('三条补偿扫描的结果进入本轮统计', async () => {
     const store = createInMemoryRepos()
     await seedChat(store, chatA, '甲群')
 
@@ -227,13 +227,15 @@ describe('维护任务', () => {
       now: () => now,
       retryDecisions: { runOnce: async () => ({ scanned: 3, retried: 2, skipped: 1, orphaned: 0 }) },
       resendAppeals: { runOnce: async () => ({ scanned: 2, sent: 1, failed: 1 }) },
+      retryRollbacks: { runOnce: async () => ({ scanned: 3, cleared: 2, failed: 1 }) },
     })
 
     expect(result.retriedDecisions).toBe(2)
     expect(result.resentAppeals).toBe(1)
+    expect(result.retriedRollbacks).toBe(2)
   })
 
-  test('两条补偿扫描失败只记日志，聚合与清理照常完成', async () => {
+  test('三条补偿扫描失败只记日志，聚合与清理照常完成', async () => {
     const store = createInMemoryRepos()
     await seedChat(store, chatA, '甲群')
     await seedEvent(store, chatA, 'a1', new Date('2026-09-22T01:00:00Z'))
@@ -252,11 +254,17 @@ describe('维护任务', () => {
           throw new Error('补发失败')
         },
       },
+      retryRollbacks: {
+        runOnce: async () => {
+          throw new Error('回滚补偿失败')
+        },
+      },
     })
 
     expect(result.rolledUp).toBe(2)
     expect(result.retriedDecisions).toBe(0)
     expect(result.resentAppeals).toBe(0)
+    expect(result.retriedRollbacks).toBe(0)
     expect(await store.repos.aggregates.listRange(chatA, '2026-09-22', '2026-09-22')).toHaveLength(1)
   })
 })

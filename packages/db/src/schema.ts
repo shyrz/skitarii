@@ -150,6 +150,9 @@ export const moderationDecisions = pgTable(
     index('moderation_decisions_chat_decided_idx').on(table.chatId, table.decidedAt),
     // 累犯加重要按 (群, 用户, 时间) 数违规决策，索引与查询形状对齐，避免全表扫描。
     index('moderation_decisions_user_decided_idx').on(table.chatId, table.userId, table.decidedAt),
+    // 面板的跨群处置流按 (decidedAt, id) 倒序分页，前面的复合索引都以 chat_id 打头，覆盖不到这条查询；
+    // 带上 id 是给同毫秒的并列记录提供全序，游标才能不重不漏。
+    index('moderation_decisions_decided_idx').on(table.decidedAt, table.id),
   ],
 )
 
@@ -181,6 +184,14 @@ export const appeals = pgTable(
      * 由调度器的补发扫描重试。不参与申诉状态机：结案只看 `state` / `resolved_at` / `resolved_by`。
      */
     notifiedAt: timestamp('notified_at', { withTimezone: true }),
+    /**
+     * 撤销结案后权限尚未回滚完成的标记。
+     *
+     * 结案（`state → overturned`）与回滚（解禁/解封）是两个独立动作，中途崩溃会让权限永远停在受限状态：
+     * 在 claim 的同一条 UPDATE 里把本列置 `true`，回滚成功后再清除；调度器的回滚补偿扫描按本列兜底重试。
+     * 外键级联下它不应长期为 `true`（决策缺失时扫描会清标记并告警）。
+     */
+    rollbackPending: boolean('rollback_pending').notNull().default(false),
   },
   (table) => [
     check('appeals_resolved_at', sql`(${table.state} = 'open') = (${table.resolvedAt} is null)`),

@@ -385,3 +385,319 @@ body {
     transform: none;
   }
 }
+
+/* ---- 管理台：页签 ---- */
+
+/* 分段控件： secondary 底托 + 选中项浮起，跟随 Telegram 组内分割的视觉习惯 */
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+  padding: 3px;
+  margin-bottom: 20px;
+  background: var(--secondary-bg);
+  border-radius: 12px;
+}
+
+.tab {
+  min-height: 36px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--hint);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab.active {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ---- 管理台：总计卡 ---- */
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  background: var(--secondary-bg);
+  border-radius: 16px;
+  padding: 12px 14px;
+}
+
+.stat-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--hint);
+}
+
+.stat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tone);
+}
+
+.stat-num {
+  margin: 4px 0 0;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-sub {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--hint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 管理台：小节标题与筛选 ---- */
+
+.section-title {
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* 卡片内（趋势图头部）标题与右侧控件同行，不再占下边距 */
+.card .section-title {
+  margin: 0;
+}
+
+section > .section-title {
+  margin-top: 4px;
+}
+
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg);
+  border-radius: 9px;
+}
+
+.seg button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--hint);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.seg button.active {
+  background: var(--secondary-bg);
+  color: var(--text);
+}
+
+.select {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 12px;
+  margin: 10px 0 12px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+}
+
+.filter-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.filter-row .select {
+  margin: 0;
+}
+
+/* ---- 管理台：趋势图 ---- */
+
+.chart {
+  margin: 0;
+}
+
+.chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.chart-grid {
+  stroke: var(--divider);
+  stroke-width: 1;
+}
+
+.chart-tick {
+  fill: var(--hint);
+  font-size: 10px;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 10px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--hint);
+}
+
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tone);
+}
+
+/* ---- 管理台：列表卡片 ---- */
+
+.list-card {
+  background: var(--secondary-bg);
+  border-radius: 16px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.list-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.list-line {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
+.list-sub {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--hint);
+  font-variant-numeric: tabular-nums;
+}
+
+.list-time {
+  flex: none;
+  font-size: 13px;
+  color: var(--hint);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chip {
+  padding: 2px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--hint);
+}
+
+/* 列表里的摘录最多三行，超出截断 */
+.quote.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* list-card 比详情卡片窄一档圆角，内部引用块保持同心 */
+.list-card .quote {
+  border-radius: 8px;
+}
+
+/* ---- 管理台：结案二次确认 ---- */
+
+.confirm-box {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--divider);
+}
+
+.confirm-text {
+  margin: 0;
+  font-size: 14px;
+}
+
+.btn-row {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-row .btn {
+  margin-top: 12px;
+}
+
+/* ---- 管理台：页签内局部状态（加载/失败）与杂项 ---- */
+
+.tab-pending {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 32px 0;
+  text-align: center;
+}
+
+.tab-pending p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--hint);
+}
+
+.tab-pending .btn {
+  width: auto;
+  min-width: 120px;
+  min-height: 40px;
+  margin-top: 8px;
+  padding: 0 20px;
+}
+
+.empty-state {
+  margin: 0;
+  padding: 24px 0;
+  text-align: center;
+  font-size: 14px;
+  color: var(--hint);
+}
+
+.footnote {
+  margin: 24px 0 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--hint);
+}

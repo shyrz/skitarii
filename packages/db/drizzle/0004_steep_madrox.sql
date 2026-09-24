@@ -1,0 +1,1 @@
+CREATE INDEX "moderation_decisions_decided_idx" ON "moderation_decisions" USING btree ("decided_at","id");

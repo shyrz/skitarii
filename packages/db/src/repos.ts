@@ -6,6 +6,7 @@ import type {
   DailyAggregate,
   MessageEvent,
   ModerationDecision,
+  RuleAction,
   Subscription,
   UserId,
 } from '@skitarii/core'
@@ -50,6 +51,15 @@ export interface MessageEventRepo {
   /** 读取事件与它的正文摘录（可能为 `null`），供申诉页面回显处置对象。 */
   findWithSample(eventId: string): Promise<{ event: MessageEvent; sampleText: string | null } | null>
   /**
+   * 批量读取多条事件的正文摘录（面板的处置队列与申诉队列共用）。
+   *
+   * 一条 `IN` 查询而不是逐条 `findWithSample`：面板一页几十条、跨群，逐条查就是 N+1。
+   * 返回的 Map 只包含库里存在的事件；已被保留期清理的 id 不在 Map 里，调用方按 `null` 处理。
+   *
+   * @param eventIds 事件 id 列表；空数组直接返回空 Map，不发查询。
+   */
+  findSamples(eventIds: string[]): Promise<Map<string, string | null>>
+  /**
    * 补写正文摘录。
    *
    * 实现必须保证「仅当该事件存在非 pass 决策时」才写入：这是隐私口径的落点，
@@ -77,6 +87,23 @@ export interface DecisionRepo {
    */
   listUnexecutedBetween(from: Date, to: Date, limit: number): Promise<ModerationDecision[]>
   /**
+   * 跨群处置流（面板「处置」页）：`(decidedAt, id)` 倒序 + 复合游标分页。
+   *
+   * 过滤语义：
+   * - `chatId` 缺省表示全部群；
+   * - `action` 缺省表示「非放行」（`action != 'pass'`），`'all'` 表示不过滤，具体档位表示只取该档位；
+   * - `before` 是复合游标：只取严格排在 `(before.decidedAt, before.id)` 之前的记录（首页不传）。
+   *   时间戳单列在同毫秒并列时会漏条，因此用与排序键一致的 `id` 补全序。
+   *
+   * 排序与 limit 都写进 SQL：面板是跨群查询，不能在应用层拉全量再切片。
+   */
+  listRecent(filter: {
+    chatId?: ChatId
+    action?: 'all' | RuleAction
+    before?: { decidedAt: Date; id: string }
+    limit: number
+  }): Promise<ModerationDecision[]>
+  /**
    * 累犯加重的输入：该用户在该群、`since` 之后被判违规的决策数。
    * 放行决策不计入（`action = 'pass'` 被排除），否则正常发言会稀释前科。
    *
@@ -96,13 +123,40 @@ export interface AppealRepo {
    * 结案。状态参数用 `Exclude` 排除了 `open`：结案不能把状态退回未处理。
    * 只对仍处于 `open` 的记录生效（条件写在 SQL 的 WHERE 里），因此重复点击不会翻转已结案的结论。
    *
+   * `rollbackPending` 与状态在**同一条 UPDATE** 里写入：撤销结案时置 `true`，让「已结案但权限未回滚」
+   * 的窗口在数据库中可见；维持或不撤销时写 `false`。原子性由这一条语句保证，调用方不需要补写。
+   *
    * @param resolvedBy 结案人（Phase 1 恒为 owner）。
+   * @param rollbackPending 结案后是否还有权限需要回滚（仅 `overturn` 为 `true`）。
    * @returns 本次调用是否真的结了案：实际影响行数为 0（并发重复点击、记录已结案）时为 `false`。
    *   调用方据此决定是否回滚权限与回复「已撤销」，而不是把别人的结案再演一遍。
    */
-  resolve(appealId: string, state: Exclude<AppealState, 'open'>, resolvedAt: Date, resolvedBy: UserId): Promise<boolean>
+  resolve(
+    appealId: string,
+    state: Exclude<AppealState, 'open'>,
+    resolvedAt: Date,
+    resolvedBy: UserId,
+    rollbackPending: boolean,
+  ): Promise<boolean>
+  /** 清除「待回滚」标记。回滚成功或决策缺失时调用；无条件写 `false`，重复调用幂等。 */
+  clearRollbackPending(appealId: string): Promise<void>
+  /**
+   * 回滚补偿扫描的输入：`state = 'overturned'` 且 `rollback_pending = true` 的申诉，
+   * 按结案时间升序（先结案的先补），最多 `limit` 条。未清标记的记录会一直留在候选集里，必须有上界。
+   */
+  listPendingRollback(limit: number): Promise<Appeal[]>
   /** 某群的待处理申诉，按创建时间升序。 */
   listOpen(chatId: ChatId): Promise<Appeal[]>
+  /**
+   * 面板申诉队列：按创建时间倒序取一组申诉与它们的决策（单条 join，禁止逐条回查）。
+   *
+   * @param state `null` 表示全部状态；否则只取该状态。
+   * @param limit 单页上限，调用方负责 clamp。
+   */
+  listByStateWithDecision(
+    state: AppealState | null,
+    limit: number,
+  ): Promise<{ appeal: Appeal; decision: ModerationDecision }[]>
   /**
    * 回填 owner 通知时刻：`notified_at` 只表示「Telegram 接受了那条私聊」，
    * 不参与申诉状态机。调度器据此找出「已提交但还没通知成功」的申诉补发。
