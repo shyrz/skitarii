@@ -240,7 +240,7 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 ### initData 校验口径
 
-`secret = HMAC_SHA256(key="WebAppData", message=bot_token)`，`hash = HMAC_SHA256(key=secret, message=data_check_string)`，`data_check_string` 是除 `hash` 与 `signature` 外的字段按 `key=value` 排序后用换行连接。`signature` 必须排除，否则带它的 initData 一律验不过。`auth_date` 与当前时间相差超过 1 小时即拒绝（允许 60 秒的时钟快偏移）；Mini App 每次打开都会拿到新的 initData，正常使用中用户无感。
+`secret = HMAC_SHA256(key="WebAppData", message=bot_token)`，`hash = HMAC_SHA256(key=secret, message=data_check_string)`，`data_check_string` 是**除 `hash` 外全部收到字段**（含 `signature`）按 `key=value` 排序后用换行连接。「排除 hash 与 signature」是第三方 Ed25519 校验（另一串字符串）的规则，混用会让所有带 signature 的真实 initData（Bot API 8.0 起客户端一律携带）验签失败。`auth_date` 与当前时间相差超过 1 小时即拒绝（允许 60 秒的时钟快偏移）；Mini App 每次打开都会拿到新的 initData，正常使用中用户无感。
 
 ## 关键约定
 
