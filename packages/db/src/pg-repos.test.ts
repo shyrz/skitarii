@@ -357,6 +357,27 @@ describe('读语句', () => {
     ])
   })
 
+  test('通知引用写入与读取的 SQL 形状', async () => {
+    const decisionId = '9c8b7a65-1111-4222-8333-999900001111'
+
+    const written = createPgReposRecording([])
+    await written.repos.decisions.markNoticeSent(decisionId, '-1001234567890', 77)
+    const [update] = written.recorded
+    expect(update?.query).toContain('update "moderation_decisions"')
+    expect(update?.query).toContain('set "notice_chat_id" = $1, "notice_message_id" = $2')
+    expect(update?.params).toEqual(['-1001234567890', 77, decisionId])
+
+    // 读路径带字段映射：行按 select 字段顺序给数组。
+    const read = createPgReposRecording([['123456789', 55]])
+    expect(await read.repos.decisions.findNoticeRef(decisionId)).toEqual({ chatId: '123456789', messageId: 55 })
+    expect(read.recorded[0]?.query).toContain('"notice_chat_id"')
+    expect(read.recorded[0]?.query).toContain('where "moderation_decisions"."id" = $1')
+
+    // 旧数据两列都是 null：视为没有引用，编辑侧跳过。
+    const missing = createPgReposRecording([[null, null]])
+    expect(await missing.repos.decisions.findNoticeRef(decisionId)).toBeNull()
+  })
+
   test('批量摘录用一条 IN 查询，空数组不发查询', async () => {
     const { repos, recorded } = createPgReposRecording([
       ['e1', '摘录一'],
@@ -409,6 +430,8 @@ describe('迁移产物', () => {
     expect(sql).toContain('ADD COLUMN "notified_at" timestamp with time zone;')
     expect(sql).toContain('ADD COLUMN "custom_emoji_count" integer DEFAULT 0 NOT NULL;')
     expect(sql).toContain('ADD COLUMN "rollback_pending" boolean DEFAULT false NOT NULL;')
+    expect(sql).toContain('ADD COLUMN "notice_chat_id" text;')
+    expect(sql).toContain('ADD COLUMN "notice_message_id" integer;')
     // 跨群处置流的分页游标是 (decided_at, id)，索引必须带上 id 才能覆盖同毫秒并列的全序。
     expect(sql).toContain(
       'CREATE INDEX "moderation_decisions_decided_idx" ON "moderation_decisions" USING btree ("decided_at","id");',
@@ -428,6 +451,29 @@ describe('迁移产物', () => {
       expect(readdirSync(migrationsDir)).toContain(`${entry.tag}.sql`)
       expect(readdirSync(join(migrationsDir, 'meta'))).toContain(`${String(entry.idx).padStart(4, '0')}_snapshot.json`)
     }
+  })
+
+  test('0006 snapshot 记录通知引用列，journal 末尾指向它', () => {
+    const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
+    const journal = JSON.parse(readFileSync(join(migrationsDir, 'meta', '_journal.json'), 'utf8')) as {
+      entries: Array<{ idx: number; tag: string }>
+    }
+    const last = journal.entries.at(-1)
+    expect(last).toEqual({ idx: 6, tag: '0006_bumpy_darkstar', version: '7', when: expect.any(Number), breakpoints: true })
+
+    const snapshot = JSON.parse(
+      readFileSync(join(migrationsDir, 'meta', '0006_snapshot.json'), 'utf8'),
+    ) as {
+      tables: Record<string, { columns: Record<string, { name: string; type: string; notNull: boolean }> }>
+    }
+    const columns = snapshot.tables['public.moderation_decisions']?.columns
+    expect(columns?.notice_chat_id).toEqual({ name: 'notice_chat_id', type: 'text', primaryKey: false, notNull: false })
+    expect(columns?.notice_message_id).toEqual({
+      name: 'notice_message_id',
+      type: 'integer',
+      primaryKey: false,
+      notNull: false,
+    })
   })
 })
 

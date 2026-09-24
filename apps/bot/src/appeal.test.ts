@@ -4,11 +4,14 @@ import { GrammyError } from 'grammy'
 import type { Context } from 'grammy'
 import { describe, expect, test, vi } from 'vitest'
 import {
+  appellantResultText,
   createAppealCallbackHandler,
   createAppealNotificationService,
   createAppealRollbackService,
   notifyOwnerOfAppeal,
+  noticeStageText,
   resolveAppeal,
+  updateDecisionNotice,
 } from './appeal.js'
 import type { Logger } from './logger.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
@@ -127,11 +130,11 @@ describe('owner 处理申诉', () => {
     expect(args[2]).toMatchObject({ can_send_messages: true, can_invite_users: true })
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
     expect(store.resolvedByOf(appealId)).toBe(ownerId)
-    expect(answers.at(-1)?.text).toBe('已撤销并恢复权限')
+    expect(answers.at(-1)?.text).toBe('已撤销并解除限制')
     expect(edits.at(-1)).toContain('已撤销（误判成立）')
   })
 
-  test('撤销封禁：调用解封', async () => {
+  test('撤销封禁：调用解封并告知当事人限制已解除', async () => {
     const store = createInMemoryRepos()
     await seedAppeal(store, { kind: 'ban' })
     const { handler, recording } = setup(store)
@@ -141,6 +144,7 @@ describe('owner 处理申诉', () => {
 
     expect(recording.lastArgsOf('unbanChatMember')).toEqual([chatId, userId, { only_if_banned: true }])
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
+    expect(recording.lastArgsOf('sendMessage')).toEqual([userId, '你的申诉已通过：原处理已撤销，限制已解除。'])
   })
 
   test('撤销禁言遇到不可罚目标：没有权限可恢复，仍结案为 overturned', async () => {
@@ -168,7 +172,7 @@ describe('owner 处理申诉', () => {
 
     // executor 本就禁言不了这个管理员，撤销时没有权限可恢复：结案照常，不落进「回滚失败」分支。
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
-    expect(answers.at(-1)?.text).toBe('已撤销并恢复权限')
+    expect(answers.at(-1)?.text).toBe('已撤销并解除限制')
     expect(edits.at(-1)).toContain('已撤销（误判成立）')
   })
 
@@ -180,7 +184,9 @@ describe('owner 处理申诉', () => {
 
     await handler(ctx, async () => {})
 
-    expect(recording.calls).toEqual([])
+    // 没有权限可回滚，但当事人会收到一条结案私聊。
+    expect(recordedMethods(recording)).toEqual(['sendMessage'])
+    expect(String(recording.lastArgsOf('sendMessage')?.[1])).toBe('你的申诉已通过：原处理已撤销。')
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
   })
 
@@ -192,7 +198,9 @@ describe('owner 处理申诉', () => {
 
     await handler(ctx, async () => {})
 
-    expect(recording.calls).toEqual([])
+    // 不改权限，只有一条结案私聊。
+    expect(recordedMethods(recording)).toEqual(['sendMessage'])
+    expect(String(recording.lastArgsOf('sendMessage')?.[1])).toBe('你的申诉未通过：原处理维持。')
     const appeal = await store.repos.appeals.findById(appealId)
     expect(appeal).toMatchObject({ state: 'upheld' })
     expect(appeal?.resolvedAt).toBeInstanceOf(Date)
@@ -223,7 +231,7 @@ describe('owner 处理申诉', () => {
     const second = createContext(`appeal:${appealId}:overturn`, ownerId)
     await handler(second.ctx, async () => {})
 
-    expect(recordedMethods(recording)).toEqual([])
+    expect(recordedMethods(recording)).toEqual(['sendMessage'])
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'upheld' })
     expect(second.answers.at(-1)?.text).toContain('已经处理过')
   })
@@ -242,7 +250,7 @@ describe('owner 处理申诉', () => {
 
     await handler(ctx, async () => {})
 
-    // 不能答「已撤销并恢复权限」：真正结案的是另一次调用。
+    // 不能答「已撤销并解除限制」：真正结案的是另一次调用。
     expect(answers.at(-1)).toEqual({ text: '这条申诉已被处理过' })
     expect(edits).toEqual([])
     expect(recording.calls).toEqual([])
@@ -273,7 +281,8 @@ describe('resolveAppeal 结案语义', () => {
     )
 
     expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false, resolvedAt: expect.any(Date) })
-    expect(recording.calls).toEqual([])
+    // 维持也要通知当事人：他们应该知道复核结果。
+    expect(String(recording.lastArgsOf('sendMessage')?.[1])).toBe('你的申诉未通过：原处理维持。')
     const appeal = await store.repos.appeals.findById(appealId)
     expect(appeal).toMatchObject({ state: 'upheld' })
     expect(appeal?.resolvedAt).toBeInstanceOf(Date)
@@ -404,22 +413,220 @@ describe('resolveAppeal 结案语义', () => {
   })
 })
 
-describe('回滚补偿（rollback_pending）', () => {
-  /** 建一个只记录 warn 的日志替身。 */
-  function warnCapture(): { logger: Logger; warnings: string[] } {
-    const warnings: string[] = []
-    return {
-      warnings,
-      logger: {
-        info: () => {},
-        warn: (message) => {
-          warnings.push(message)
-        },
-        error: () => {},
+/**
+ * 建一个只记录 warn 的日志替身。
+ *
+ * @returns `logger` 与其收到的 warn 文案（按顺序）。
+ */
+function warnCapture(): { logger: Logger; warnings: string[] } {
+  const warnings: string[] = []
+  return {
+    warnings,
+    logger: {
+      info: () => {},
+      warn: (message) => {
+        warnings.push(message)
       },
-    }
+      error: () => {},
+    },
   }
+}
 
+describe('通知生命周期与结案私聊', () => {
+  test('阶段文案覆盖两个受众', () => {
+    expect(noticeStageText('received', 'group')).toBe('⏳ 已收到申诉，等待复核')
+    expect(noticeStageText('received', 'dm')).toBe('⏳ 已收到你的申诉，等待复核')
+    expect(noticeStageText('overturned', 'group')).toBe('✅ 已撤销（复核为误判）')
+    expect(noticeStageText('overturned', 'dm')).toBe('✅ 你的申诉已通过，处理已撤销')
+    expect(noticeStageText('upheld', 'group')).toBe('🚫 已维持原处置')
+    expect(noticeStageText('upheld', 'dm')).toBe('🚫 你的申诉未通过，原处理维持')
+  })
+
+  test('结案私聊文案按动作与回滚结果分档', () => {
+    // 限制类动作：回滚成功说「已解除」，失败说「解除中」（补偿扫描会继续重试）。
+    expect(appellantResultText('mute', 'overturn', false)).toBe('你的申诉已通过：原处理已撤销，限制已解除。')
+    expect(appellantResultText('ban', 'overturn', false)).toBe('你的申诉已通过：原处理已撤销，限制已解除。')
+    expect(appellantResultText('mute', 'overturn', true)).toBe('你的申诉已通过：原处理已撤销，限制解除中。')
+    expect(appellantResultText('ban', 'overturn', true)).toBe('你的申诉已通过：原处理已撤销，限制解除中。')
+    // 无权限状态可恢复的动作：不承诺解除限制。
+    expect(appellantResultText('warn', 'overturn', false)).toBe('你的申诉已通过：原处理已撤销。')
+    expect(appellantResultText('delete', 'overturn', false)).toBe('你的申诉已通过：原处理已撤销。')
+    // 维持与动作无关。
+    expect(appellantResultText('mute', 'uphold', false)).toBe('你的申诉未通过：原处理维持。')
+  })
+
+  test('编辑目标消息已删除（message to edit not found）只 warn，结案照常', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    await store.repos.decisions.markNoticeSent(decisionId, String(userId), 77)
+    const recording: RecordingApi = createRecordingApi({
+      editMessageText: () => {
+        throw new GrammyError(
+          'Call to editMessageText failed',
+          { ok: false, error_code: 400, description: 'Bad Request: message to edit not found' },
+          'editMessageText',
+          {},
+        )
+      },
+    })
+    const { logger, warnings } = warnCapture()
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger },
+      appealId,
+      'uphold',
+    )
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false })
+    expect(warnings.some((message) => message.includes('通知编辑失败'))).toBe(true)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'upheld' })
+  })
+
+  test('提交申诉阶段：私聊通知切成「等待复核」并去按钮', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    await store.repos.decisions.markNoticeSent(decisionId, String(userId), 77)
+    const recording = createRecordingApi()
+
+    await updateDecisionNotice(
+      { api: recording.api, repos: store.repos, logger: silentLogger },
+      decisionId,
+      'received',
+    )
+
+    expect(recording.lastArgsOf('editMessageText')).toEqual([
+      String(userId),
+      77,
+      '⏳ 已收到你的申诉，等待复核',
+      { reply_markup: { inline_keyboard: [] } },
+    ])
+  })
+
+  test('结案编辑私聊通知：终态文案与去按钮', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    await store.repos.decisions.markNoticeSent(decisionId, String(userId), 77)
+    const recording = createRecordingApi()
+
+    await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger },
+      appealId,
+      'overturn',
+    )
+
+    expect(recording.lastArgsOf('editMessageText')).toEqual([
+      String(userId),
+      77,
+      '✅ 你的申诉已通过，处理已撤销',
+      { reply_markup: { inline_keyboard: [] } },
+    ])
+  })
+
+  test('结案编辑群内通知：匿名文案与去按钮', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    // 群/超级群 id 为负数，编辑侧据此选匿名文案。
+    await store.repos.decisions.markNoticeSent(decisionId, String(chatId), 88)
+    const recording = createRecordingApi()
+
+    await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger },
+      appealId,
+      'uphold',
+    )
+
+    expect(recording.lastArgsOf('editMessageText')).toEqual([
+      String(chatId),
+      88,
+      '🚫 已维持原处置',
+      { reply_markup: { inline_keyboard: [] } },
+    ])
+  })
+
+  test('没有通知引用时跳过编辑，只记 warn', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    const recording = createRecordingApi()
+    const { logger, warnings } = warnCapture()
+
+    await resolveAppeal({ api: recording.api, repos: store.repos, ownerUserId: ownerId, logger }, appealId, 'uphold')
+
+    expect(recording.countOf('editMessageText')).toBe(0)
+    expect(warnings.some((message) => message.includes('没有通知引用'))).toBe(true)
+  })
+
+  test('通知编辑失败只 warn，不影响结案结论', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    await store.repos.decisions.markNoticeSent(decisionId, String(userId), 77)
+    const recording: RecordingApi = createRecordingApi({
+      editMessageText: () => {
+        throw new Error('Bad Request: message is not modified')
+      },
+    })
+    const { logger, warnings } = warnCapture()
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger },
+      appealId,
+      'uphold',
+    )
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false })
+    expect(warnings.some((message) => message.includes('通知编辑失败'))).toBe(true)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'upheld' })
+  })
+
+  test('回滚失败仍发结案私聊（记录层已撤销）', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
+    const recording: RecordingApi = createRecordingApi({
+      restrictChatMember: () => {
+        throw new GrammyError(
+          'Call to restrictChatMember failed',
+          { ok: false, error_code: 503, description: 'Service Unavailable' },
+          'restrictChatMember',
+          {},
+        )
+      },
+    })
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger },
+      appealId,
+      'overturn',
+    )
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: true })
+    expect(recording.lastArgsOf('sendMessage')).toEqual([
+      userId,
+      '你的申诉已通过：原处理已撤销，限制解除中。',
+    ])
+  })
+
+  test('结案私聊失败只 warn，不影响结案', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'delete' })
+    const recording: RecordingApi = createRecordingApi({
+      sendMessage: () => {
+        throw new Error('Forbidden: bot was blocked by the user')
+      },
+    })
+    const { logger, warnings } = warnCapture()
+
+    const resolution = await resolveAppeal(
+      { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger },
+      appealId,
+      'uphold',
+    )
+
+    expect(resolution).toMatchObject({ kind: 'resolved', rollbackFailed: false })
+    expect(warnings.some((message) => message.includes('结案通知发送失败'))).toBe(true)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'upheld' })
+  })
+})
+
+describe('回滚补偿（rollback_pending）', () => {
   test('撤销在 claim 的同一次更新里置「待回滚」，回滚成功后清除', async () => {
     const store = createInMemoryRepos()
     await seedAppeal(store, { kind: 'mute', until: new Date('2026-09-23T11:00:00Z') })
@@ -605,7 +812,7 @@ describe('owner 通知', () => {
         inline_keyboard: [
           [
             { text: '维持原处置', callback_data: `appeal:${appealId}:uphold` },
-            { text: '撤销并恢复', callback_data: `appeal:${appealId}:overturn` },
+            { text: '撤销并解除限制', callback_data: `appeal:${appealId}:overturn` },
           ],
         ],
       },

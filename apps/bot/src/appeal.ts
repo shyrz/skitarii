@@ -10,9 +10,12 @@ import { isUnpunishableTarget } from './telegram-errors.js'
 /**
  * 申诉闭环：群内申诉入口、owner 私聊通知、owner 的「维持 / 撤销」回调。
  *
- * 链路：非放行处置在群里发一条带申诉按钮的通知（按钮 URL 携带 decisionId）→
+ * 链路：非放行处置发一条带申诉按钮的通知（先私聊当事人，不可达回退群内；按钮 URL 携带 decisionId）→
  * 用户在 Mini App 里提交申诉 → server 落库并调用 {@link notifyOwnerOfAppeal} 私聊 owner →
  * owner 点按钮或在面板里结案 → {@link resolveAppeal} 撤销（回滚权限）或维持。
+ *
+ * 通知生命周期：提交申诉与结案都会把原通知编辑成状态行并去掉按钮（见 {@link updateDecisionNotice}），
+ * 结案时另外私聊当事人一条结果通知（编辑不触发提醒）。
  *
  * 撤销的回滚口径：`mute` 解禁、`ban` 解封，`delete` 与 `warn` 没有可回滚的权限状态
  * （消息已删除无法恢复），只把申诉状态改成 `overturned`，让误伤率统计与人工复盘能看到它。
@@ -88,7 +91,7 @@ export function ownerDecisionKeyboard(appealId: string): InlineKeyboardMarkup {
     inline_keyboard: [
       [
         { text: '维持原处置', callback_data: `appeal:${appealId}:uphold` },
-        { text: '撤销并恢复', callback_data: `appeal:${appealId}:overturn` },
+        { text: '撤销并解除限制', callback_data: `appeal:${appealId}:overturn` },
       ],
     ],
   }
@@ -290,26 +293,150 @@ export async function resolveAppeal(
   )
   if (!claimed) return { kind: 'already_resolved' }
 
+  let rollbackFailed = false
   if (outcome === 'overturn') {
     try {
       await rollbackAction(deps, decision)
     } catch (error) {
       // 结案已经写入，权限回滚失败：不能报「已恢复」。把可执行的处置方向交给调用方，
-      // 否则用户会一直停在禁言/封禁状态而没人知道。待回滚标记保持置位，扫描会继续重试。
+      // 否则用户会一直停在禁言/封禁状态而没人知道。待回滚标记保持置位，扫描会继续重试；
+      // 结案通知照发（记录层已经撤销，文案不承诺恢复消息内容）。
       deps.logger.error(`申诉已结案但权限回滚失败 appealId=${appealId} decisionId=${decision.id}`, error)
-      return { kind: 'resolved', rollbackFailed: true, resolvedAt }
+      rollbackFailed = true
     }
 
-    try {
-      await deps.repos.appeals.clearRollbackPending(appealId)
-    } catch (error) {
-      // 清除失败不改变结案结论：标记留着最多让扫描再回滚一次（解禁/解封幂等）。
-      deps.logger.warn(`回滚标记清除失败，待扫描兜底 appealId=${appealId}`, error)
+    if (!rollbackFailed) {
+      try {
+        await deps.repos.appeals.clearRollbackPending(appealId)
+      } catch (error) {
+        // 清除失败不改变结案结论：标记留着最多让扫描再回滚一次（解禁/解封幂等）。
+        deps.logger.warn(`回滚标记清除失败，待扫描兜底 appealId=${appealId}`, error)
+      }
     }
   }
 
+  // 通知生命周期与结案私聊都是旁路：best-effort，失败只 warn，不影响结案结论。
+  await updateDecisionNotice(deps, decision.id, outcome === 'overturn' ? 'overturned' : 'upheld')
+  await notifyAppellant(deps, decision, outcome, rollbackFailed)
+
   deps.logger.info(`申诉已结案 appealId=${appealId} outcome=${outcome} by=${deps.ownerUserId}`)
-  return { kind: 'resolved', rollbackFailed: false, resolvedAt }
+  return { kind: 'resolved', rollbackFailed, resolvedAt }
+}
+
+/** 通知编辑的阶段：提交申诉、撤销结案、维持结案。 */
+export type AppealNoticeStage = 'received' | 'overturned' | 'upheld'
+
+/**
+ * 通知在各阶段的文案。
+ *
+ * 群内保持匿名口径（不提当事人），私聊用第二人称。
+ *
+ * @param stage 生命周期阶段。
+ * @param audience `group` 群内通知；`dm` 当事人私聊通知。
+ * @returns 直接作为消息正文的文案。
+ */
+export function noticeStageText(stage: AppealNoticeStage, audience: 'group' | 'dm'): string {
+  switch (stage) {
+    case 'received':
+      return audience === 'dm' ? '⏳ 已收到你的申诉，等待复核' : '⏳ 已收到申诉，等待复核'
+    case 'overturned':
+      return audience === 'dm' ? '✅ 你的申诉已通过，处理已撤销' : '✅ 已撤销（复核为误判）'
+    case 'upheld':
+      return audience === 'dm' ? '🚫 你的申诉未通过，原处理维持' : '🚫 已维持原处置'
+    default: {
+      const exhaustive: never = stage
+      throw new Error(`未知通知阶段: ${String(exhaustive)}`)
+    }
+  }
+}
+
+/**
+ * 更新处置通知：整条替换成阶段文案，并移除申诉按钮。
+ *
+ * 为什么整条替换而不是追加：阶段文案本身就是通知的当前状态，原通知已经作为一次推送送达过；
+ * 追加会让「等待复核」残留在终态消息里。
+ *
+ * 去按钮必须显式传空 `inline_keyboard`：Telegram 省略 `reply_markup` 不会清掉旧键盘。
+ *
+ * best-effort：引用缺失（通知没发出去、记录失败或旧数据）或编辑失败只 warn，不抛出，
+ * 提交申诉与结案的主流程都不受它影响。受众由通知落点判断：私聊记录的是用户 id（正数），
+ * 群/超级群 id 恒为负数。
+ *
+ * @param deps api、仓储与日志（与 `resolveAppeal` 同源）。
+ * @param decisionId 决策 id。
+ * @param stage 要切换到的阶段。
+ */
+export async function updateDecisionNotice(
+  deps: Pick<AppealDeps, 'api' | 'repos' | 'logger'>,
+  decisionId: string,
+  stage: AppealNoticeStage,
+): Promise<void> {
+  try {
+    const ref = await deps.repos.decisions.findNoticeRef(decisionId)
+    if (ref === null) {
+      deps.logger.warn(`决策没有通知引用，跳过通知编辑 decisionId=${decisionId}`)
+      return
+    }
+
+    const audience = ref.chatId.startsWith('-') ? 'group' : 'dm'
+    await deps.api.editMessageText(ref.chatId, ref.messageId, noticeStageText(stage, audience), {
+      reply_markup: { inline_keyboard: [] },
+    })
+  } catch (error) {
+    deps.logger.warn(`通知编辑失败，跳过 decisionId=${decisionId} stage=${stage}`, error)
+  }
+}
+
+/**
+ * 结案后私聊当事人（发新消息，不依赖通知引用）。
+ *
+ * 为什么单独发新消息：编辑不触发通知，当事人需要一条真正的提醒；即使 `rollbackFailed` 也照发
+ * （记录层已撤销，权限由补偿扫描/owner 兜底），文案不承诺恢复已删除的消息内容。
+ * 不可达或失败只 warn。
+ *
+ * @param deps api 与日志。
+ * @param decision 原决策（取当事人 id 与实际动作）。
+ * @param outcome 结案结果。
+ * @param rollbackFailed 解除限制是否失败；只影响 mute/ban 的措辞（「解除中」而非「已解除」）。
+ */
+async function notifyAppellant(
+  deps: AppealDeps,
+  decision: ModerationDecision,
+  outcome: AppealOutcome,
+  rollbackFailed: boolean,
+): Promise<void> {
+  const text = appellantResultText(decision.action.kind, outcome, rollbackFailed)
+
+  try {
+    await callWithRetry(() => deps.api.sendMessage(decision.userId, text), {
+      logger: deps.logger,
+      label: 'sendMessage(appeal-result)',
+    })
+  } catch (error) {
+    deps.logger.warn(`结案通知发送失败，当事人可能未与 bot 私聊 userId=${decision.userId}`, error)
+  }
+}
+
+/**
+ * 结案私聊的文案。纯函数，便于断言。
+ *
+ * 只对「限制类动作」承诺解除限制：mute/ban 撤销成功说「已解除」，回滚失败说「解除中」（补偿扫描会重试）；
+ * warn/delete 没有权限状态可恢复，只说原处理已撤销，不承诺恢复已删除的消息内容。
+ *
+ * @param actionKind 原处置档位。
+ * @param outcome 结案结果。
+ * @param rollbackFailed 解除限制是否失败。
+ * @returns 给当事人的一句话。
+ */
+export function appellantResultText(
+  actionKind: Action['kind'],
+  outcome: AppealOutcome,
+  rollbackFailed: boolean,
+): string {
+  if (outcome === 'uphold') return '你的申诉未通过：原处理维持。'
+  if (actionKind !== 'mute' && actionKind !== 'ban') return '你的申诉已通过：原处理已撤销。'
+
+  return rollbackFailed ? '你的申诉已通过：原处理已撤销，限制解除中。' : '你的申诉已通过：原处理已撤销，限制已解除。'
 }
 
 /** 回滚补偿一轮最多处理的申诉数。没清掉标记的记录会一直留在候选集里，因此必须有上界。 */
@@ -432,12 +559,12 @@ export function createAppealCallbackHandler(deps: AppealDeps): MiddlewareFn<Cont
 
     if (resolution.rollbackFailed) {
       await editOwnerMessage(ctx, outcome, resolution.resolvedAt)
-      await ctx.answerCallbackQuery({ text: '已结案，但恢复权限失败：请手动解禁或解封', show_alert: true })
+      await ctx.answerCallbackQuery({ text: '已结案，但解除限制失败：请手动解禁或解封', show_alert: true })
       return
     }
 
     await editOwnerMessage(ctx, outcome, resolution.resolvedAt)
-    await ctx.answerCallbackQuery({ text: outcome === 'overturn' ? '已撤销并恢复权限' : '已维持原处置' })
+    await ctx.answerCallbackQuery({ text: outcome === 'overturn' ? '已撤销并解除限制' : '已维持原处置' })
   }
 }
 

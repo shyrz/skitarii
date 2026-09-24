@@ -7,19 +7,20 @@ import type { IdempotencyRegistry } from './idempotency.js'
 import type { Logger } from './logger.js'
 import { MUTE_ALL_PERMISSIONS } from './permissions.js'
 import { callWithRetry } from './telegram-call.js'
-import { isUnpunishableTarget } from './telegram-errors.js'
+import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-errors.js'
 import type { TokenBucket } from './token-bucket.js'
 
 /**
  * 处置执行。
  *
- * 职责边界：把已落库的决策施加到 Telegram，并在群里发一条带申诉入口的处置通知。
+ * 职责边界：把已落库的决策施加到 Telegram，并给当事人发一条带申诉入口的处置通知。
  * 判定与落库在管线侧完成，这里不做任何分数或阈值判断。
  *
  * 执行序：先施加动作，再发通知，最后回填 `executed`。
  * - 动作失败（非终态）时不回填，决策留成「未执行」，重投递或人工补偿还能再试一次。
  * - 通知失败（限流桶空、编辑失败）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
- * - 动作被 Telegram 终结性拒绝时不发群内通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
+ * - 通知先私聊当事人，不可达（未 /start、被拉黑）才回退群内；实际落点记录在决策上，供申诉编辑复用。
+ * - 动作被 Telegram 终结性拒绝时不发通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
  *   留着不填只会让补偿扫描反复重投递。配置了 `notifyOwnerFailure` 时私聊 owner 一条失败通知。
  *
  * 幂等：动作与通知都在 `eventId:action` 的闸门内执行；决策已 `executed` 时直接跳过。
@@ -45,7 +46,7 @@ export interface ActionExecutorDeps {
   api: Api
   repos: Repos
   idempotency: IdempotencyRegistry
-  /** 群内通知的限流桶，键是 chatId。 */
+  /** 处置通知的限流桶：私聊以用户 id 为键、群内以 chat id 为键（见 `sendNotice`）。 */
   outbound: TokenBucket
   miniAppUrl: string
   logger: Logger
@@ -220,17 +221,87 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
 }
 
 /**
- * 发送群内处置通知，附带 Mini App 申诉入口。
+ * 发送处置通知：**先私聊当事人，不可达才回退群内**。
  *
- * 限流桶取不到令牌时直接放弃本次发送：通知是可丢的，为它排队会拖慢审核路径。
- * 通知不重复消息正文：群成员看得到原消息，摘要摘录属于申诉页面与 owner。
+ * 私聊优先的理由：处置结果直接递到当事人手里，群里不再出现一条匿名通知（完全静默）。
+ * 私聊不可达（从未 /start 或已拉黑 bot）时回退群内通知，保留现状形态：匿名文案 + 申诉按钮。
+ * 其余失败与限流都按「通知可丢」处理：通知是旁路，不能反过来影响动作执行。
+ *
+ * 限流：两类目标各自过一遍 per-chat 令牌桶（私聊以用户 id 为键）；取不到令牌的那个目标跳过。
+ * 私聊被限流时仍会尝试群内兜底，群内能否发出由它自己的桶决定。
+ *
+ * 发送成功后记录通知引用（`notice_*` 列），申诉生命周期据此编辑原通知；记录失败只 warn。
  *
  * @param deps 执行器依赖。
- * @param decision 决策（取群与 decisionId）。
+ * @param decision 决策（取群、用户与 decisionId）。
  * @param action 实际生效的动作；降级时它与决策上的原动作不同（见 {@link applyAction}）。
  * @param instant 当前时刻（渲染禁言剩余分钟数）。
  */
 async function sendNotice(
+  deps: ActionExecutorDeps,
+  decision: ModerationDecision,
+  action: Action,
+  instant: Date,
+): Promise<void> {
+  const dm = await sendDirectNotice(deps, decision, action, instant)
+  // 只有「不可达」与「私聊被限流」才回退群内；其余私聊失败按通知可丢处理，不发群内。
+  if (dm !== 'fallback') return
+  await sendGroupNotice(deps, decision, action, instant)
+}
+
+/** 私聊投递结果：成功；回退群内（不可达或限流跳过）；失败（其余错误，通知可丢）。 */
+type DirectNoticeOutcome = 'sent' | 'fallback' | 'failed'
+
+/**
+ * 私聊当事人。
+ *
+ * @param deps 执行器依赖。
+ * @param decision 决策。
+ * @param action 实际生效的动作。
+ * @param instant 当前时刻。
+ * @returns 投递结果，决定是否回退群内。
+ */
+async function sendDirectNotice(
+  deps: ActionExecutorDeps,
+  decision: ModerationDecision,
+  action: Action,
+  instant: Date,
+): Promise<DirectNoticeOutcome> {
+  const target = String(decision.userId)
+  if (!deps.outbound.tryTake(target)) {
+    deps.logger.warn(`出站限流，跳过当事人私聊通知 userId=${decision.userId} decisionId=${decision.id}`)
+    return 'fallback'
+  }
+
+  try {
+    const message = await callWithRetry(
+      () =>
+        deps.api.sendMessage(decision.userId, noticeText(action, instant, 'dm'), {
+          reply_markup: appealKeyboard(deps.miniAppUrl, decision.id),
+        }),
+      { logger: deps.logger, label: 'sendMessage(dm-notice)' },
+    )
+    await recordNoticeRef(deps, decision, target, message.message_id)
+    return 'sent'
+  } catch (error) {
+    if (isPrivateChatUnreachable(error)) {
+      deps.logger.info(`当事人私聊不可达，回退群内通知 decisionId=${decision.id}`)
+      return 'fallback'
+    }
+    deps.logger.warn(`当事人私聊通知发送失败 decisionId=${decision.id}`, error)
+    return 'failed'
+  }
+}
+
+/**
+ * 群内通知（回退形态）：匿名文案 + 申诉按钮，现状不变。
+ *
+ * @param deps 执行器依赖。
+ * @param decision 决策。
+ * @param action 实际生效的动作。
+ * @param instant 当前时刻。
+ */
+async function sendGroupNotice(
   deps: ActionExecutorDeps,
   decision: ModerationDecision,
   action: Action,
@@ -241,14 +312,36 @@ async function sendNotice(
     return
   }
 
-  const text = noticeText(action, instant)
+  const text = noticeText(action, instant, 'group')
   try {
-    await callWithRetry(
+    const message = await callWithRetry(
       () => deps.api.sendMessage(decision.chatId, text, { reply_markup: appealKeyboard(deps.miniAppUrl, decision.id) }),
       { logger: deps.logger, label: 'sendMessage(notice)' },
     )
+    await recordNoticeRef(deps, decision, decision.chatId, message.message_id)
   } catch (error) {
     deps.logger.warn(`处置通知发送失败 decisionId=${decision.id}`, error)
+  }
+}
+
+/**
+ * 记录通知引用。记录失败只 warn：引用缺失时申诉生命周期的编辑会跳过，不影响主流程。
+ *
+ * @param deps 执行器依赖。
+ * @param decision 决策。
+ * @param chatId 通知落点（私聊为用户 id、回退时是群 id，均为字符串形态）。
+ * @param messageId 通知消息 id。
+ */
+async function recordNoticeRef(
+  deps: ActionExecutorDeps,
+  decision: ModerationDecision,
+  chatId: string,
+  messageId: number,
+): Promise<void> {
+  try {
+    await deps.repos.decisions.markNoticeSent(decision.id, chatId, messageId)
+  } catch (error) {
+    deps.logger.warn(`通知引用记录失败，后续编辑将跳过 decisionId=${decision.id}`, error)
   }
 }
 
@@ -275,23 +368,29 @@ async function notifyFailure(deps: ActionExecutorDeps, decision: ModerationDecis
 /**
  * 通知文案。纯函数，便于断言。
  *
+ * 两个受众两套口气：群内匿名（现状不变，避免把被处置者点名示众），
+ * 私聊第二人称（对接当事人的处置结果）。禁言时长都按剩余分钟数渲染。
+ *
  * @param action 处置。
  * @param instant 当前时刻。
- * @returns 群里可见的文案。
+ * @param audience `group` 群内匿名；`dm` 私聊当事人（第二人称）。
+ * @returns 目标受众可见的文案。
  */
-export function noticeText(action: Action, instant: Date): string {
+export function noticeText(action: Action, instant: Date, audience: 'group' | 'dm'): string {
   switch (action.kind) {
     case 'pass':
       return ''
     case 'warn':
-      return '⚠️ 请注意群规：这条消息疑似违规，请勿重复发送。'
+      return audience === 'dm'
+        ? '⚠️ 请注意群规：你发的这条消息疑似违规，请勿重复发送。'
+        : '⚠️ 请注意群规：这条消息疑似违规，请勿重复发送。'
     case 'delete':
-      return '🚫 已删除一条违规消息。'
+      return audience === 'dm' ? '🚫 已删除你的违规消息。' : '🚫 已删除一条违规消息。'
     case 'ban':
-      return '⛔ 已将违规用户移出本群。'
+      return audience === 'dm' ? '⛔ 已将你移出本群。' : '⛔ 已将违规用户移出本群。'
     case 'mute': {
       const minutes = Math.max(1, Math.round((action.until.getTime() - instant.getTime()) / 60_000))
-      return `🔇 已禁言违规用户 ${minutes} 分钟。`
+      return audience === 'dm' ? `🔇 已对你禁言 ${minutes} 分钟。` : `🔇 已禁言违规用户 ${minutes} 分钟。`
     }
     default: {
       const exhaustive: never = action

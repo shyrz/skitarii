@@ -43,6 +43,13 @@
       "when": 1790264395896,
       "tag": "0005_naive_secret_warriors",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790270452144,
+      "tag": "0006_bumpy_darkstar",
+      "breakpoints": true
     }
   ]
 }

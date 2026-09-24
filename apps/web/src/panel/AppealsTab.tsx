@@ -11,7 +11,7 @@ import { ACTION_LABEL, ACTION_TONE, formatTime } from './util.js'
 /** 结案按钮文案与确认提示；撤销伴随权限回滚，确认语写明后果。 */
 const RESOLUTION_TEXT: Record<PanelResolution, { button: string; confirm: string }> = {
   upheld: { button: '维持原处置', confirm: '确认维持原处理？' },
-  overturned: { button: '撤销并恢复', confirm: '确认撤销处置，并恢复用户的发言权限？' },
+  overturned: { button: '撤销并解除限制', confirm: '确认撤销处置，并解除对该用户的限制？' },
 }
 
 export function AppealsTab({
@@ -69,7 +69,7 @@ export function AppealsTab({
           ...list,
         ])
         if (result.rollbackFailed) {
-          setNotice('已结案，但恢复权限失败，请手动解禁或解封。')
+          setNotice('已结案，但解除限制失败：请手动解禁或解封')
         }
       } catch (error) {
         if (error instanceof ConflictError) {

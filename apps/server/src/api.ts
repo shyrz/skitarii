@@ -1,6 +1,6 @@
 import type { Appeal, ModerationDecision, UserId } from '@skitarii/core'
 import type { Repos } from '@skitarii/db'
-import type { AppealNotification, Logger } from '@skitarii/bot'
+import type { AppealNoticeStage, AppealNotification, Logger } from '@skitarii/bot'
 import { z } from 'zod'
 import { verifyInitData } from './init-data.js'
 
@@ -47,6 +47,11 @@ export interface AppealApiDeps {
   ownerUserId: UserId
   /** 新申诉的通知出口（bot 私聊 owner）。`true` 表示 Telegram 接受；实现不抛出。 */
   notifyAppeal(notification: AppealNotification): Promise<boolean>
+  /**
+   * 申诉提交后更新原处置通知（切成「等待复核」并去掉申诉按钮）。
+   * 实现在 bot 侧（`updateDecisionNotice`），由 `index.ts` 注入 bot api；best-effort，不抛出。
+   */
+  editNotice(decisionId: string, stage: AppealNoticeStage): Promise<void>
   logger: Logger
   now?: () => Date
 }
@@ -136,6 +141,15 @@ export async function createAppeal(deps: AppealApiDeps, body: unknown): Promise<
   if (stored === null || stored.id !== appeal.id) return { status: 409, body: { error: 'appeal_exists' } }
 
   const context = await loadContext(deps, decision)
+
+  // 先编辑原通知、后通知 owner：owner 收到私聊后可能立刻结案，编辑必须赶在结案编辑之前，
+  // 否则「等待复核」会覆盖终态文案（两段都是 best-effort，失败只记日志）。
+  try {
+    await deps.editNotice(decision.id, 'received')
+  } catch (error) {
+    deps.logger.warn(`通知编辑调用失败 decisionId=${decision.id}`, error)
+  }
+
   try {
     const accepted = await deps.notifyAppeal({
       appealId: appeal.id,

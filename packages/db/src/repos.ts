@@ -110,6 +110,20 @@ export interface DecisionRepo {
    * @param since 统计起点，通常取当前时间往前若干天；调用方负责决定「多久算一次前科」。
    */
   countPriorViolations(chatId: ChatId, userId: UserId, since: Date): Promise<number>
+  /**
+   * 记录处置通知的落点，供申诉生命周期编辑：提交申诉时改成「等待复核」、结案时改成终态，
+   * 两处都要去掉申诉按钮。
+   *
+   * @param chatId 私聊优先时的用户 id，或回退群内时的群 id（字符串形态）。
+   * @param messageId `sendMessage` 返回的消息 id。
+   */
+  markNoticeSent(decisionId: string, chatId: string, messageId: number): Promise<void>
+  /**
+   * 读取处置通知引用。
+   *
+   * @returns 记录过的落点；通知没发出去、记录失败或旧数据时为 `null`（编辑侧跳过，不报错）。
+   */
+  findNoticeRef(decisionId: string): Promise<{ chatId: string; messageId: number } | null>
 }
 
 /** 申诉读写。 */

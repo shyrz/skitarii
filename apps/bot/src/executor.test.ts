@@ -85,7 +85,7 @@ describe('处置执行', () => {
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
   })
 
-  test('群内通知带申诉按钮，URL 携带 decisionId', async () => {
+  test('当事人私聊通知带申诉按钮，URL 携带 decisionId', async () => {
     const { executor, recording, store } = setup()
     const decision = decisionFixture()
     await store.repos.decisions.insert(decision)
@@ -93,13 +93,139 @@ describe('处置执行', () => {
     await executor.execute(decision, { messageId: 42 })
 
     const args = recording.lastArgsOf('sendMessage') ?? []
-    expect(args[0]).toBe(chatId)
-    expect(String(args[1])).toContain('已删除一条违规消息')
+    expect(args[0]).toBe(userId)
+    expect(String(args[1])).toBe('🚫 已删除你的违规消息。')
     expect(args[2]).toEqual({
       reply_markup: {
         inline_keyboard: [[{ text: '提起申诉', url: `https://mini.example.com/app?startapp=${decision.id}` }]],
       },
     })
+  })
+
+  test('私聊成功：群内完全静默，并记录通知引用', async () => {
+    const { executor, recording, store } = setup()
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    // 只有一条私聊通知，群内没有任何消息。
+    expect(recording.calls.filter((call) => call.method === 'sendMessage')).toHaveLength(1)
+    expect(recording.lastArgsOf('sendMessage')?.[0]).toBe(userId)
+    // 引用落库，供申诉生命周期编辑。
+    expect(await store.repos.decisions.findNoticeRef(decision.id)).toEqual({
+      chatId: String(userId),
+      messageId: 1,
+    })
+  })
+
+  test.each([
+    ["Forbidden: bot can't initiate conversation with a user"],
+    ['Forbidden: bot was blocked by the user'],
+  ])('私聊不可达（%s）→ 回退群内通知', async (description) => {
+    const { executor, recording, store } = setup({
+      handlers: {
+        sendMessage: (target) => {
+          if (target === userId) {
+            throw new GrammyError('failed', { ok: false, error_code: 403, description }, 'sendMessage', {})
+          }
+          return { message_id: 9 }
+        },
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    const args = recording.lastArgsOf('sendMessage') ?? []
+    expect(args[0]).toBe(chatId)
+    expect(String(args[1])).toBe('🚫 已删除一条违规消息。')
+    expect(args[2]).toMatchObject({
+      reply_markup: { inline_keyboard: [[{ text: '提起申诉' }]] },
+    })
+    expect(await store.repos.decisions.findNoticeRef(decision.id)).toEqual({ chatId, messageId: 9 })
+  })
+
+  test('私聊其余失败按通知可丢处理，不回退群内', async () => {
+    const { executor, recording, store } = setup({
+      handlers: {
+        sendMessage: () => {
+          throw new GrammyError(
+            'failed',
+            { ok: false, error_code: 400, description: 'Bad Request: chat not found' },
+            'sendMessage',
+            {},
+          )
+        },
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    // 只有那次失败的私聊尝试：不回退群内，也不影响动作与 executed。
+    expect(recording.calls.filter((call) => call.method === 'sendMessage')).toHaveLength(1)
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+    expect(await store.repos.decisions.findNoticeRef(decision.id)).toBeNull()
+  })
+
+  test('私聊限流 → 回退群内；群内也限流 → 两边都跳过', async () => {
+    const limited = setup()
+    // 把当事人私聊桶的令牌耗光，群桶仍是满的。
+    for (let index = 0; index < 3; index += 1) limited.outbound.tryTake(String(userId))
+    const first = decisionFixture()
+    await limited.store.repos.decisions.insert(first)
+    await limited.executor.execute(first, { messageId: 42 })
+
+    expect(limited.recording.lastArgsOf('sendMessage')?.[0]).toBe(chatId)
+
+    const allLimited = setup({ capacity: 0 })
+    const second = decisionFixture()
+    await allLimited.store.repos.decisions.insert(second)
+    await allLimited.executor.execute(second, { messageId: 42 })
+
+    expect(allLimited.recording.countOf('sendMessage')).toBe(0)
+    expect(await allLimited.store.repos.decisions.findNoticeRef(second.id)).toBeNull()
+  })
+
+  test('通知引用记录失败只 warn，不影响执行完成', async () => {
+    const warnings: string[] = []
+    const logger: Logger = {
+      info: () => {},
+      warn: (message) => {
+        warnings.push(message)
+      },
+      error: () => {},
+    }
+    const { store } = setup({ logger })
+    const repos = {
+      ...store.repos,
+      decisions: {
+        ...store.repos.decisions,
+        markNoticeSent: async () => {
+          throw new Error('database is down')
+        },
+      },
+    }
+    const executorWithFailingRepo = createActionExecutor({
+      api: createRecordingApi().api,
+      repos,
+      idempotency: createIdempotencyRegistry(),
+      outbound: createTokenBucket(),
+      miniAppUrl: 'https://mini.example.com/app',
+      logger,
+      now: () => new Date('2026-09-23T10:00:00Z'),
+      sleep: async () => {},
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executorWithFailingRepo.execute(decision, { messageId: 42 })
+
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+    expect(warnings.some((message) => message.includes('通知引用记录失败'))).toBe(true)
   })
 
   test('重复执行同一决策只生效一次（幂等键 = eventId + action）', async () => {
@@ -151,7 +277,7 @@ describe('处置执行', () => {
     expect(args[1]).toBe(userId)
     expect(args[2]).toMatchObject({ can_send_messages: false })
     expect(args[3]).toEqual({ until_date: Math.floor(until.getTime() / 1_000) })
-    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toContain('已禁言违规用户 60 分钟')
+    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toContain('已对你禁言 60 分钟')
     // 禁言成功就没有降级：消息本身不删。
     expect(recording.countOf('deleteMessage')).toBe(0)
   })
@@ -358,7 +484,7 @@ describe('处置执行', () => {
 
     // 管理员不可被禁言，但广告消息仍能删掉：通知按实际生效的动作说「已删除」。
     expect(recording.lastArgsOf('deleteMessage')).toEqual([chatId, 42])
-    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toBe('🚫 已删除一条违规消息。')
+    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toBe('🚫 已删除你的违规消息。')
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
   })
 
@@ -381,7 +507,7 @@ describe('处置执行', () => {
     await executor.execute(decision, { messageId: 42 })
 
     expect(recording.lastArgsOf('deleteMessage')).toEqual([chatId, 42])
-    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toBe('🚫 已删除一条违规消息。')
+    expect(String((recording.lastArgsOf('sendMessage') ?? [])[1])).toBe('🚫 已删除你的违规消息。')
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
   })
 
@@ -533,12 +659,18 @@ describe('重试判定与文案', () => {
     expect(backoffDelayMs(0, () => 0)).toBe(500)
   })
 
-  test('处置文案带剩余禁言分钟数', () => {
+  test('处置文案带剩余禁言分钟数，两个受众两套口气', () => {
     const instant = new Date('2026-09-23T10:00:00Z')
-    expect(noticeText({ kind: 'mute', until: new Date('2026-09-23T10:30:00Z') }, instant)).toBe(
+    expect(noticeText({ kind: 'mute', until: new Date('2026-09-23T10:30:00Z') }, instant, 'group')).toBe(
       '🔇 已禁言违规用户 30 分钟。',
     )
-    expect(noticeText({ kind: 'ban' }, instant)).toBe('⛔ 已将违规用户移出本群。')
-    expect(noticeText({ kind: 'pass' }, instant)).toBe('')
+    expect(noticeText({ kind: 'mute', until: new Date('2026-09-23T10:30:00Z') }, instant, 'dm')).toBe(
+      '🔇 已对你禁言 30 分钟。',
+    )
+    expect(noticeText({ kind: 'warn' }, instant, 'dm')).toBe('⚠️ 请注意群规：你发的这条消息疑似违规，请勿重复发送。')
+    expect(noticeText({ kind: 'delete' }, instant, 'dm')).toBe('🚫 已删除你的违规消息。')
+    expect(noticeText({ kind: 'ban' }, instant, 'dm')).toBe('⛔ 已将你移出本群。')
+    expect(noticeText({ kind: 'ban' }, instant, 'group')).toBe('⛔ 已将违规用户移出本群。')
+    expect(noticeText({ kind: 'pass' }, instant, 'group')).toBe('')
   })
 })

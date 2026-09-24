@@ -141,6 +141,14 @@ export const moderationDecisions = pgTable(
     signals: jsonb('signals').notNull(),
     decidedAt: timestamp('decided_at', { withTimezone: true }).notNull(),
     executed: boolean('executed').notNull().default(false),
+    /**
+     * 处置通知的落点：私聊优先时是用户私聊（`notice_chat_id` 为用户 id 的字符串形态），
+     * 私聊不可达回退群内时是群 id。申诉生命周期（提交 → 等待复核、结案 → 终态）要按这两个列编辑原通知。
+     * 可空：通知是尽力投递的，没发出去或旧数据都没有引用，编辑侧跳过。
+     */
+    noticeChatId: text('notice_chat_id'),
+    /** 通知消息 id，与 `notice_chat_id` 成对出现。 */
+    noticeMessageId: integer('notice_message_id'),
   },
   (table) => [
     // 「mute 才带解禁时刻」的双向约束：既挡住 mute 缺时刻，也挡住非 mute 带时刻。

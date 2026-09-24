@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { asUserId } from '@skitarii/core'
-import { createLogger, createBotRuntime, notifyOwnerOfAppeal, resolveAppeal } from '@skitarii/bot'
+import { createLogger, createBotRuntime, notifyOwnerOfAppeal, resolveAppeal, updateDecisionNotice } from '@skitarii/bot'
 import { createDb, createPgRepos } from '@skitarii/db'
 import type { LlmConfig } from '@skitarii/llm'
 import { webhookCallback } from 'grammy'
@@ -64,6 +64,8 @@ const appealApi: AppealApiDeps = {
   botToken: env.BOT_TOKEN,
   ownerUserId,
   notifyAppeal: (notification) => notifyOwnerOfAppeal({ api: bot.api, repos, ownerUserId, logger }, notification),
+  // 通知编辑与结案口径同源：都在 bot 侧实现（找引用、换文案、去按钮），这里只注入 bot api。
+  editNotice: (decisionId, stage) => updateDecisionNotice({ api: bot.api, repos, logger }, decisionId, stage),
   logger,
 }
 

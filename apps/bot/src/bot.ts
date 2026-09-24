@@ -43,12 +43,15 @@ export type { Logger } from './logger.js'
 export {
   notifyOwnerOfAppeal,
   resolveAppeal,
+  updateDecisionNotice,
+  noticeStageText,
   createAppealNotificationService,
   createAppealRollbackService,
   APPEAL_CALLBACK_PATTERN,
 } from './appeal.js'
 export type {
   AppealDeps,
+  AppealNoticeStage,
   AppealNotification,
   AppealNotificationService,
   AppealNotifyResult,

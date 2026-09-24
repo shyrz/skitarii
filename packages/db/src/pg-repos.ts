@@ -262,6 +262,29 @@ function createDecisionRepo(db: Db): DecisionRepo {
         )
       return rows[0]?.total ?? 0
     },
+
+    async markNoticeSent(decisionId, chatId, messageId): Promise<void> {
+      // 无条件覆盖：同一条决策的通知引用只会有一个落点（私聊或群内二选一），重写是幂等的。
+      await db
+        .update(moderationDecisions)
+        .set({ noticeChatId: chatId, noticeMessageId: messageId })
+        .where(eq(moderationDecisions.id, decisionId))
+    },
+
+    async findNoticeRef(decisionId) {
+      const rows = await db
+        .select({
+          noticeChatId: moderationDecisions.noticeChatId,
+          noticeMessageId: moderationDecisions.noticeMessageId,
+        })
+        .from(moderationDecisions)
+        .where(eq(moderationDecisions.id, decisionId))
+        .limit(1)
+      const row = rows[0]
+      // 两列由同一次写入成对设置；只认两列都存在的记录（旧行两列都是 null）。
+      if (row === undefined || row.noticeChatId === null || row.noticeMessageId === null) return null
+      return { chatId: row.noticeChatId, messageId: row.noticeMessageId }
+    },
   }
 }
 

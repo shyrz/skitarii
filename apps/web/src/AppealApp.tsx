@@ -263,6 +263,7 @@ function AppealStatus({ appeal, justSubmitted }: { appeal: AppealDto; justSubmit
         <div>
           <h1>{justSubmitted ? '申诉已提交' : '你已提交过申诉'}</h1>
           <p>正在等群主复核，不用重复提交。</p>
+          {justSubmitted && <p>想直接收到处理结果？在私聊里给机器人发送 /start。</p>}
           <p className="time">提交于 {formatTime(appeal.createdAt)}</p>
         </div>
       </section>

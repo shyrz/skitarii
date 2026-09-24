@@ -48,6 +48,12 @@ interface Harness {
   notifications: AppealNotification[]
   /** 通知出口的返回：`true` 表示 Telegram 接受。测试里可翻转。 */
   notifyAcceptance: { accepted: boolean }
+  /** 通知编辑收到的调用（decisionId + 阶段）。 */
+  noticeEdits: Array<{ decisionId: string; stage: string }>
+  /** 通知编辑的失败开关。 */
+  editFailure: { enabled: boolean }
+  /** 通知编辑与 owner 通知的调用顺序（best-effort 两段的相对次序断言用）。 */
+  order: string[]
 }
 
 /**
@@ -59,18 +65,30 @@ function setup(): Harness {
   const store = createInMemoryRepos()
   const notifications: AppealNotification[] = []
   const notifyAcceptance = { accepted: true }
+  const noticeEdits: Harness['noticeEdits'] = []
+  const editFailure = { enabled: false }
+  const order: string[] = []
 
   return {
     store,
     notifications,
     notifyAcceptance,
+    noticeEdits,
+    editFailure,
+    order,
     deps: {
       repos: store.repos,
       botToken: BOT_TOKEN,
       ownerUserId: asUserId(OWNER_ID),
       notifyAppeal: async (notification) => {
+        order.push('notifyAppeal')
         notifications.push(notification)
         return notifyAcceptance.accepted
+      },
+      editNotice: async (decisionId, stage) => {
+        order.push('editNotice')
+        if (editFailure.enabled) throw new Error('编辑失败')
+        noticeEdits.push({ decisionId, stage })
       },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
       now: () => now,
@@ -264,6 +282,8 @@ describe('POST /api/appeals', () => {
 
     expect(second).toEqual({ status: 409, body: { error: 'appeal_exists' } })
     expect(harness.notifications).toHaveLength(1)
+    // 409 不重复走通知编辑。
+    expect(harness.noticeEdits).toHaveLength(1)
   })
 
   test('理由为空或超长返回 400，并列出问题字段', async () => {
@@ -354,5 +374,28 @@ describe('POST /api/appeals', () => {
     const appealId = (response.body as { appeal: { id: string } }).appeal.id
 
     expect(harness.store.notifiedAtOf(appealId)).toBeNull()
+  })
+
+  test('提交成功后把原处置通知切成「等待复核」，且先编辑再通知 owner', async () => {
+    const harness = setup()
+    await seedDecision(harness.store)
+
+    const response = await createAppeal(harness.deps, { initData: signInitData(USER_ID), decisionId, reason: '误判' })
+
+    expect(response.status).toBe(201)
+    expect(harness.noticeEdits).toEqual([{ decisionId, stage: 'received' }])
+    // 顺序有意义：编辑赶在 owner 通知之前，缩小「提交编辑」与「结案编辑」的竞态窗口。
+    expect(harness.order).toEqual(['editNotice', 'notifyAppeal'])
+  })
+
+  test('通知编辑失败不影响 201（best-effort 由 bot 侧吞掉）', async () => {
+    const harness = setup()
+    await seedDecision(harness.store)
+    harness.editFailure.enabled = true
+
+    const response = await createAppeal(harness.deps, { initData: signInitData(USER_ID), decisionId, reason: '误判' })
+
+    expect(response.status).toBe(201)
+    expect(harness.noticeEdits).toEqual([])
   })
 })

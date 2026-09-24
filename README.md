@@ -38,7 +38,7 @@ Telegram ──update──▶ apps/server /telegram/webhook ──▶ grammY we
    └───────┬──────────────────────────────────────────────────────────────────────────────────┘
            │ 非放行
            ▼
-   群内处置通知 + inline 申诉按钮（${MINI_APP_URL}?startapp=${decisionId}）
+   处置通知：私聊当事人优先（含申诉按钮），不可达回退群内；提交/结案时原通知被编辑为状态行
            │ 用户在 Mini App 提交
            ▼
    apps/server /api/appeals ──▶ Appeal(open) ──▶ bot 私聊 owner（维持 / 撤销 按钮）
@@ -106,7 +106,7 @@ curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
 3. 容器启动 `deploy/entrypoint.sh`：先 `pnpm db:migrate`，失败即以非 0 退出，不会带着旧 schema 起服务；成功后 `exec node --import tsx src/index.ts`
 4. 进程监听 `PORT`（平台注入，缺省 3000）；`PUBLIC_URL` 非空时启动阶段调用 `setWebhook(${PUBLIC_URL}/telegram/webhook, { secret_token })`，幂等（每次启动重注册），失败只记日志、不阻断启动，Telegram 侧保留旧地址
 
-迁移按单实例、低流量假设执行：每个实例启动都会跑一遍 `pnpm db:migrate`，多实例同时启动会并发执行迁移；0004 的 `CREATE INDEX` 会短暂持有表级 SHARE 锁（阻塞写入、允许读取），自用规模下几乎无感。实例数或写入量上来后，应把迁移拆成独立的发布步骤，或改用手工执行的 `CREATE INDEX CONCURRENTLY`。
+迁移按单实例、低流量假设执行：每个实例启动都会跑一遍 `pnpm db:migrate`，多实例同时启动会并发执行迁移；0004 的 `CREATE INDEX` 会短暂持有表级 SHARE 锁（阻塞写入、允许读取），0006 的两次 `ADD COLUMN`（可空、无默认值）会短暂持有 ACCESS EXCLUSIVE 锁，自用规模下几乎无感。实例数或写入量上来后，应把迁移拆成独立的发布步骤，或改用手工执行的 `CREATE INDEX CONCURRENTLY`。
 
 ```bash
 docker build -t skitarii .
@@ -233,7 +233,9 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 - `404 {"error":"decision_not_found"}`：处置不存在或不属于请求者
 - `409 {"error":"appeal_exists"}`：该处置已经提交过申诉（一条处置只受理一次，重复提交不覆盖理由）
 
-提交成功后 bot 会私聊 owner 一条通知，附「维持原处置 / 撤销并恢复」两个按钮。撤销会回滚权限（mute 解禁、ban 解封），并把申诉置为 `overturned`，写 `resolvedAt` 与 `resolvedBy`；维持置为 `upheld`。已结案的申诉不会被重复点击翻转。
+提交成功后 bot 会私聊 owner 一条通知，附「维持原处置 / 撤销并解除限制」两个按钮；同时把原处置通知编辑为「等待复核」并去掉按钮（私聊通知用「已收到你的申诉，等待复核」）。撤销会回滚权限（mute 解禁、ban 解封），并把申诉置为 `overturned`，写 `resolvedAt` 与 `resolvedBy`；维持置为 `upheld`。结案后原通知编辑为终态文案（撤销 / 维持，私聊用第二人称），并给当事人发一条结案私聊；即使权限回滚失败也照发（记录层已经撤销，权限由补偿扫描与 owner 兜底），通知文案不承诺恢复已删除的消息内容。已结案的申诉不会被重复点击翻转。
+
+处置通知的投递是两态的：先私聊被处置人（附申诉入口按钮）；对方从未与 bot 私聊或被拉黑（Telegram 403）时回退群内通知（匿名文案 + 申诉按钮）。实际落点记在决策上，供上面的生命周期编辑使用；编辑是 best-effort，引用缺失或编辑失败（消息过旧等）只记日志，不影响提交与结案。
 
 通知没被 Telegram 接受时（owner 从未与 bot 私聊过、网络抖动）不会让提交失败：这条申诉留在 `notified_at` 为空的状态，调度器的补发扫描会重试。代价是极端情况下可能收到重复的同一条提醒，而不会出现「申诉静默地没人处理」。
 
@@ -339,7 +341,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 { "initData": "<Telegram.WebApp.initData>", "resolution": "upheld" }
 ```
 
-- `200 {"state":"upheld"|"overturned","rollbackFailed":false}`：结案成功。`rollbackFailed=true` 表示撤销已生效但权限回滚失败（Telegram 拒绝），前端提示「已结案，但恢复权限失败，请手动解禁/解封」
+- `200 {"state":"upheld"|"overturned","rollbackFailed":false}`：结案成功。`rollbackFailed=true` 表示撤销已生效但权限回滚失败（Telegram 拒绝），前端提示「已结案，但解除限制失败：请手动解禁或解封」
 - `400 {"error":"invalid_request","details":[...]}`：请求体不合法（鉴权前先校验）
 - `401 {"error":"init_data_invalid"}` / `403 {"error":"forbidden"}`
 - `404 {"error":"appeal_not_found"}`：申诉或关联决策不存在，路径参数不是 uuid 也按此处理
@@ -369,7 +371,7 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **不变量尽量进 DDL。** 阈值必须有序、`mute` 才带解禁时刻、置信度与分数限定在 0..1、结案状态与结案时间/结案人必须一致、一条处置至多一条申诉，这些都写成 CHECK 与唯一索引，绕过应用的写入同样会被拒绝。
 
-**出站消息限流。** 每个群一个令牌桶（容量 3、20 条/分钟），警示语与处置通知是可丢消息，桶空时跳过发送；动作本身不受限流影响，它只受 Telegram 的 429 约束，按 `retry_after` 退避重试。
+**出站消息限流。** 每个目标一个令牌桶（容量 3、20 条/分钟）：群内通知以群 id 为键，私聊通知以用户 id 为键，各自独立；警示语与处置通知是可丢消息，桶空时跳过发送（私聊被限流时仍会尝试群内兜底）。动作本身不受限流影响，它只受 Telegram 的 429 约束，按 `retry_after` 退避重试。
 
 **依赖冻结。** 依赖在脚手架阶段一次性装齐，后续 lane 不新增外部依赖。需要新库时先改根 `package.json` 与各包 `package.json`，再重跑 `pnpm install`。
 
@@ -383,3 +385,4 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 - 累犯计数在并发处理下的阈值竞态：`countPriorViolations` 读的是已落库的决策数，同一用户两条消息被并发处理时，两边都可能数到「还差一条」而不加重档位（漏加重）。窗口内累计三次的判定因此是尽力而为，不保证严格；要严格需要给 `(chatId, userId)` 加锁或改成数据库侧的原子计数。
 - 时间源没有贯穿 `decide`：`mute` 的解禁时刻由 `packages/core` 的 `decide` 直接读 `Date.now()` 算出，不经过管线注入的 `now`。正常运行时两者是同一个挂钟，影响只在测试与本地跑批：要用自定义时间源断言 `mute.until` 时得先冻结 `Date`。
 - 同一消息的每次编辑产生独立事件与决策，频繁编辑会加速累犯计数（设计取舍：每次编辑是独立违规事件，不合并计数）。判别符是 `edit:${edit_date}:${内容哈希前 16 位}`：同一秒内不同内容的编辑各自成事件；编辑回退到早前内容时复用当时的事件 id，跳过重审（该状态已审过，代价是回退后不会按新语境重新判定）。
+- 补偿重投递窗口内处置通知可能重复（Telegram 重投递、崩溃恢复重跑执行器时各发一条），通知引用只记最后一条，申诉生命周期的编辑作用于它，更早的那条留在原地。

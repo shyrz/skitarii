@@ -49,6 +49,8 @@ export function createInMemoryRepos(): InMemoryRepos {
   const notifiedAtBy = new Map<string, Date>()
   /** 撤销结案后权限尚未回滚的申诉 id。PG 里是 `appeals.rollback_pending` 列，这里旁存。 */
   const rollbackPendingIds = new Set<string>()
+  /** 处置通知的落点（decisionId → 目标 + 消息 id）。PG 里是 `moderation_decisions.notice_*` 列，这里旁存。 */
+  const noticeRefs = new Map<string, { chatId: string; messageId: number }>()
   const subscriptions = new Map<string, Subscription>()
   const aggregates = new Map<string, DailyAggregate>()
   const cache = new Map<string, LlmCacheEntry>()
@@ -153,6 +155,14 @@ export function createInMemoryRepos(): InMemoryRepos {
             decision.decidedAt >= since &&
             decision.action.kind !== 'pass',
         ).length
+      },
+      async markNoticeSent(decisionId: string, chatId: string, messageId: number): Promise<void> {
+        // 与 PG 的 `UPDATE ... WHERE id = $1` 对齐：决策不存在时静默不写入。
+        if (!decisions.has(decisionId)) return
+        noticeRefs.set(decisionId, { chatId, messageId })
+      },
+      async findNoticeRef(decisionId: string): Promise<{ chatId: string; messageId: number } | null> {
+        return noticeRefs.get(decisionId) ?? null
       },
     },
 

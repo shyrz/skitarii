@@ -64,6 +64,8 @@ const decisionRowFixture: ModerationDecisionRow = {
   ],
   decidedAt: new Date('2026-09-23T10:00:01Z'),
   executed: true,
+  noticeChatId: '-1001234567890',
+  noticeMessageId: 77,
 }
 
 describe('JSONB 解析与行映射', () => {
