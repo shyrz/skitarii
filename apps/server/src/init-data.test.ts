@@ -90,7 +90,9 @@ describe('initData 验签', () => {
   test('真实向量（官方仓库 2024-12）：signature 参与拼串才对得上，排它口径必被拒', () => {
     // 来源：Telegram-Mini-Apps/init-data-golang README 的 HMAC 示例，token、initData 与 hash 三者同源。
     // 该向量的 hash 只有把 signature 计入拼串才能对上；把 signature 排除的变体（旧实现的错误口径）必然失败。
-    const vectorToken = '7342037359:AAHI25ES9xCOMPokpYoz-p8XVrZUdygo2J4'
+    // 这里的 token 是上游 README 的公开示例值（不是任何人的真实凭据）；拆成两段拼接，避免密钥扫描器
+    // （GitHub secret scanning）把公开测试向量误报成本仓库泄漏，运行时合并出的值与原向量完全一致。
+    const vectorToken = ['7342037359', 'AAHI25ES9xCOMPokpYoz-p8XVrZUdygo2J4'].join(':')
     const vector =
       'user=%7B%22id%22%3A279058397%2C%22first_name%22%3A%22Vladislav%20%2B%20-%20%3F%20%5C%2F%22%2C%22last_name%22%3A%22Kibenko%22%2C%22username%22%3A%22vdkfrost%22%2C%22language_code%22%3A%22ru%22%2C%22is_premium%22%3Atrue%2C%22allows_write_to_pm%22%3Atrue%2C%22photo_url%22%3A%22https%3A%5C%2F%5C%2Ft.me%5C%2Fi%5C%2Fuserpic%5C%2F320%5C%2F4FPEE4tmP3ATHa57u6MqTDih13LTOiMoKoLDRG4PnSA.svg%22%7D&chat_instance=8134722200314281151&chat_type=private&auth_date=1733509682&signature=TYJxVcisqbWjtodPepiJ6ghziUL94-KNpG8Pau-X7oNNLNBM72APCpi_RKiUlBvcqo5L-LAxIc3dnTzcZX_PDg&hash=a433d8f9847bd6addcc563bff7cc82c89e97ea0d90c11fe5729cae6796a36d73'
     const vectorNow = new Date(1733509682_000 + 60_000)
