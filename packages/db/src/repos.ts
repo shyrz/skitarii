@@ -126,6 +126,18 @@ export interface DecisionRepo {
   findNoticeRef(decisionId: string): Promise<{ chatId: string; messageId: number } | null>
 }
 
+/** 一条误伤样本：申诉撤销结案后回写给判定链路的记录。 */
+export interface OverturnedSample {
+  /** 被处置用户（原决策的当事人）。 */
+  userId: UserId
+  /** 原消息的内容哈希：内容白名单按「同人 + 同哈希」匹配。 */
+  contentHash: string
+  /** 原消息的正文摘录；撤销处置时若没有摘录（纯媒体等）为 `null`，few-shot 侧跳过。 */
+  sampleText: string | null
+  /** 结案时刻：白名单的 30 天窗口用它判定。 */
+  resolvedAt: Date
+}
+
 /** 申诉读写。 */
 export interface AppealRepo {
   /** 追加一条申诉。同一 `decisionId` 重复插入被忽略（数据库层唯一约束，见 `appeals_decision_unique`）。 */
@@ -159,6 +171,20 @@ export interface AppealRepo {
    * 按结案时间升序（先结案的先补），最多 `limit` 条。未清标记的记录会一直留在候选集里，必须有上界。
    */
   listPendingRollback(limit: number): Promise<Appeal[]>
+  /**
+   * 误伤样本回写的数据源：某群 `since` 之后撤销结案的申诉，带原消息的正文摘录，按结案时间倒序。
+   *
+   * 一条 join（appeals → moderation_decisions → message_events）而不是分步查询：它在消息判定路径上，
+   * 每多一次往返都是延迟。返回全部行（含 `sampleText` 为 `null` 的）：内容白名单只看 hash，
+   * few-shot 侧自行过滤非空。
+   *
+   * 行里带 `resolvedAt`：内容白名单的有效期（30 天）比 few-shot 窗口（90 天）短，
+   * 调用方要用它做二次判定，单查一次数据必须带上结案时刻。
+   *
+   * @param since 结案时间下界。
+   * @param limit 单次上限，调用方负责给一个有限值。
+   */
+  listOverturnedSamples(chatId: ChatId, since: Date, limit: number): Promise<OverturnedSample[]>
   /** 某群的待处理申诉，按创建时间升序。 */
   listOpen(chatId: ChatId): Promise<Appeal[]>
   /**

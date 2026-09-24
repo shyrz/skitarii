@@ -415,6 +415,45 @@ describe('读语句', () => {
     expect(all.recorded[0]?.query).not.toContain('"appeals"."state" =')
     expect(all.recorded[0]?.params).toEqual([20])
   })
+
+  test('误伤样本用一条三表 join，倒序取时间窗内的撤销结案', async () => {
+    // 带字段映射的读走 .values()：行按 select 字段顺序给数组。
+    const { repos, recorded } = createPgReposRecording([
+      [7_000_000_001, 'b'.repeat(64), '近期摘录', new Date('2026-09-23T10:10:00Z')],
+    ])
+    const since = new Date('2026-09-01T00:00:00Z')
+
+    const samples = await repos.appeals.listOverturnedSamples(chatConfigFixture.chatId, since, 20)
+
+    expect(samples).toEqual([
+      {
+        userId: asUserId(7_000_000_001),
+        contentHash: 'b'.repeat(64),
+        sampleText: '近期摘录',
+        resolvedAt: new Date('2026-09-23T10:10:00Z'),
+      },
+    ])
+    const [statement] = recorded
+    // join 方向：申诉 → 决策（decision_id = id），决策 → 事件（event_id = id），群过滤在决策侧。
+    expect(statement?.query).toContain('inner join "moderation_decisions" on "appeals"."decision_id" = "moderation_decisions"."id"')
+    expect(statement?.query).toContain('inner join "message_events" on "message_events"."id" = "moderation_decisions"."event_id"')
+    expect(statement?.query).toContain('"moderation_decisions"."chat_id" = $1')
+    expect(statement?.query).toContain('"state" = $2')
+    expect(statement?.query).toContain('"resolved_at" >= $3')
+    expect(statement?.query).toContain('order by "appeals"."resolved_at" desc, "appeals"."id" desc')
+    expect(statement?.query).toContain('limit')
+    expect(statement?.params).toEqual(['-1001234567890', 'overturned', '2026-09-01T00:00:00.000Z', 20])
+  })
+
+  test('误伤样本的 limit 为负数或小数时按 max(0, trunc) 归一', async () => {
+    const negative = createPgReposRecording([])
+    await negative.repos.appeals.listOverturnedSamples(chatConfigFixture.chatId, new Date('2026-09-01T00:00:00Z'), -1)
+    expect(negative.recorded[0]?.params.at(-1)).toBe(0)
+
+    const fractional = createPgReposRecording([])
+    await fractional.repos.appeals.listOverturnedSamples(chatConfigFixture.chatId, new Date('2026-09-01T00:00:00Z'), 2.9)
+    expect(fractional.recorded[0]?.params.at(-1)).toBe(2)
+  })
 })
 
 describe('迁移产物', () => {

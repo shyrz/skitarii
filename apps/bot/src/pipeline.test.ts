@@ -571,6 +571,262 @@ describe('默认规则：名字信号与高精度正则', () => {
   })
 })
 
+describe('误伤样本回写', () => {
+  /**
+   * 预置一条误伤样本：事件（可带摘录）+ 非放行决策 + 已撤销申诉。
+   *
+   * @param store 内存仓储。
+   * @param options 事件内容哈希或原文（二选一）、当事人、结案时刻与摘录。
+   */
+  async function seedOverturnedSample(
+    store: InMemoryRepos,
+    options: {
+      id: string
+      text?: string
+      contentHash?: string
+      userId?: number
+      resolvedAt: Date
+      sampleText?: string | null
+    },
+  ): Promise<void> {
+    const eventId = `ev-${options.id}`
+    const targetUser = asUserId(options.userId ?? userId)
+    await store.repos.events.insert({
+      id: eventId,
+      chatId,
+      userId: targetUser,
+      messageId: 1,
+      contentHash: options.contentHash ?? contentHashOf(options.text ?? ''),
+      features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0 },
+      createdAt: options.resolvedAt,
+    })
+    await store.repos.decisions.insert({
+      id: `dec-${options.id}`,
+      eventId,
+      chatId,
+      userId: targetUser,
+      action: { kind: 'delete' },
+      score: 0.9,
+      signals: [],
+      decidedAt: options.resolvedAt,
+      executed: true,
+    })
+    await store.repos.appeals.insert({
+      id: options.id,
+      decisionId: `dec-${options.id}`,
+      userId: targetUser,
+      state: 'overturned',
+      note: null,
+      createdAt: options.resolvedAt,
+      resolvedAt: options.resolvedAt,
+    })
+    if (options.sampleText !== undefined && options.sampleText !== null) {
+      await store.repos.events.attachSample(eventId, options.sampleText)
+    }
+  }
+
+  test('内容白名单：同人同内容 30 天内被撤销过 → 直接放行，不调复核也不执行动作', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    await seedOverturnedSample(store, {
+      id: 'sample-1',
+      text: '加v推荐一个渠道',
+      resolvedAt: new Date('2026-09-22T10:00:00Z'),
+    })
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 200 }),
+    )
+
+    const eventId = deriveEventId(chatId, 200)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(eventId))
+    // 规则分原样记录、保留命中信号作留痕；不升档、不调复核、不碰 Telegram。
+    expect(decision).toMatchObject({
+      action: { kind: 'pass' },
+      score: 0.4,
+      signals: [{ kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 }],
+      executed: true,
+    })
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.calls).toEqual([])
+    // 白名单命中仍落事件与决策，事后可回看。
+    expect(await store.repos.events.findWithSample(eventId)).not.toBeNull()
+  })
+
+  test('白名单：异用户同内容不命中', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    await seedOverturnedSample(store, {
+      id: 'sample-other',
+      text: '加v推荐一个渠道',
+      userId: 7_000_000_999,
+      resolvedAt: new Date('2026-09-22T10:00:00Z'),
+    })
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 201 }),
+    )
+
+    // 回到常规路径：灰色地带送复核，复核确认违规 → delete。
+    expect(judgeStub.calls).toHaveLength(1)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 201)))
+    expect(decision?.action).toEqual({ kind: 'delete' })
+  })
+
+  test('白名单：超过 30 天的撤销不再自动放行', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    await seedOverturnedSample(store, {
+      id: 'sample-expired',
+      text: '加v推荐一个渠道',
+      resolvedAt: new Date('2026-08-23T10:00:00Z'),
+    })
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 202 }),
+    )
+
+    expect(judgeStub.calls).toHaveLength(1)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 202)))
+    expect(decision?.action).toEqual({ kind: 'delete' })
+  })
+
+  test('few-shot：灰色地带送审带上最近的误伤样例（跳过空摘录，最多 5 条）', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+
+    // 最近的一条没有摘录（纯媒体），随后 6 条有摘录：只带最近 5 条非空，按最近优先。
+    await seedOverturnedSample(store, {
+      id: 'fs-null',
+      contentHash: contentHashOf('空摘录样本'),
+      resolvedAt: new Date('2026-09-23T09:00:00Z'),
+      sampleText: null,
+    })
+    for (let index = 1; index <= 6; index += 1) {
+      await seedOverturnedSample(store, {
+        id: `fs-${index}`,
+        contentHash: contentHashOf(`样例${index}`),
+        resolvedAt: new Date(`2026-09-23T09:0${index}:00Z`),
+        sampleText: `样例${index}`,
+      })
+    }
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 203 }),
+    )
+
+    expect(judgeStub.calls).toHaveLength(1)
+    expect(judgeStub.calls[0]?.examples).toEqual(['样例6', '样例5', '样例4', '样例3', '样例2'])
+  })
+
+  test('样本查询失败降级为无样本，判定照常（warn）', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (message: string) => {
+        warnings.push(message)
+      },
+      error: () => {},
+    }
+    const repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        listOverturnedSamples: async () => {
+          throw new Error('database is down')
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 204 }),
+    )
+
+    expect(judgeStub.calls).toHaveLength(1)
+    expect(warnings.some((message) => message.includes('误伤样本读取失败'))).toBe(true)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 204)))
+    expect(decision?.action).toEqual({ kind: 'delete' })
+  })
+
+  test('低于放行阈值的消息不查询样本、不调复核', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    let sampleQueries = 0
+    const repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        listOverturnedSamples: async () => {
+          sampleQueries += 1
+          return []
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '这个键盘手感不错', messageId: 205 }),
+    )
+
+    expect(sampleQueries).toBe(0)
+    expect(judgeStub.calls).toEqual([])
+  })
+
+  test('样本读取恰好一次：窗口为 now − 90 天、上限 20', async () => {
+    const { store, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const queries: Array<{ chatId: unknown; since: Date; limit: number }> = []
+    const repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        listOverturnedSamples: async (targetChatId: unknown, since: Date, limit: number) => {
+          queries.push({ chatId: targetChatId, since, limit })
+          return []
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 206 }),
+    )
+
+    expect(queries).toHaveLength(1)
+    expect(queries[0]?.chatId).toBe(chatId)
+    // fixedNow（2026-09-23T10:00:00Z）往前 90 天。
+    expect(queries[0]?.since).toEqual(new Date('2026-06-25T10:00:00Z'))
+    expect(queries[0]?.limit).toBe(20)
+  })
+
+  test('白名单：恰好在 30 天边界上仍命中（左闭区间）', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    // fixedNow 往前 30 天 = 2026-08-24T10:00:00Z。
+    await seedOverturnedSample(store, {
+      id: 'sample-boundary',
+      text: '加v推荐一个渠道',
+      resolvedAt: new Date('2026-08-24T10:00:00Z'),
+    })
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 207 }),
+    )
+
+    expect(judgeStub.calls).toEqual([])
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 207)))
+    expect(decision?.action).toEqual({ kind: 'pass' })
+  })
+})
+
 /**
  * 在冻结的挂钟下执行：`decide` 生成 `mute` 时会读 `Date.now()` 算解禁时刻，
  * 冻结后断言才能写成确定的字面量。只冻结 `Date`，不碰定时器（幂等闸门用的是 `Date.now`）。

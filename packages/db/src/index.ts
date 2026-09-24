@@ -17,6 +17,7 @@ export type {
   DecisionRepo,
   LlmCacheRepo,
   MessageEventRepo,
+  OverturnedSample,
   Repos,
   SubscriptionRepo,
 } from './repos.js'

@@ -202,6 +202,36 @@ export function createInMemoryRepos(): InMemoryRepos {
           .sort((a, b) => (a.resolvedAt?.getTime() ?? 0) - (b.resolvedAt?.getTime() ?? 0))
           .slice(0, limit)
       },
+      async listOverturnedSamples(chatId, since, limit) {
+        return [...appeals.values()]
+          .filter(
+            (appeal) =>
+              appeal.state === 'overturned' && appeal.resolvedAt !== null && appeal.resolvedAt >= since,
+          )
+          // 同刻按 id 倒序兜底：与 PG 的 `ORDER BY resolved_at DESC, id DESC` 同序。
+          .sort(
+            (a, b) =>
+              (b.resolvedAt?.getTime() ?? 0) - (a.resolvedAt?.getTime() ?? 0) ||
+              (a.id === b.id ? 0 : a.id > b.id ? -1 : 1),
+          )
+          .flatMap((appeal) => {
+            const decision = decisions.get(appeal.decisionId)
+            if (decision === undefined || decision.chatId !== chatId) return []
+            const stored = events.get(decision.eventId)
+            if (stored === undefined) return []
+            return [
+              {
+                userId: decision.userId,
+                contentHash: stored.event.contentHash,
+                sampleText: stored.sampleText,
+                // filter 已保证非空；`??` 只是让类型收窄，与 PG 的兜底一致。
+                resolvedAt: appeal.resolvedAt ?? new Date(0),
+              },
+            ]
+          })
+          // limit 归一：负数与小数按 `max(0, trunc)` 处理（`slice(0, -1)` 会意外丢掉末尾一条）。
+          .slice(0, Math.max(0, Math.trunc(limit)))
+      },
       async listOpen(chatId: ChatId): Promise<Appeal[]> {
         return [...appeals.values()]
           .filter((appeal) => appeal.state === 'open' && decisions.get(appeal.decisionId)?.chatId === chatId)

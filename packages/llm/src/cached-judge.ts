@@ -10,10 +10,10 @@ import type { JudgeInput, JudgeResult, ModerationJudge } from './types.js'
  * 所以缓存落在包装函数上，由调用方把正文的内容哈希和送审材料一起传进来。
  *
  * 缓存键是判定指纹（见 `judgeFingerprint`），覆盖提示词消费的全部输入：正文之外，
- * 同一条正文换一个发送者身份、语言、消息特征或规则命中组合都会得到不同的键。
+ * 同一条正文换一个发送者身份、语言、消息特征、规则命中组合或误伤样例都会得到不同的键。
  * 只按正文哈希缓存在身份之间复用结论：可疑身份能直接继承普通身份拿到的 legit，反之则误伤。
- * `v1` 前缀留给未来提示词口径变更时整体失效；库里存的仍是不可逆摘要，身份原文不落库
- * （`llm_cache.content_hash` 列存的即是指纹，不是裸内容哈希）。
+ * 指纹前缀在提示词口径变更时升版整体失效（当前 `v2`，相对 `v1` 纳入误伤样例）；库里存的仍是
+ * 不可逆摘要，身份原文不落库（`llm_cache.content_hash` 列存的即是指纹，不是裸内容哈希）。
  *
  * 命中缓存的语义：同一份送审材料被判定过一次就复用结论，省掉一次 LLM 调用。
  * 这不会抹平群之间的规则差异：规则命中与 `decide` 每次照常执行，缓存只替代「复核」这一步；
@@ -44,14 +44,18 @@ export interface JudgeCache {
 }
 
 /**
- * 判定指纹：sha256(`v1|<正文内容哈希>|<发送者身份>|<语言>|<特征>|<信号>`) 的十六进制摘要。
+ * 判定指纹：sha256(`v2|<正文内容哈希>|<发送者身份>|<语言>|<特征>|<信号>|<误伤样例 JSON>`) 的十六进制摘要。
  *
  * 覆盖范围与提示词消费的输入一一对应（`prompt.ts` 的 `buildJudgeMessages`）：
  * 正文（contentHash 是它的 sha256）、发送者身份、语言（决定 system 提示）、
- * 消息特征（`hasLink` / `mediaType` / `length` / `customEmojiCount`）与已命中信号
- * （rule-hit 记为 `r:<ruleId>:<score>`，llm 结论记为 `l:<verdict>:<confidence>`，按序逗号连接）。
+ * 消息特征（`hasLink` / `mediaType` / `length` / `customEmojiCount`）、已命中信号
+ * （rule-hit 记为 `r:<ruleId>:<score>`，llm 结论记为 `l:<verdict>:<confidence>`，按序逗号连接）
+ * 与误伤样例（`JSON.stringify(examples ?? [])`，顺序敏感：样例按最近优先传入，换序即换键）。
  * 任何一项不同都不该复用结论，因此任何一项都必须进指纹。信号里的 ruleId 还隐含了
  * 「哪条规则命中」，两群规则集不同导致的信号差异会自然分键。
+ *
+ * `v2` 相对 `v1` 只多了样例一项：升级时旧缓存整体失效（等 30 天保留期清掉），
+ * 避免用「没有样例」的结论回答「带样例」的请求。前缀留给未来提示词口径变更时再次整体失效。
  *
  * @param contentHash 消息原文的 sha256，来自 `MessageEvent.contentHash`。
  * @param input 送审材料。
@@ -68,7 +72,7 @@ function judgeFingerprint(contentHash: string, input: JudgeInput): string {
     .join(',')
 
   const payload = [
-    'v1',
+    'v2',
     contentHash,
     input.senderIdentity ?? '',
     input.language,
@@ -77,6 +81,7 @@ function judgeFingerprint(contentHash: string, input: JudgeInput): string {
     String(length),
     String(customEmojiCount),
     signals,
+    JSON.stringify(input.examples ?? []),
   ].join('|')
 
   return createHash('sha256').update(payload, 'utf8').digest('hex')

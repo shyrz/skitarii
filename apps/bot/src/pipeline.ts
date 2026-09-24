@@ -10,7 +10,7 @@ import {
   type Signal,
   type UserId,
 } from '@skitarii/core'
-import type { Repos } from '@skitarii/db'
+import type { OverturnedSample, Repos } from '@skitarii/db'
 import type { CachedJudge } from '@skitarii/llm'
 import { defaultChatConfig } from './defaults.js'
 import type { ActionExecutor } from './executor.js'
@@ -31,6 +31,9 @@ import type { Logger } from './logger.js'
  *    跳过重审（同一状态已经审过，视为幂等）。
  * 2. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
  *    规则匹配同时看正文与发送者身份（后者只服务 sender-name 规则，不落库）。
+ *    「本会被处置」（规则分 ≥ `passThreshold`）时另读一次该群误伤样本：命中内容白名单
+ *    （同人 + 同内容 + 30 天内被撤销过）直接放行；灰色地带送审时把最近的非空摘录作为复核样例。
+ *    低于阈值的正常消息不查样本（零额外开销），查询失败按「无样本」降级。
  * 3. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
  *    复核失败只记日志，不追加信号，让 `decide` 走「待复核」的 warn 分支且不计累犯。这是既定口径：
  *    复核不可用时绝不能按 `actionHint` 直接动手，那等价于悄悄把 `llmThreshold` 降到 `passThreshold`。
@@ -51,6 +54,29 @@ export const RECIDIVISM_WINDOW_DAYS = 7
 
 /** 一天的毫秒数，用于把窗口天数换算成时间戳。 */
 const DAY_MS = 24 * 60 * 60 * 1_000
+
+/**
+ * 误伤样本的回看窗口（天）。
+ *
+ * 取 90 天：样本是「这个群实际误伤过什么形态」的经验，误判往往隔一段时间才以相似措辞复发，
+ * 窗口太短会让样例刚积累就过期。查询带上限（{@link OVERTURNED_SAMPLE_LIMIT}），
+ * 窗口放宽不会让单次读取变重。
+ */
+const OVERTURNED_SAMPLE_WINDOW_DAYS = 90
+
+/**
+ * 内容白名单的有效期（天）。
+ *
+ * 比样本回看窗口短得多：直接放行是强动作，只在「最近刚被撤销过」的强相关时间窗内生效；
+ * 更早的误伤仍然进 few-shot，但不自动放行。
+ */
+const CONTENT_WHITELIST_WINDOW_DAYS = 30
+
+/** 单次读取的误伤样本条数上限。白名单只看最近窗口，few-shot 也只用少数几条。 */
+const OVERTURNED_SAMPLE_LIMIT = 20
+
+/** 送进复核提示词的误伤样例条数上限（按最近优先取非空摘录）。 */
+const MAX_FEW_SHOT_EXAMPLES = 5
 
 /**
  * 频道评论场景的深链锚点。
@@ -159,19 +185,33 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
   const ruleSignals = matchRules(normalized, message.features, config.rules, identity)
   const ruleScore = scoreOf(ruleSignals)
 
-  const signals = await collectSignals(deps, {
-    message,
-    config,
-    normalized,
-    identity,
-    ruleSignals,
-    ruleScore,
-    contentHash,
-  })
+  // 只对「本会被处置」的消息找误伤样本：低于放行阈值的正常消息不付出这次查询。
+  const samples = ruleScore < config.passThreshold ? [] : await loadOverturnedSamples(deps, message, now)
 
-  // 放行带不必查前科：`decide` 在这一带直接放行，累犯次数影响不到结果，省一次查询。
+  // 内容白名单命中就直接放行：跳过复核与 `decide` 的累犯升档，但事件与决策照常落库（事后可回看）。
+  const whitelisted = isWhitelisted(samples, message, contentHash, now)
+  if (whitelisted) {
+    deps.logger.info(
+      `内容白名单命中，直接放行 chatId=${message.chatId} userId=${message.userId} messageId=${message.messageId}`,
+    )
+  }
+
+  const signals = whitelisted
+    ? ruleSignals
+    : await collectSignals(deps, {
+        message,
+        config,
+        normalized,
+        identity,
+        ruleSignals,
+        ruleScore,
+        contentHash,
+        samples,
+      })
+
+  // 放行带与前科无关；白名单命中的结局是放行，也不必查。
   const priorViolations =
-    ruleScore < config.passThreshold
+    whitelisted || ruleScore < config.passThreshold
       ? 0
       : await deps.repos.decisions.countPriorViolations(
           message.chatId,
@@ -179,7 +219,7 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
           new Date(now().getTime() - RECIDIVISM_WINDOW_DAYS * DAY_MS),
         )
 
-  const action = decide(signals, config, { priorViolations })
+  const action = whitelisted ? { kind: 'pass' as const } : decide(signals, config, { priorViolations })
   const decidedAt = now()
 
   await deps.repos.decisions.insert({
@@ -226,6 +266,59 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
 }
 
 /**
+ * 读取该群最近的误伤样本。
+ *
+ * 失败按「无可用样本」降级：样本只是优化（少误判、少调模型），读不到不能阻断判定。
+ *
+ * @param deps 管线依赖。
+ * @param message 入站消息（取群）。
+ * @param now 时间源。
+ * @returns 按结案时间倒序的样本；失败时为空数组。
+ */
+async function loadOverturnedSamples(
+  deps: PipelineDeps,
+  message: IncomingMessage,
+  now: () => Date,
+): Promise<OverturnedSample[]> {
+  try {
+    return await deps.repos.appeals.listOverturnedSamples(
+      message.chatId,
+      new Date(now().getTime() - OVERTURNED_SAMPLE_WINDOW_DAYS * DAY_MS),
+      OVERTURNED_SAMPLE_LIMIT,
+    )
+  } catch (error) {
+    deps.logger.warn(`误伤样本读取失败，按无样本处理 chatId=${message.chatId}`, error)
+    return []
+  }
+}
+
+/**
+ * 内容白名单判定：样本里存在同人、同内容哈希、且结案在白名单窗口内的记录。
+ *
+ * 不做「正文相似」之类的模糊匹配：哈希全等是唯一不会引入新误伤的判据。
+ *
+ * @param samples 本轮读取的样本（倒序，白名单不依赖顺序）。
+ * @param message 入站消息（取用户）。
+ * @param contentHash 本条消息的内容哈希。
+ * @param now 时间源。
+ * @returns 是否命中白名单。
+ */
+function isWhitelisted(
+  samples: readonly OverturnedSample[],
+  message: IncomingMessage,
+  contentHash: string,
+  now: () => Date,
+): boolean {
+  const earliest = now().getTime() - CONTENT_WHITELIST_WINDOW_DAYS * DAY_MS
+  return samples.some(
+    (sample) =>
+      sample.userId === message.userId &&
+      sample.contentHash === contentHash &&
+      sample.resolvedAt.getTime() >= earliest,
+  )
+}
+
+/**
  * 读取群配置；未登记时写入默认配置并返回。
  *
  * @param deps 管线依赖。
@@ -259,9 +352,11 @@ async function collectSignals(
     ruleSignals: Signal[]
     ruleScore: number
     contentHash: string
+    /** 本轮读到的误伤样本（倒序）；只用于给复核提供样例。 */
+    samples: readonly OverturnedSample[]
   },
 ): Promise<Signal[]> {
-  const { config, normalized, identity, ruleSignals, ruleScore, contentHash, message } = context
+  const { config, normalized, identity, ruleSignals, ruleScore, contentHash, message, samples } = context
 
   const inGreyZone = ruleScore >= config.passThreshold && ruleScore < config.llmThreshold
   if (!inGreyZone) return ruleSignals
@@ -270,6 +365,15 @@ async function collectSignals(
     return ruleSignals
   }
   if (normalized.trim().length === 0) return ruleSignals
+
+  // 样例按最近优先取非空摘录：样本本身已按结案时间倒序，`slice` 即取最近 5 条有正文的。
+  // 纯空白摘录与空串一样跳过（避免占满 5 条额度）。
+  const examples = samples
+    .flatMap((sample) => {
+      const text = sample.sampleText
+      return text !== null && text.trim().length > 0 ? [text] : []
+    })
+    .slice(0, MAX_FEW_SHOT_EXAMPLES)
 
   try {
     const result = await deps.judge(contentHash, {
@@ -280,6 +384,8 @@ async function collectSignals(
       rules: config.rules,
       // 空身份不带：让「没有身份可用」与「身份是空串」在送审材料里表现一致。
       ...(identity.length > 0 ? { senderIdentity: identity } : {}),
+      // 没有样例时不带该字段：指纹对 `[]` 与「缺省」是同一个键，但送审材料保持最小。
+      ...(examples.length > 0 ? { examples } : {}),
     })
     return [...ruleSignals, { kind: 'llm', verdict: result.verdict, confidence: result.confidence }]
   } catch (error) {

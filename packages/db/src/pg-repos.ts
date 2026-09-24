@@ -1,5 +1,5 @@
 import { and, asc, count, desc, eq, exists, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm'
-import type { ChatConfig, ChatId } from '@skitarii/core'
+import { asUserId, type ChatConfig, type ChatId } from '@skitarii/core'
 import type { Db } from './client.js'
 import {
   toAppeal,
@@ -348,6 +348,40 @@ function createAppealRepo(db: Db): AppealRepo {
         .orderBy(asc(appeals.resolvedAt))
         .limit(limit)
       return rows.map(toAppeal)
+    },
+
+    async listOverturnedSamples(chatId, since, limit) {
+      // 一条 join 走完 appeals → decisions → events；事件经 decision.eventId 关联（两表无外键，
+      // 但 eventId 由管线写入，值必然存在）。摘录列为 null 的行也要返回：白名单只看 hash。
+      const rows = await db
+        .select({
+          userId: moderationDecisions.userId,
+          contentHash: messageEvents.contentHash,
+          sampleText: messageEvents.sampleText,
+          resolvedAt: appeals.resolvedAt,
+        })
+        .from(appeals)
+        .innerJoin(moderationDecisions, eq(appeals.decisionId, moderationDecisions.id))
+        .innerJoin(messageEvents, eq(messageEvents.id, moderationDecisions.eventId))
+        .where(
+          and(
+            eq(moderationDecisions.chatId, chatId),
+            eq(appeals.state, 'overturned'),
+            gte(appeals.resolvedAt, since),
+          ),
+        )
+        // 同刻按 id 倒序兜底：样例顺序会进复核指纹，顺序必须确定（两实现同序）。
+        .orderBy(desc(appeals.resolvedAt), desc(appeals.id))
+        // limit 归一：负数与小数按 `max(0, trunc)` 处理，与内存实现同语义（PG 的 limit 负数会直接报错）。
+        .limit(Math.max(0, Math.trunc(limit)))
+
+      return rows.map((row) => ({
+        userId: asUserId(row.userId),
+        contentHash: row.contentHash,
+        sampleText: row.sampleText,
+        // `state='overturned'` 由 CHECK 保证 resolved_at 非空；类型上仍是可空的，兜到 epoch。
+        resolvedAt: row.resolvedAt ?? new Date(0),
+      }))
     },
 
     async listOpen(chatId) {
