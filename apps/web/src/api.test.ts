@@ -24,12 +24,12 @@ describe('申诉接口客户端', () => {
   })
 
   test('initData 随查询串携带，特殊字符被转义', async () => {
-    const spy = vi.fn(async (_input: string | URL | Request) => new Response('{}', { status: 200 }))
+    const spy = vi.fn(async () => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', spy)
 
     await fetchAppeal('dec-1', 'a+b c')
 
-    expect(String(spy.mock.calls[0]?.[0])).toBe('/api/appeals/dec-1?initData=a%2Bb%20c')
+    expect(String((spy.mock.calls[0] as unknown[])[0])).toBe('/api/appeals/dec-1?initData=a%2Bb%20c')
   })
 
   test('404、409、401 分别归类为三种可分支的错误', async () => {
