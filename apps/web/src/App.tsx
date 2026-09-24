@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { ConflictError, NotFoundError, fetchAppeal, submitAppeal } from './api.js'
+import { AuthError, ConflictError, NotFoundError, fetchAppeal, submitAppeal } from './api.js'
 import type { AppealDto, AppealView, DecisionAction } from './api.js'
-import { getDecisionId, getWebApp } from './telegram.js'
+import { getDecisionId, getInitData, getWebApp } from './telegram.js'
 
 /** 申诉理由长度上限，与后端校验一致。 */
 const REASON_MAX = 500
@@ -21,8 +21,10 @@ const ACTION_META: Record<
 type Screen =
   | { kind: 'loading' }
   | { kind: 'no-param' }
+  | { kind: 'no-credential' }
+  | { kind: 'auth' }
   | { kind: 'not-found' }
-  | { kind: 'failed' }
+  | { kind: 'failed'; detail: string }
   | { kind: 'ready'; view: AppealView }
 
 const timeFormatter = new Intl.DateTimeFormat('zh-CN', {
@@ -50,13 +52,20 @@ export function App() {
       setScreen({ kind: 'no-param' })
       return
     }
-    initDataRef.current = getWebApp()?.initData ?? ''
+    initDataRef.current = getInitData()
+    if (initDataRef.current === '') {
+      // Telegram 没把签名凭据带进来（脚本缺席且回退也拿不到），请求必然 401，直接给出可操作的提示。
+      setScreen({ kind: 'no-credential' })
+      return
+    }
     setScreen({ kind: 'loading' })
     try {
       const view = await fetchAppeal(decisionId, initDataRef.current)
       setScreen({ kind: 'ready', view })
     } catch (error) {
-      setScreen(error instanceof NotFoundError ? { kind: 'not-found' } : { kind: 'failed' })
+      if (error instanceof NotFoundError) setScreen({ kind: 'not-found' })
+      else if (error instanceof AuthError) setScreen({ kind: 'auth' })
+      else setScreen({ kind: 'failed', detail: error instanceof Error ? error.message : String(error) })
     }
   }, [])
 
@@ -133,6 +142,30 @@ export function App() {
     )
   }
 
+  if (screen.kind === 'no-credential') {
+    return (
+      <main className="screen">
+        <div className="center-state">
+          <InfoIcon />
+          <h1>页面缺少登录凭据</h1>
+          <p>请从群消息里的申诉按钮打开本页，不要把链接复制到外部浏览器。</p>
+        </div>
+      </main>
+    )
+  }
+
+  if (screen.kind === 'auth') {
+    return (
+      <main className="screen">
+        <div className="center-state">
+          <InfoIcon />
+          <h1>身份验证失败</h1>
+          <p>凭据已过期或无效。回到群消息重新点「提起申诉」按钮即可刷新。</p>
+        </div>
+      </main>
+    )
+  }
+
   if (screen.kind === 'failed') {
     return (
       <main className="screen">
@@ -140,6 +173,7 @@ export function App() {
           <InfoIcon />
           <h1>内容没加载出来</h1>
           <p>网络似乎不太稳定，你的申诉还没有提交，重试不会重复。</p>
+          <p className="detail">{screen.detail}</p>
           <button type="button" className="btn" onClick={() => void load()}>
             重试
           </button>

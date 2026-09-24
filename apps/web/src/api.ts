@@ -2,9 +2,10 @@
  * 申诉接口客户端。initData 是 Telegram 签发的身份凭据：
  * GET 没有请求体，放在 query；POST 放在 body。后端两种携带方式都认。
  *
- * 错误分三类，UI 按类决定显示哪一屏：
+ * 错误分四类，UI 按类决定显示哪一屏：
  * - NotFoundError：404，记录不存在或不属于当前账号，不可重试；
  * - ConflictError：409，已提交过申诉，调用方应重新拉取展示既有申诉；
+ * - AuthError：401，凭据缺失/验签不过，提示重新从群消息进入；
  * - 其余（网络失败、5xx、异常响应）：可重试。
  */
 
@@ -47,10 +48,19 @@ export class ConflictError extends Error {
   }
 }
 
+/** 401：initData 缺失、验签不过或已过期。与网络故障分开归类，UI 才能给出「重新进入」而不是「检查网络」的提示。 */
+export class AuthError extends Error {
+  constructor() {
+    super('身份验证失败')
+    this.name = 'AuthError'
+  }
+}
+
 /** 把非 2xx 响应映射成上面的错误类型；永远抛错。 */
 function throwForStatus(res: Response): never {
   if (res.status === 404) throw new NotFoundError()
   if (res.status === 409) throw new ConflictError()
+  if (res.status === 401) throw new AuthError()
   throw new Error(`请求失败（HTTP ${res.status}）`)
 }
 

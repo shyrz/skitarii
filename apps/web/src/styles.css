@@ -131,6 +131,13 @@ body {
   font-size: 15px;
 }
 
+/* 失败详情行：给出可定位的错误原文，字号收小一档 */
+.center-state .detail {
+  font-size: 13px;
+  max-width: 320px;
+  word-break: break-word;
+}
+
 .center-state .btn {
   width: auto;
   min-width: 160px;
