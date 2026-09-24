@@ -361,7 +361,10 @@ async function dispatch(request: IncomingMessage, response: ServerResponse): Pro
 
 const server = createServer((request, response) => {
   dispatch(request, response).catch((error: unknown) => {
-    logger.error(`请求处理失败 ${request.method ?? ''} ${request.url ?? ''}`, error)
+    // 只记 pathname：`request.url` 的查询串可能携带 initData（申诉与面板端点的凭据），
+    // 异常日志不该把凭据写进日志。
+    const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
+    logger.error(`请求处理失败 ${request.method ?? ''} ${pathname}`, error)
     if (!response.headersSent) {
       respondJson(response, 500, { error: 'internal error' })
     } else {
