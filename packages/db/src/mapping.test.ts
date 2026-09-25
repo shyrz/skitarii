@@ -46,6 +46,8 @@ const eventRowFixture: MessageEventRow = {
   mediaType: 'photo',
   length: 18,
   customEmojiCount: 3,
+  emojiCount: 5,
+  viaBot: true,
   sampleText: '低价出售会员，需要的私聊',
   createdAt: new Date('2026-09-23T10:00:00Z'),
 }
@@ -91,6 +93,18 @@ describe('JSONB 解析与行映射', () => {
     ])
   })
 
+  test('emoji-count 与 via-bot 是合法的匹配方式（via-bot 的 pattern 不使用）', () => {
+    expect(
+      parseChatRules([
+        { ...ruleFixture, kind: 'emoji-count', pattern: '6' },
+        { ...ruleFixture, kind: 'via-bot', pattern: '' },
+      ]),
+    ).toEqual([
+      { ...ruleFixture, kind: 'emoji-count', pattern: '6' },
+      { ...ruleFixture, kind: 'via-bot', pattern: '' },
+    ])
+  })
+
   test('分数越界的规则被拒（阈值口径不允许脏数据进入判定）', () => {
     expect(() => parseChatRules([{ ...ruleFixture, score: 1.5 }])).toThrow(ZodError)
   })
@@ -110,7 +124,7 @@ describe('JSONB 解析与行映射', () => {
 
   test('事件行映射出特征对象，且不带出正文摘录', () => {
     const event = toMessageEvent(eventRowFixture)
-    expect(event.features).toEqual({ hasLink: true, mediaType: 'photo', length: 18, customEmojiCount: 3 })
+    expect(event.features).toEqual({ hasLink: true, mediaType: 'photo', length: 18, customEmojiCount: 3, emojiCount: 5, viaBot: true })
     expect(event.chatId).toBe(asChatId('-1001234567890'))
     expect(event.userId).toBe(asUserId(7_000_000_001))
     expect(Object.keys(event)).not.toContain('sampleText')

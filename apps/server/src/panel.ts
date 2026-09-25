@@ -69,13 +69,30 @@ const MAX_RULES = 100
 const MAX_MUTE_DURATION_MINUTES = 43_200
 
 /** 合法规则种类，与 `RuleKind` 一致。保存边界必须与引擎的认识一致，否则写进去的规则不会命中。 */
-const RULE_KINDS: ReadonlySet<string> = new Set(['keyword', 'regex', 'link-domain', 'sender-name', 'custom-emoji'])
+const RULE_KINDS: ReadonlySet<string> = new Set([
+  'keyword',
+  'regex',
+  'link-domain',
+  'sender-name',
+  'custom-emoji',
+  'emoji-count',
+  'via-bot',
+])
 
 /** 合法处置档位，与 `RuleAction` 一致。 */
 const RULE_ACTIONS: ReadonlySet<string> = new Set(['pass', 'warn', 'delete', 'mute', 'ban'])
 
-/** `custom-emoji` 的 pattern 形态：十进制最小计数。 */
-const CUSTOM_EMOJI_PATTERN = /^\d+$/u
+/** 计数值规则（`custom-emoji` / `emoji-count`）的 pattern 形态：十进制最小计数。 */
+const COUNT_PATTERN = /^\d+$/u
+
+/**
+ * 计数 pattern 是否合法：与引擎 `rules.ts` 的 `minimumCount` 完全同口径，多一层都不算宽——
+ * 整体十进制加安全整数；20 位这类超长数字串解析超出安全整数范围，引擎按坏数据失效，
+ * 保存边界同样拒绝，不让它写进去静默失效。
+ */
+function isCountPattern(pattern: string): boolean {
+  return COUNT_PATTERN.test(pattern) && Number.isSafeInteger(Number(pattern))
+}
 
 /** 面板聚合计数。与 `DailyAggregate` 去掉主键字段后一一对应。 */
 type DailyCounts = Omit<DailyAggregate, 'chatId' | 'date'>
@@ -456,7 +473,9 @@ interface ConfigValidation {
  * 逐项校验配置数据，错误按「第 N 条规则的哪个字段」归位。
  *
  * 校验口径与引擎一致而不是更宽：`regex` / `sender-name` 必须能按 `u` 标志编译（引擎就这么编译），
- * `custom-emoji` 的 pattern 是十进制最小计数。不在保存边界挡住，坏规则写进去只会在运行时静默失效。
+ * `custom-emoji` / `emoji-count` 的 pattern 是十进制最小计数（含安全整数检查）；`via-bot` 不使用
+ * pattern，允许空串且保存时把非空输入归一为空串（其余 kind 仍要求非空）。
+ * 不在保存边界挡住，坏规则写进去只会在运行时静默失效。
  *
  * @param data 解析后的 config。
  * @returns 错误清单（空即通过）与补齐 id 的规则集（仅通过时有意义）。
@@ -480,12 +499,12 @@ function validateConfigData(data: ConfigData): ConfigValidation {
 
     if (!RULE_KINDS.has(rule.kind)) details.push(`第 ${position} 条规则 kind 非法：${rule.kind}`)
 
-    if (rule.pattern.trim().length === 0) {
+    if (rule.pattern.trim().length === 0 && rule.kind !== 'via-bot') {
       details.push(`第 ${position} 条规则 pattern 不能为空`)
     } else if (rule.kind === 'regex' || rule.kind === 'sender-name') {
       if (!compilesUnicodeRegex(rule.pattern)) details.push(`第 ${position} 条规则正则无法编译：${rule.pattern}`)
-    } else if (rule.kind === 'custom-emoji' && !CUSTOM_EMOJI_PATTERN.test(rule.pattern)) {
-      details.push(`第 ${position} 条规则 custom-emoji 的 pattern 需为十进制最小计数：${rule.pattern}`)
+    } else if ((rule.kind === 'custom-emoji' || rule.kind === 'emoji-count') && !isCountPattern(rule.pattern)) {
+      details.push(`第 ${position} 条规则 ${rule.kind} 的 pattern 需为十进制最小计数：${rule.pattern}`)
     }
 
     if (!(Number.isFinite(rule.score) && rule.score >= 0 && rule.score <= 1)) {
@@ -510,7 +529,8 @@ function validateConfigData(data: ConfigData): ConfigValidation {
     return {
       id: id.length > 0 ? id : allocateCustomRuleId(usedIds),
       kind: rule.kind as RuleKind,
-      pattern: rule.pattern,
+      // `via-bot` 不使用 pattern：非空与纯空白输入一律归一为空串，落库形状与引擎、面板一致。
+      pattern: rule.kind === 'via-bot' ? '' : rule.pattern,
       score: rule.score,
       actionHint: rule.actionHint as RuleAction,
       enabled: rule.enabled,

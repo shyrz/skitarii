@@ -33,6 +33,8 @@ export function extractFeatures(message: Message, text: string): MessageFeatures
     mediaType: mediaTypeOf(message, text),
     length: Array.from(text).length,
     customEmojiCount: customEmojiCount(message),
+    emojiCount: emojiCount(message, text),
+    viaBot: message.via_bot !== undefined,
   }
 }
 
@@ -87,6 +89,50 @@ function hasLink(message: Message, text: string): boolean {
 function customEmojiCount(message: Message): number {
   const entities = [...(message.entities ?? []), ...(message.caption_entities ?? [])]
   return entities.filter((entity) => entity.type === 'custom_emoji').length
+}
+
+/** `Extended_Pictographic` 属性（表情码位）。不带 `g`：每次 `test` 独立、无 `lastIndex` 状态。 */
+const EXTENDED_PICTOGRAPHIC = /\p{Extended_Pictographic}/u
+
+/**
+ * 字素簇切分器（默认区域设置）。模块级复用：构造有一定开销，而 `segment` 每调用
+ * 返回独立迭代器，无共享状态。字素簇即「用户感知的一个字符」。
+ */
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+
+/**
+ * 统计表情总数，按用户感知口径：每个表情恰计一次。
+ *
+ * 先按字素簇切分，统计包含 `\p{Extended_Pictographic}` 的簇数：ZWJ 序列（👨‍👩‍👧‍👦）、
+ * 肤色修饰与变体选择符都属于同一簇，只计 1；`custom-emoji` 那种按码位逐一计数会把
+ * 一个家庭表情算成四个人。
+ *
+ * Telegram 把自定义表情替换成正文里的占位符：占位符本身是表情（常见形态）时已被簇计数覆盖，
+ * 不再重复计入；占位符不是表情（如字母、数字）时该自定义表情在簇计数里没有任何痕迹，
+ * 按 `custom_emoji` 实体补计 1。因此 `emojiCount >= customEmojiCount` 恒成立。
+ *
+ * `text` 由调用方完成 text/caption 合并（传的是与 `contentHash` 相同的 `message.text ?? message.caption`），
+ * 本函数不读 `message.caption`；caption 上的实体从 `caption_entities` 取，与文本侧保持一致。
+ *
+ * @param message 消息对象。
+ * @param text 消息文本（正文或 caption）。
+ * @returns 表情总数。
+ */
+function emojiCount(message: Message, text: string): number {
+  let count = 0
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(text)) {
+    if (EXTENDED_PICTOGRAPHIC.test(segment)) count += 1
+  }
+
+  const entities = [...(message.entities ?? []), ...(message.caption_entities ?? [])]
+  return (
+    count +
+    entities.filter(
+      (entity) =>
+        entity.type === 'custom_emoji' &&
+        !EXTENDED_PICTOGRAPHIC.test(text.slice(entity.offset, entity.offset + entity.length)),
+    ).length
+  )
 }
 
 /**

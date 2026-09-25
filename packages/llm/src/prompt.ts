@@ -164,12 +164,18 @@ function describeSignals(input: JudgeInput): string {
 }
 
 /**
- * 把消息特征写成一行上下文。特征是文本之外唯一可信的信号（模型看不到原文的转义与元数据）。
+ * 把消息特征写成上下文。特征是文本之外唯一可信的信号（模型看不到原文的转义与元数据）。
+ * 表情数量与内联机器人各占一行：它们是本批新增信号，单列出来便于模型把「表情墙 + via bot」
+ * 与「正常使用 @gif」区分开。
  *
  * @param input 送审材料。
- * @returns 单行文本。
+ * @returns 多行文本。
  */
 function describeFeatures(input: JudgeInput): string {
-  const { length, hasLink, mediaType } = input.features
-  return `【消息特征】类型 ${mediaType}，字符数 ${length}，含链接 ${hasLink ? '是' : '否'}`
+  const { length, hasLink, mediaType, emojiCount, viaBot } = input.features
+  return [
+    `【消息特征】类型 ${mediaType}，字符数 ${length}，含链接 ${hasLink ? '是' : '否'}`,
+    `表情数量 ${emojiCount}`,
+    `内联机器人 ${viaBot ? '是' : '否'}`,
+  ].join('\n')
 }

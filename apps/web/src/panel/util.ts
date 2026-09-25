@@ -30,13 +30,15 @@ export const VERDICT_LABEL: Record<string, string> = {
   scam: '诈骗',
 }
 
-/** 规则匹配方式 → 中文标签（规则页签用）。 */
+/** 规则匹配方式 → 中文标签（规则页签用；选项顺序即这里的书写顺序）。 */
 export const RULE_KIND_LABEL: Record<PanelRuleKind, string> = {
   keyword: '关键词',
   regex: '正则',
   'link-domain': '域名',
   'sender-name': '发送者名',
   'custom-emoji': '表情计数',
+  'emoji-count': '表情总数',
+  'via-bot': '内联机器人',
 }
 
 /**

@@ -74,7 +74,7 @@ describe('写入语句的形状与参数化', () => {
       userId: asUserId(7_000_000_001),
       messageId: 42,
       contentHash: 'a'.repeat(64),
-      features: { hasLink: true, mediaType: 'photo', length: 18, customEmojiCount: 2 },
+      features: { hasLink: true, mediaType: 'photo', length: 18, customEmojiCount: 2, emojiCount: 5, viaBot: true },
       createdAt: new Date('2026-09-23T10:00:00Z'),
     })
 
@@ -92,6 +92,8 @@ describe('写入语句的形状与参数化', () => {
       'photo',
       18,
       2,
+      5,
+      true,
       '2026-09-23T10:00:00.000Z',
     ])
   })
@@ -468,6 +470,8 @@ describe('迁移产物', () => {
     expect(sql).toContain('ADD COLUMN "resolved_by" bigint;')
     expect(sql).toContain('ADD COLUMN "notified_at" timestamp with time zone;')
     expect(sql).toContain('ADD COLUMN "custom_emoji_count" integer DEFAULT 0 NOT NULL;')
+    expect(sql).toContain('ADD COLUMN "emoji_count" integer DEFAULT 0 NOT NULL;')
+    expect(sql).toContain('ADD COLUMN "via_bot" boolean DEFAULT false NOT NULL;')
     expect(sql).toContain('ADD COLUMN "rollback_pending" boolean DEFAULT false NOT NULL;')
     expect(sql).toContain('ADD COLUMN "notice_chat_id" text;')
     expect(sql).toContain('ADD COLUMN "notice_message_id" integer;')
@@ -492,27 +496,22 @@ describe('迁移产物', () => {
     }
   })
 
-  test('0006 snapshot 记录通知引用列，journal 末尾指向它', () => {
+  test('0007 snapshot 记录表情总数与 via-bot 列，journal 末尾指向它', () => {
     const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
     const journal = JSON.parse(readFileSync(join(migrationsDir, 'meta', '_journal.json'), 'utf8')) as {
       entries: Array<{ idx: number; tag: string }>
     }
     const last = journal.entries.at(-1)
-    expect(last).toEqual({ idx: 6, tag: '0006_bumpy_darkstar', version: '7', when: expect.any(Number), breakpoints: true })
+    expect(last).toEqual({ idx: 7, tag: '0007_bitter_william_stryker', version: '7', when: expect.any(Number), breakpoints: true })
 
     const snapshot = JSON.parse(
-      readFileSync(join(migrationsDir, 'meta', '0006_snapshot.json'), 'utf8'),
+      readFileSync(join(migrationsDir, 'meta', '0007_snapshot.json'), 'utf8'),
     ) as {
-      tables: Record<string, { columns: Record<string, { name: string; type: string; notNull: boolean }> }>
+      tables: Record<string, { columns: Record<string, { name: string; type: string; notNull: boolean; default?: unknown }> }>
     }
-    const columns = snapshot.tables['public.moderation_decisions']?.columns
-    expect(columns?.notice_chat_id).toEqual({ name: 'notice_chat_id', type: 'text', primaryKey: false, notNull: false })
-    expect(columns?.notice_message_id).toEqual({
-      name: 'notice_message_id',
-      type: 'integer',
-      primaryKey: false,
-      notNull: false,
-    })
+    const columns = snapshot.tables['public.message_events']?.columns
+    expect(columns?.emoji_count).toEqual({ name: 'emoji_count', type: 'integer', primaryKey: false, notNull: true, default: 0 })
+    expect(columns?.via_bot).toEqual({ name: 'via_bot', type: 'boolean', primaryKey: false, notNull: true, default: false })
   })
 })
 

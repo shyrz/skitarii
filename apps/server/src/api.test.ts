@@ -118,7 +118,7 @@ async function seedDecision(store: InMemoryRepos, userId: number = USER_ID): Pro
     userId: asUserId(userId),
     messageId: 42,
     contentHash: 'h'.repeat(64),
-    features: { hasLink: false, mediaType: 'text', length: 12, customEmojiCount: 0 },
+    features: { hasLink: false, mediaType: 'text', length: 12, customEmojiCount: 0, emojiCount: 0, viaBot: false },
     createdAt: new Date('2026-09-23T10:00:00Z'),
   })
   await store.repos.decisions.insert({

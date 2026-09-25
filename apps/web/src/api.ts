@@ -282,7 +282,14 @@ export async function resolvePanelAppeal(
 
 /* ---- 规则/阈值配置（phase2b-spec §1；保存后立即生效） ---- */
 
-export type PanelRuleKind = 'keyword' | 'regex' | 'link-domain' | 'sender-name' | 'custom-emoji'
+export type PanelRuleKind =
+  | 'keyword'
+  | 'regex'
+  | 'link-domain'
+  | 'sender-name'
+  | 'custom-emoji'
+  | 'emoji-count'
+  | 'via-bot'
 
 export interface PanelRuleDto {
   /** 新增规则传空串，由服务端分配 `custom-<8位十六进制>`。 */

@@ -48,7 +48,7 @@ export interface JudgeCache {
  *
  * 覆盖范围与提示词消费的输入一一对应（`prompt.ts` 的 `buildJudgeMessages`）：
  * 正文（contentHash 是它的 sha256）、发送者身份、语言（决定 system 提示）、
- * 消息特征（`hasLink` / `mediaType` / `length` / `customEmojiCount`）、已命中信号
+ * 消息特征（`hasLink` / `mediaType` / `length` / `customEmojiCount` / `emojiCount` / `viaBot`）、已命中信号
  * （rule-hit 记为 `r:<ruleId>:<score>`，llm 结论记为 `l:<verdict>:<confidence>`，按序逗号连接）
  * 与误伤样例（`JSON.stringify(examples ?? [])`，顺序敏感：样例按最近优先传入，换序即换键）。
  * 任何一项不同都不该复用结论，因此任何一项都必须进指纹。信号里的 ruleId 还隐含了
@@ -62,7 +62,7 @@ export interface JudgeCache {
  * @returns 十六进制判定指纹，直接作缓存键。
  */
 function judgeFingerprint(contentHash: string, input: JudgeInput): string {
-  const { hasLink, mediaType, length, customEmojiCount } = input.features
+  const { hasLink, mediaType, length, customEmojiCount, emojiCount, viaBot } = input.features
   const signals = input.signals
     .map((signal) =>
       signal.kind === 'rule-hit'
@@ -80,6 +80,8 @@ function judgeFingerprint(contentHash: string, input: JudgeInput): string {
     mediaType,
     String(length),
     String(customEmojiCount),
+    String(emojiCount),
+    String(viaBot),
     signals,
     JSON.stringify(input.examples ?? []),
   ].join('|')

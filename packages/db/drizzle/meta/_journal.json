@@ -50,6 +50,13 @@
       "when": 1790270452144,
       "tag": "0006_bumpy_darkstar",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790298722138,
+      "tag": "0007_bitter_william_stryker",
+      "breakpoints": true
     }
   ]
 }

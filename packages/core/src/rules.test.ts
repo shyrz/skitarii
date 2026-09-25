@@ -3,13 +3,21 @@ import { normalize } from './normalize.js'
 import { matchRules } from './rules.js'
 import type { MessageFeatures, Rule } from './types.js'
 
-const TEXT_FEATURES: MessageFeatures = { hasLink: false, mediaType: 'text', length: 12, customEmojiCount: 0 }
-const LINK_FEATURES: MessageFeatures = { hasLink: true, mediaType: 'text', length: 32, customEmojiCount: 0 }
+const TEXT_FEATURES: MessageFeatures = { hasLink: false, mediaType: 'text', length: 12, customEmojiCount: 0, emojiCount: 0, viaBot: false }
+const LINK_FEATURES: MessageFeatures = { ...TEXT_FEATURES, hasLink: true, length: 32 }
 
 /** 带自定义表情计数的特征，只用于 custom-emoji 用例。 */
 function emojiFeatures(count: number): MessageFeatures {
-  return { hasLink: false, mediaType: 'text', length: 12, customEmojiCount: count }
+  return { ...TEXT_FEATURES, customEmojiCount: count }
 }
+
+/** 带表情总数的特征，只用于 emoji-count 用例（customEmojiCount 保持 0，两个字段互不影响）。 */
+function emojiCountFeatures(count: number): MessageFeatures {
+  return { ...TEXT_FEATURES, emojiCount: count }
+}
+
+/** via-bot 的命中态特征；不命中时直接用 TEXT_FEATURES。 */
+const VIA_BOT_FEATURES: MessageFeatures = { ...TEXT_FEATURES, viaBot: true }
 
 /** 不参与身份判定的空身份：只测正文规则时用它占位。 */
 const NO_IDENTITY = ''
@@ -125,6 +133,46 @@ describe('matchRules: custom-emoji', () => {
     const rules = patterns.map((pattern, index) => ruleWith({ id: `bad-${index}`, kind: 'custom-emoji', pattern }))
 
     expect(matchRules('你好', emojiFeatures(100), rules, NO_IDENTITY)).toEqual([])
+  })
+})
+
+describe('matchRules: emoji-count', () => {
+  it('达到最小计数即命中，低于阈值不命中', () => {
+    const rule = ruleWith({ id: 'flood', kind: 'emoji-count', pattern: '6' })
+
+    expect(matchRules('你好', emojiCountFeatures(6), [rule], NO_IDENTITY)).toEqual([
+      { kind: 'rule-hit', ruleId: 'flood', score: 0.5 },
+    ])
+    expect(matchRules('你好', emojiCountFeatures(100), [rule], NO_IDENTITY)).toHaveLength(1)
+    expect(matchRules('你好', emojiCountFeatures(5), [rule], NO_IDENTITY)).toEqual([])
+  })
+
+  it('pattern 必须整体是十进制数字：坏数据静默不命中（与 custom-emoji 同口径）', () => {
+    const patterns = ['-1', '6abc', '6.5', '', ' 6 ', '+6', '很多', '9'.repeat(20)]
+    const rules = patterns.map((pattern, index) => ruleWith({ id: `bad-${index}`, kind: 'emoji-count', pattern }))
+
+    expect(matchRules('你好', emojiCountFeatures(100), rules, NO_IDENTITY)).toEqual([])
+  })
+
+  it('只看 emojiCount，不被 customEmojiCount 顶替', () => {
+    const rule = ruleWith({ id: 'flood', kind: 'emoji-count', pattern: '6' })
+
+    expect(matchRules('你好', emojiFeatures(100), [rule], NO_IDENTITY)).toEqual([])
+  })
+})
+
+describe('matchRules: via-bot', () => {
+  it('匹配 viaBot 特征；pattern 内容（含坏数据）不影响结果', () => {
+    const rules = [
+      ruleWith({ id: 'via-empty', kind: 'via-bot', pattern: '' }),
+      ruleWith({ id: 'via-junk', kind: 'via-bot', pattern: '(((' }),
+    ]
+
+    expect(matchRules('你好', VIA_BOT_FEATURES, rules, NO_IDENTITY)).toEqual([
+      { kind: 'rule-hit', ruleId: 'via-empty', score: 0.5 },
+      { kind: 'rule-hit', ruleId: 'via-junk', score: 0.5 },
+    ])
+    expect(matchRules('你好', TEXT_FEATURES, rules, NO_IDENTITY)).toEqual([])
   })
 })
 

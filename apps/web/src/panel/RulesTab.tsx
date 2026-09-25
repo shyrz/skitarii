@@ -17,7 +17,8 @@ import { RULE_ACTION_LABEL, RULE_KIND_LABEL } from './util.js'
  * 覆盖本地（拿到分配后的正式 id）。删除规则与结案确认同模式：第一次点只展开确认条。
  */
 
-const RULE_KINDS: PanelRuleKind[] = ['keyword', 'regex', 'link-domain', 'sender-name', 'custom-emoji']
+/** 选项直接取标签表的键，新增匹配方式时只改 util 一处，不会出现「有 kind 没选项」的漂移。 */
+const RULE_KINDS = Object.keys(RULE_KIND_LABEL) as PanelRuleKind[]
 const RULE_ACTIONS: PanelDecisionAction[] = ['pass', 'warn', 'delete', 'mute', 'ban']
 
 /** 本地新增规则的 id 前缀：保存时置空串交给服务端分配，避免与正式 id 撞车。 */
@@ -140,7 +141,12 @@ export function RulesTab({
     try {
       const config = await savePanelConfig(chatId, initData, {
         ...draft,
-        rules: draft.rules.map((r) => (r.id.startsWith(LOCAL_ID_PREFIX) ? { ...r, id: '' } : r)),
+        // 本地新增规则的 id 交给服务端分配；`via-bot` 的 pattern 统一置空（与后端归一逻辑同口径）。
+        rules: draft.rules.map((r) => ({
+          ...r,
+          id: r.id.startsWith(LOCAL_ID_PREFIX) ? '' : r.id,
+          pattern: r.kind === 'via-bot' ? '' : r.pattern,
+        })),
       })
       // 以服务端返回为准：拿到分配后的正式 id，本地草稿与服务端对齐
       setSaved(config)
@@ -392,6 +398,9 @@ function RuleCard({
   onDeleteCancel: () => void
   onDeleteConfirm: () => void
 }) {
+  /** `via-bot` 是布尔特征规则，pattern 不参与判定：输入禁用并给出说明，避免填了却不生效。 */
+  const ignoresPattern = rule.kind === 'via-bot'
+
   return (
     <article className="list-card">
       <div className="row-between">
@@ -432,7 +441,11 @@ function RuleCard({
               className="select"
               value={rule.kind}
               disabled={disabled}
-              onChange={(event) => onChange({ kind: event.target.value as PanelRuleKind })}
+              onChange={(event) => {
+                const kind = event.target.value as PanelRuleKind
+                // 切到 `via-bot` 时把 pattern 一并置空：此 kind 不使用 pattern，留着旧值会误导。
+                onChange(kind === 'via-bot' ? { kind, pattern: '' } : { kind })
+              }}
               aria-label="匹配方式"
             >
               {RULE_KINDS.map((kind) => (
@@ -458,11 +471,12 @@ function RuleCard({
           <input
             className="input mono"
             value={rule.pattern}
-            disabled={disabled}
+            disabled={disabled || ignoresPattern}
             placeholder="匹配内容"
             onChange={(event) => onChange({ pattern: event.target.value })}
             aria-label="匹配内容"
           />
+          {ignoresPattern && <p className="list-sub">此匹配方式不使用 pattern</p>}
           <div className="rule-edit-row">
             <input
               className="input"

@@ -318,7 +318,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 响应包装：GET 直接返回配置本体，PUT 把同一形状包在 `config` 键下，前端解析时不要混用。判定顺序是结构 → 鉴权 → 群存在 → 语义校验：未知群即使配置非法也先返回 `404 chat_not_found`。`details` 最多 50 条，超出时截断并以 `…等 N 条其他错误` 汇总。
 
 - `200 {"config":{...}}`：与 GET 同形（注意外层包了 `config` 键），含服务端分配后的 id
-- `400 {"error":"invalid_request","details":[...]}`：逐条指出第几条规则的哪个字段。校验口径：`0 ≤ passThreshold ≤ llmThreshold ≤ 1`；`muteDurationMinutes` 为 1..43200 的整数；规则至多 100 条、id 不得重复；`kind` 取 `keyword | regex | link-domain | sender-name | custom-emoji`；`pattern` 非空（纯空白同样拒绝），`regex` / `sender-name` 需能按 `u` 标志编译，`custom-emoji` 需为十进制计数；`score ∈ [0,1]`；`actionHint` 取五个档位；`enabled` 为布尔
+- `400 {"error":"invalid_request","details":[...]}`：逐条指出第几条规则的哪个字段。校验口径：`0 ≤ passThreshold ≤ llmThreshold ≤ 1`；`muteDurationMinutes` 为 1..43200 的整数；规则至多 100 条、id 不得重复；`kind` 取 `keyword | regex | link-domain | sender-name | custom-emoji | emoji-count | via-bot`；`pattern` 非空（纯空白同样拒绝），`regex` / `sender-name` 需能按 `u` 标志编译，`custom-emoji` / `emoji-count` 需为十进制计数，`via-bot` 不使用 pattern（允许空串）；`score ∈ [0,1]`；`actionHint` 取五个档位；`enabled` 为布尔
 - `401 {"error":"init_data_invalid"}` / `403 {"error":"forbidden"}`
 - `404 {"error":"chat_not_found"}`：群未登记（保存不会隐式创建群配置）
 
@@ -404,13 +404,15 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 ## 关键约定
 
-**正文默认不留存，处置对象留摘录。** `message_events` 只有 `content_hash` 与特征列；唯一的正文落地形态是 `sample_text`，一条被判非放行的消息的原文摘录（≤280 字符），用于申诉复核与事后复盘。它由 SQL 条件强制：只有同事件存在非 `pass` 决策时才允许写入，放行消息的正文没有任何写入路径。
+**正文默认不留存，处置对象留摘录。** `message_events` 只有 `content_hash` 与特征列（是否有链接、媒体类型、长度、自定义表情数、表情总数、是否经内联机器人发送）；唯一的正文落地形态是 `sample_text`，一条被判非放行的消息的原文摘录（≤280 字符），用于申诉复核与事后复盘。它由 SQL 条件强制：只有同事件存在非 `pass` 决策时才允许写入，放行消息的正文没有任何写入路径。
 
 **归一化是所有匹配的前提。** 文本先过 `normalize`，规则 pattern 按归一化后的形态编写（小写、简体、无拆词标点）。`normalize` 会把「加v」改写成「加微信」，按原始写法写规则永远匹配不上，新增规则前先跑一遍归一化。发送者身份（显示名与 `@用户名`）走同一套归一化，`kind: 'sender-name'` 的规则匹配的是身份而非正文；身份只存在于运行时，不落库。绕过词表在 `packages/core/src/normalize-map.ts`，扩充只改数据。
 
 **双阈值决定要不要花钱。** `passThreshold` 以下直接放行；`llmThreshold` 以上直接按命中的规则处置；只有落在中间的样本才调用 LLM。灰色地带没拿到复核结论时返回 `warn`，不执行破坏性动作。
 
 **规则与阈值可在面板里编辑。** 规则集、双阈值与禁言时长在 Mini App 面板的「规则」页签编辑，保存后立即生效（管线每条消息读配置）。保存边界会挡住坏数据（阈值乱序、坏正则、非法枚举、超量规则等）并逐条指出第几条规则的哪个字段，与 README 既有口径「规则编译失败在保存接口暴露」一致。
+
+**默认配置只在群首次登记时写入。** 新群拿到 15 条默认规则（含 `default-emoji-flood`：表情总数 ≥6；`default-inline-bot`：经内联机器人发送，pattern 不使用），此后配置以数据库为准；已登记的群不会自动追加新默认规则，需要时在面板手动添加。表情总数把普通 Unicode 表情也计入（`custom-emoji` 只覆盖付费自定义表情），按用户感知每个表情恰计一次（ZWJ 序列如家庭表情计 1，不再按码位拆开）；两者叠加后有意的语义收紧：≥6 个自定义表情会同时命中 `default-emoji-burst` 与 `default-emoji-flood`（0.8 直接处置）。
 
 **重复投递不重复处置。** 事件 id 由 `(chatId, messageId)` 派生（编辑消息附加 `edit:${edit_date}:${内容哈希前 16 位}` 判别符：同一秒内不同内容的编辑各自成事件，编辑回退到早前内容时复用当时的事件 id、不再重审），决策 id 由事件 id 派生，落库用 `on conflict do nothing`；执行侧再叠一层 `eventId + action` 的进程内幂等闸门与 `moderation_decisions.executed` 回填。Telegram 重投递同一 update 的效果是「什么都不再发生」。
 

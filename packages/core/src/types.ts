@@ -19,7 +19,14 @@ export type UserId = number & { readonly __brand: 'UserId' }
 export type RuleAction = 'pass' | 'warn' | 'delete' | 'mute' | 'ban'
 
 /** 规则匹配方式。新增一种匹配方式时在 `rules.ts` 的匹配器表中登记，而不是加分支。 */
-export type RuleKind = 'keyword' | 'regex' | 'link-domain' | 'sender-name' | 'custom-emoji'
+export type RuleKind =
+  | 'keyword'
+  | 'regex'
+  | 'link-domain'
+  | 'sender-name'
+  | 'custom-emoji'
+  | 'emoji-count'
+  | 'via-bot'
 
 /** LLM 复核结论。`legit` 表示判定为正常消息。 */
 export type Verdict = 'legit' | 'spam' | 'scam'
@@ -37,7 +44,8 @@ export interface Rule {
   /**
    * 匹配模式，含义由 `kind` 决定：keyword 为字面量子串，regex 为正则源串（目标是正文），
    * link-domain 为域名，sender-name 为正则源串（目标是发送者身份而非正文），
-   * custom-emoji 为十进制最小计数（`customEmojiCount` 达到即命中）。
+   * custom-emoji / emoji-count 为十进制最小计数（`customEmojiCount` / `emojiCount` 达到即命中），
+   * via-bot 不使用 pattern（留空串）。
    */
   pattern: string
   /** 命中时贡献的违规分，0..1。多条命中累加，总分封顶 1。 */
@@ -84,6 +92,14 @@ export interface MessageFeatures {
   length: number
   /** `custom_emoji` 实体数量。付费表情堆砌是广告号的常见特征（来源实测阈值 >5）。 */
   customEmojiCount: number
+  /**
+   * 表情总数，按用户感知每个表情恰计一次：含 `\p{Extended_Pictographic}` 的字素簇计数
+   * （ZWJ 序列如家庭表情计 1），加上未被占位符覆盖的自定义表情实体。
+   * 普通 Unicode 表情墙在规则层此前是完全隐形的；`customEmojiCount` 是它的下界。
+   */
+  emojiCount: number
+  /** 消息是否经内联机器人发送（`message.via_bot` 存在）。`from` 仍是普通用户，规则层看不到发送者差异。 */
+  viaBot: boolean
 }
 
 /** 消息事件。`contentHash` 用于 LLM 缓存与重复检测，原文不出现在任何持久化结构中。 */

@@ -28,16 +28,35 @@ const MATCHERS: Readonly<Record<RuleKind, RuleMatcher>> = {
   'link-domain': (pattern, { normalized, features }) => features.hasLink && matchesDomain(normalized, pattern),
   // 与 regex 同一套正则语义，只是目标换成身份文本：假客服、假官方的特征在名字里，不在正文里。
   'sender-name': (pattern, { identity }) => identity.length > 0 && testRegex(identity, pattern),
-  // 计数值规则：pattern 是十进制最小计数，特征值达到即命中。pattern 必须整体是十进制数字
-  // （`/^\d+$/u`）才算合法：`'-1'`、`'6abc'`、`'6.5'` 这类坏数据一律按不命中处理，不用
-  // `Number.parseInt` 的前缀解析（那会让 `'-1'` 命中任何非负计数、`'6abc'` 静默按 6 生效）；
-  // 再经 `Number` + `Number.isSafeInteger` 解析，超长数字串溢出同样按坏数据处理。
-  // 与坏正则同口径：一条坏规则只失效自己，不打断整条消息的判定。
+  // 计数值规则，语义见 `minimumCount`：达到最小计数即命中。
   'custom-emoji': (pattern, { features }) => {
-    if (!/^\d+$/u.test(pattern)) return false
-    const minimum = Number(pattern)
-    return Number.isSafeInteger(minimum) && features.customEmojiCount >= minimum
+    const minimum = minimumCount(pattern)
+    return minimum !== null && features.customEmojiCount >= minimum
   },
+  // 表情总数（Unicode 表情 + custom_emoji 实体）与 custom-emoji 同口径，只换成 `emojiCount`。
+  'emoji-count': (pattern, { features }) => {
+    const minimum = minimumCount(pattern)
+    return minimum !== null && features.emojiCount >= minimum
+  },
+  // 布尔特征规则：pattern 不参与判定（默认规则用空串），因此坏 pattern 也无从谈起。
+  'via-bot': (_pattern, { features }) => features.viaBot,
+}
+
+/**
+ * 计数值规则（custom-emoji / emoji-count）的 pattern 解析：十进制最小计数，特征值达到即命中。
+ *
+ * pattern 必须整体是十进制数字（`/^\d+$/u`）才算合法：`'-1'`、`'6abc'`、`'6.5'` 这类坏数据
+ * 一律按不命中处理，不用 `Number.parseInt` 的前缀解析（那会让 `'-1'` 命中任何非负计数、
+ * `'6abc'` 静默按 6 生效）；再经 `Number` + `Number.isSafeInteger` 解析，超长数字串溢出同样
+ * 按坏数据处理。与坏正则同口径：一条坏规则只失效自己，不打断整条消息的判定。
+ *
+ * @param pattern 规则 pattern。
+ * @returns 合法时的最小计数；坏数据返回 `null`。
+ */
+function minimumCount(pattern: string): number | null {
+  if (!/^\d+$/u.test(pattern)) return null
+  const minimum = Number(pattern)
+  return Number.isSafeInteger(minimum) ? minimum : null
 }
 
 /** 域名判定用的 host 形状：至少一个点，标签由字母、数字、连字符组成。端口、路径、查询串不在匹配内。 */
@@ -51,7 +70,8 @@ const HOST_TOKEN = /[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/gu
  * 保证一条坏规则不会让整条消息的审核流程抛错。
  *
  * @param normalized `normalize` 的输出。
- * @param features 消息特征；`link-domain` 规则依赖 `hasLink`，`custom-emoji` 规则依赖 `customEmojiCount`。
+ * @param features 消息特征；`link-domain` 依赖 `hasLink`，`custom-emoji` / `emoji-count` 依赖计数字段，
+ *   `via-bot` 依赖 `viaBot`。
  * @param rules 群的规则集。`enabled === false` 的规则被跳过，不改动入参数组。
  * @param identity 发送者身份文本的 `normalize` 输出；`sender-name` 规则只匹配它。身份不落库。
  * @returns 命中信号，顺序与 `rules` 中的相对顺序一致，`score` 已夹到 0..1。

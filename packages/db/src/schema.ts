@@ -109,6 +109,10 @@ export const messageEvents = pgTable(
     length: integer('length').notNull(),
     /** `custom_emoji` 实体数量（`MessageFeatures['customEmojiCount']`）。付费表情堆砌是广告信号的来源。 */
     customEmojiCount: integer('custom_emoji_count').notNull().default(0),
+    /** 表情总数（按用户感知每个表情恰计一次，`MessageFeatures['emojiCount']`）。 */
+    emojiCount: integer('emoji_count').notNull().default(0),
+    /** 是否经内联机器人发送（`MessageFeatures['viaBot']`）。 */
+    viaBot: boolean('via_bot').notNull().default(false),
     /**
      * 正文摘录（去掉首尾空白后截到 {@link SAMPLE_TEXT_MAX_LENGTH}）。空值表示「本条没有留下摘录」：
      * 放行的消息不留、纯媒体无文本的消息也没有。仅当该事件存在非 pass 决策时才允许写入。

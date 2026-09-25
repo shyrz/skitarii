@@ -122,7 +122,7 @@ async function seedDecision(
     userId: decision.userId,
     messageId: 1,
     contentHash: decision.eventId,
-    features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0 },
+    features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0, emojiCount: 0, viaBot: false },
     createdAt: decision.decidedAt,
   })
   await store.repos.decisions.insert(decision)
@@ -728,6 +728,54 @@ describe('面板规则配置', () => {
     expect(await store.repos.chats.findByChatId(chatId)).toEqual(config)
   })
 
+  test('保存：emoji-count 与 via-bot 合法；via-bot 允许空 pattern', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({
+          rules: [
+            { id: 'r-emoji', kind: 'emoji-count', pattern: '6', score: 0.4, actionHint: 'delete', enabled: true },
+            { id: 'r-via', kind: 'via-bot', pattern: '', score: 0.4, actionHint: 'delete', enabled: true },
+          ],
+        }),
+      },
+    })
+
+    expect(result.status).toBe(200)
+    expect((result.body as { config: ChatConfig }).config.rules).toEqual([
+      { id: 'r-emoji', kind: 'emoji-count', pattern: '6', score: 0.4, actionHint: 'delete', enabled: true },
+      { id: 'r-via', kind: 'via-bot', pattern: '', score: 0.4, actionHint: 'delete', enabled: true },
+    ])
+  })
+
+  test('保存：via-bot 的 pattern 非空或纯空白时归一为空串', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({
+          rules: [
+            { id: 'r-via-filled', kind: 'via-bot', pattern: 'some-pattern', score: 0.4, actionHint: 'delete', enabled: true },
+            { id: 'r-via-blank', kind: 'via-bot', pattern: '   ', score: 0.4, actionHint: 'delete', enabled: true },
+          ],
+        }),
+      },
+    })
+
+    expect(result.status).toBe(200)
+    const config = (result.body as { config: ChatConfig }).config
+    // 此 kind 不使用 pattern：两种脏输入都落成空串，落库形状与响应一致。
+    expect(config.rules.map((rule) => rule.pattern)).toEqual(['', ''])
+    expect(await store.repos.chats.findByChatId(chatId)).toEqual(config)
+  })
+
   test('保存：未知群 404，且不隐式创建', async () => {
     const { deps, store } = setup()
 
@@ -787,6 +835,16 @@ describe('面板规则配置', () => {
       'custom-emoji pattern 非计数',
       { rules: [{ ...ruleBase, kind: 'custom-emoji', pattern: 'abc' }] },
       '第 1 条规则 custom-emoji',
+    ],
+    [
+      'emoji-count pattern 非计数',
+      { rules: [{ ...ruleBase, kind: 'emoji-count', pattern: '6个' }] },
+      '第 1 条规则 emoji-count',
+    ],
+    [
+      'emoji-count pattern 超出安全整数（与引擎同口径失效）',
+      { rules: [{ ...ruleBase, kind: 'emoji-count', pattern: '9'.repeat(20) }] },
+      '第 1 条规则 emoji-count',
     ],
     ['pattern 为空', { rules: [{ ...ruleBase, pattern: '' }] }, '第 1 条规则 pattern 不能为空'],
     ['pattern 纯空白', { rules: [{ ...ruleBase, pattern: '   ' }] }, '第 1 条规则 pattern 不能为空'],

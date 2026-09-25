@@ -513,6 +513,35 @@ describe('编辑消息审核', () => {
 })
 
 describe('默认规则：名字信号与高精度正则', () => {
+  test('默认配置恰 15 条规则，两条新增规则字段固定', async () => {
+    const { store, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '你好', messageId: 139 }),
+    )
+
+    const config = await store.repos.chats.findByChatId(chatId)
+    expect(config?.rules).toHaveLength(15)
+    // 两条新规则按字段全等断言：kind / pattern / 分数 / 动作 / 启用态任一项漂移都会在这里失败。
+    expect(config?.rules).toContainEqual({
+      id: 'default-emoji-flood',
+      kind: 'emoji-count',
+      pattern: '6',
+      score: 0.4,
+      actionHint: 'delete',
+      enabled: true,
+    })
+    expect(config?.rules).toContainEqual({
+      id: 'default-inline-bot',
+      kind: 'via-bot',
+      pattern: '',
+      score: 0.4,
+      actionHint: 'delete',
+      enabled: true,
+    })
+  })
+
   test('私有邀请链接叠加 t.me 域名规则，0.8 直接处置', async () => {
     const { store, recording, judgeStub, executor, judge } = setup()
 
@@ -569,6 +598,59 @@ describe('默认规则：名字信号与高精度正则', () => {
     expect(judgeStub.calls).toEqual([])
     expect(recording.countOf('deleteMessage')).toBe(1)
   })
+
+  test('样例复现：via bot + 100 个表情，0.8 直接处置', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '💰'.repeat(100), messageId: 140, emojiCount: 100, viaBot: true }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 140)))
+    // 表情总数 0.4 + 内联机器人 0.4 = 0.8：两条弱信号叠加越过复核阈值，直接处置。
+    expect(decision?.signals).toEqual([
+      { kind: 'rule-hit', ruleId: 'default-emoji-flood', score: 0.4 },
+      { kind: 'rule-hit', ruleId: 'default-inline-bot', score: 0.4 },
+    ])
+    expect(decision?.score).toBe(0.8)
+    expect(decision?.action).toEqual({ kind: 'delete' })
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.countOf('deleteMessage')).toBe(1)
+  })
+
+  test('无 via 的纯表情墙：0.4 落在灰色地带，送复核判定', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '💰'.repeat(10), messageId: 141, emojiCount: 10 }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 141)))
+    expect(judgeStub.calls).toHaveLength(1)
+    // 送审材料只带规则命中（0.4），复核结论由模型给出。
+    expect(judgeStub.calls[0]?.signals).toEqual([{ kind: 'rule-hit', ruleId: 'default-emoji-flood', score: 0.4 }])
+    expect(decision?.signals).toEqual([
+      { kind: 'rule-hit', ruleId: 'default-emoji-flood', score: 0.4 },
+      { kind: 'llm', verdict: 'spam', confidence: 0.9 },
+    ])
+    expect(decision?.action).toEqual({ kind: 'delete' })
+  })
+
+  test('普通文本零新信号：表情不足 6 个且无 via bot 时直接放行', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '这个键盘手感不错', messageId: 142, emojiCount: 5 }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 142)))
+    expect(decision?.signals).toEqual([])
+    expect(decision?.action).toEqual({ kind: 'pass' })
+    expect(judgeStub.calls).toEqual([])
+  })
 })
 
 describe('误伤样本回写', () => {
@@ -597,7 +679,7 @@ describe('误伤样本回写', () => {
       userId: targetUser,
       messageId: 1,
       contentHash: options.contentHash ?? contentHashOf(options.text ?? ''),
-      features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0 },
+      features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0, emojiCount: 0, viaBot: false },
       createdAt: options.resolvedAt,
     })
     await store.repos.decisions.insert({
@@ -887,6 +969,8 @@ function incoming(overrides: {
   senderIdentity?: string
   hasLink?: boolean
   customEmojiCount?: number
+  emojiCount?: number
+  viaBot?: boolean
   commentThread?: CommentThread
 }) {
   const text = overrides.text
@@ -901,6 +985,8 @@ function incoming(overrides: {
       mediaType: 'text' as const,
       length: Array.from(text).length,
       customEmojiCount: overrides.customEmojiCount ?? 0,
+      emojiCount: overrides.emojiCount ?? 0,
+      viaBot: overrides.viaBot ?? false,
     },
     editDate: overrides.editDate ?? null,
     senderIdentity: overrides.senderIdentity ?? '',

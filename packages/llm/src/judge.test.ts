@@ -12,7 +12,7 @@ const config: LlmConfig = {
 
 const input: JudgeInput = {
   text: '全网最低价会员年卡，需要的加v私聊',
-  features: { hasLink: false, mediaType: 'text', length: 18, customEmojiCount: 0 },
+  features: { hasLink: false, mediaType: 'text', length: 18, customEmojiCount: 0, emojiCount: 0, viaBot: false },
   signals: [{ kind: 'rule-hit', ruleId: 'rule-1', score: 0.4 }],
   language: 'zh',
   rules: [{ id: 'rule-1', kind: 'keyword', pattern: '加v', score: 0.4, actionHint: 'delete', enabled: true }],
@@ -184,6 +184,18 @@ describe('OpenAI 兼容复核器', () => {
     expect(body.messages[0].content).toContain('【发送者】')
   })
 
+  test('消息特征渲染表情数量与内联机器人两行', async () => {
+    const { stub, calls } = createFetchStub(() => completionResponse('{"verdict":"legit","confidence":0.5}'))
+    await createOpenAiJudge(config, { fetch: stub }).judge({
+      ...input,
+      features: { ...input.features, emojiCount: 100, viaBot: true },
+    })
+
+    const last = JSON.parse(String(calls[0]?.init?.body)).messages.at(-1)
+    expect(last.content).toContain('表情数量 100')
+    expect(last.content).toContain('内联机器人 是')
+  })
+
   test('不带发送者身份时请求体没有身份标签', async () => {
     const { stub, calls } = createFetchStub(() => completionResponse('{"verdict":"legit","confidence":0.5}'))
     await createOpenAiJudge(config, { fetch: stub }).judge(input)
@@ -345,6 +357,20 @@ describe('带缓存的复核器', () => {
     await cached('hash-6', { ...input, signals: [{ kind: 'rule-hit', ruleId: 'rule-2', score: 0.5 }] })
 
     expect(judge.judge).toHaveBeenCalledTimes(2)
+  })
+
+  test('指纹纳入表情数量与内联机器人：任一项不同都不复用缓存', async () => {
+    const { cache } = createMemoryCache()
+    const judge = {
+      judge: vi.fn(async () => ({ verdict: 'legit' as const, confidence: 0.6, model: 'gpt-4o-mini', rationale: null })),
+    }
+    const cached = createCachedJudge({ judge, cache })
+
+    await cached('hash-7', input)
+    await cached('hash-7', { ...input, features: { ...input.features, emojiCount: 100 } })
+    await cached('hash-7', { ...input, features: { ...input.features, viaBot: true } })
+
+    expect(judge.judge).toHaveBeenCalledTimes(3)
   })
 
   test('复核失败时不写缓存，错误原样抛出', async () => {

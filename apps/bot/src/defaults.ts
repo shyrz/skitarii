@@ -48,6 +48,27 @@ const DEFAULT_RULES: readonly Rule[] = [
     actionHint: 'delete',
     enabled: true,
   },
+  // 表情总数（Unicode 表情 + 自定义表情）。阈值与 custom-emoji 一致：≥6 个自定义表情会同时命中
+  // 两条规则（合计 0.8 直接处置），这是有意的语义收紧；普通 Unicode 表情墙在规则层此前完全隐形。
+  {
+    id: 'default-emoji-flood',
+    kind: 'emoji-count',
+    pattern: '6',
+    score: 0.4,
+    actionHint: 'delete',
+    enabled: true,
+  },
+  // 经内联机器人发送（`via_bot` 存在）。inline bot 广告的正文通常是一屏表情或按钮，
+  // 按钮 URL 不落正文、规则看不见；via-bot 信号与表情计数叠加后覆盖这条路径。
+  // pattern 不使用，按约定留空串。单条命中 0.4，普通 @gif 使用落在灰色地带交复核判。
+  {
+    id: 'default-inline-bot',
+    kind: 'via-bot',
+    pattern: '',
+    score: 0.4,
+    actionHint: 'delete',
+    enabled: true,
+  },
   // 私有邀请链接比通用 t.me 域名（default-link-telegram）强得多：两条规则叠加命中 0.8 直接处置；
   // 该规则自身只贡献 0.4，单独命中（链接特征缺失时）仍落在灰色地带。
   {

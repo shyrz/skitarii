@@ -118,6 +118,8 @@ function createMessageEventRepo(db: Db): MessageEventRepo {
           mediaType: event.features.mediaType,
           length: event.features.length,
           customEmojiCount: event.features.customEmojiCount,
+          emojiCount: event.features.emojiCount,
+          viaBot: event.features.viaBot,
           createdAt: event.createdAt,
         })
         .onConflictDoNothing({ target: messageEvents.id })

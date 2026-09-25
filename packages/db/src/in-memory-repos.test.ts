@@ -77,7 +77,7 @@ async function seedSample(
     userId: targetUser,
     messageId: 1,
     contentHash: options.contentHash,
-    features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0 },
+    features: { hasLink: false, mediaType: 'text', length: 4, customEmojiCount: 0, emojiCount: 0, viaBot: false },
     createdAt: options.resolvedAt,
   })
   await store.repos.decisions.insert({
