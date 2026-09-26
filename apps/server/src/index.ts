@@ -69,6 +69,7 @@ const runtime = createBotRuntime({
   miniAppUrl: env.MINI_APP_URL,
   ownerUserId,
   ownerFeed: env.OWNER_DEBUG_NOTIFY,
+  appealSampleWriteback: env.APPEAL_SAMPLE_WRITEBACK,
   logger,
 })
 const bot = runtime.bot

@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'vitest'
 import { deriveDecisionId, deriveEventId, sha256Hex } from './ids.js'
-import { createTokenBucket } from './token-bucket.js'
 import { asChatId } from '@skitarii/core'
 
 describe('确定性 id', () => {
@@ -37,38 +36,5 @@ describe('确定性 id', () => {
 
   test('内容哈希是原文的 sha256（归一化不会改变缓存键的含义）', () => {
     expect(sha256Hex('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
-  })
-})
-
-describe('出站令牌桶', () => {
-  test('容量用尽后拒绝发送，按时间补充后恢复', () => {
-    let nowMs = 0
-    const bucket = createTokenBucket({ capacity: 3, refillPerMinute: 20, now: () => nowMs })
-
-    expect(bucket.tryTake('chat-1')).toBe(true)
-    expect(bucket.tryTake('chat-1')).toBe(true)
-    expect(bucket.tryTake('chat-1')).toBe(true)
-    expect(bucket.tryTake('chat-1')).toBe(false)
-
-    // 20 条/分钟 = 3 秒一条。
-    nowMs += 3_000
-    expect(bucket.tryTake('chat-1')).toBe(true)
-    expect(bucket.tryTake('chat-1')).toBe(false)
-  })
-
-  test('每个群一个桶，互不消耗', () => {
-    const bucket = createTokenBucket({ capacity: 1, refillPerMinute: 20, now: () => 0 })
-
-    expect(bucket.tryTake('chat-1')).toBe(true)
-    expect(bucket.tryTake('chat-1')).toBe(false)
-    expect(bucket.tryTake('chat-2')).toBe(true)
-  })
-
-  test('空闲不会把令牌堆过容量上限', () => {
-    let nowMs = 0
-    const bucket = createTokenBucket({ capacity: 2, refillPerMinute: 20, now: () => nowMs })
-
-    nowMs += 600_000
-    expect(bucket.tokensLeft('chat-1')).toBe(2)
   })
 })

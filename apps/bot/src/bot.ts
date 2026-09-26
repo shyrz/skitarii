@@ -21,7 +21,6 @@ import { createLogger, type Logger } from './logger.js'
 import { createOwnerFailureNotifier, createOwnerFeed } from './owner-feed.js'
 import { handleIncomingMessage, type PipelineDeps } from './pipeline.js'
 import { createSubscriptionMemberRecorder } from './subscription-members.js'
-import { createTokenBucket } from './token-bucket.js'
 
 /**
  * bot 组装。
@@ -110,6 +109,11 @@ export interface CreateBotOptions {
    * 显式传 `false` 关闭（对应 `OWNER_DEBUG_NOTIFY=false`）。
    */
   ownerFeed?: boolean
+  /**
+   * 误伤样本回写开关（开发中功能，默认关闭）。对应 `APPEAL_SAMPLE_WRITEBACK=true`：
+   * 关闭时管线不读误伤样本，内容白名单与 few-shot 样例都不生效。
+   */
+  appealSampleWriteback?: boolean
   logger?: Logger
   /** 时间源，默认系统时间。 */
   now?: (() => Date) | undefined
@@ -121,7 +125,7 @@ export interface CreateBotOptions {
 export interface BotRuntime {
   bot: Bot
   /**
-   * 未执行决策的补偿扫描。与 bot 共用同一个 `ActionExecutor`（幂等闸门、限流桶），
+   * 未执行决策的补偿扫描。与 bot 共用同一个 `ActionExecutor`（幂等闸门），
    * 由 apps/server 的调度器在维护任务里调用。
    */
   retryDecisions: DecisionRetryService
@@ -154,14 +158,13 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       ? null
       : createCachedJudge({ judge: createOpenAiJudge(options.llm), cache: options.repos.llmCache })
 
-  // 幂等闸门与限流桶只建一份：补偿扫描必须与管线共用它们，否则「本进程已施加动作、回填还没落库」
+  // 幂等闸门只建一份：补偿扫描必须与管线共用它，否则「本进程已施加动作、回填还没落库」
   // 的决策会被再施加一次（二次禁言会把解禁时刻重置）。
   const idempotency = createIdempotencyRegistry()
   const executor = createActionExecutor({
     api: bot.api,
     repos: options.repos,
     idempotency,
-    outbound: createTokenBucket(),
     miniAppUrl: options.miniAppUrl,
     logger,
     now: options.now,
@@ -176,6 +179,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
     executor,
     logger,
     now: options.now,
+    // 误伤样本回写是开发中功能：只有显式开启才读样本，缺省按关闭处理。
+    appealSampleWriteback: options.appealSampleWriteback === true,
     // 判定 feed 默认开启：测试期 owner 要逐条核对判定结果，显式 false 才关闭。
     notifyOwner:
       options.ownerFeed === false

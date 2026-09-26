@@ -8,7 +8,6 @@ import type { Logger } from './logger.js'
 import { MUTE_ALL_PERMISSIONS } from './permissions.js'
 import { callWithRetry } from './telegram-call.js'
 import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-errors.js'
-import type { TokenBucket } from './token-bucket.js'
 
 /**
  * 处置执行。
@@ -18,7 +17,8 @@ import type { TokenBucket } from './token-bucket.js'
  *
  * 执行序：先施加动作，再发通知，最后回填 `executed`。
  * - 动作失败（非终态）时不回填，决策留成「未执行」，重投递或人工补偿还能再试一次。
- * - 通知失败（限流桶空、编辑失败）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
+ * - 通知失败（发送失败或 429 退避耗尽）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
+ *   通知不做人为丢弃：密集时照常尝试发送，由 Telegram 的 429 退避兜底（见 `telegram-call.ts`）。
  * - 通知先私聊当事人，不可达（未 /start、被拉黑）才回退群内；实际落点记录在决策上，供申诉编辑复用。
  * - 动作被 Telegram 终结性拒绝时不发通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
  *   留着不填只会让补偿扫描反复重投递。配置了 `notifyOwnerFailure` 时私聊 owner 一条失败通知。
@@ -46,8 +46,6 @@ export interface ActionExecutorDeps {
   api: Api
   repos: Repos
   idempotency: IdempotencyRegistry
-  /** 处置通知的限流桶：私聊以用户 id 为键、群内以 chat id 为键（见 `sendNotice`）。 */
-  outbound: TokenBucket
   miniAppUrl: string
   logger: Logger
   /** 时间源，默认系统时间。显式允许 `undefined`，让调用方可以直接透传可选配置。 */
@@ -99,7 +97,7 @@ export function idempotencyKeyOf(decision: ModerationDecision): string {
 /**
  * 建立执行器。
  *
- * @param deps api、仓储、幂等闸门、限流桶与日志。
+ * @param deps api、仓储、幂等闸门与日志。
  * @returns 执行器。
  */
 export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
@@ -225,10 +223,8 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
  *
  * 私聊优先的理由：处置结果直接递到当事人手里，群里不再出现一条匿名通知（完全静默）。
  * 私聊不可达（从未 /start 或已拉黑 bot）时回退群内通知，保留现状形态：匿名文案 + 申诉按钮。
- * 其余失败与限流都按「通知可丢」处理：通知是旁路，不能反过来影响动作执行。
- *
- * 限流：两类目标各自过一遍 per-chat 令牌桶（私聊以用户 id 为键）；取不到令牌的那个目标跳过。
- * 私聊被限流时仍会尝试群内兜底，群内能否发出由它自己的桶决定。
+ * 通知不做人为丢弃：密集时直接尝试发送，由 Telegram 的 429 退避兜底；其余失败（含退避耗尽）
+ * 都按「通知可丢」处理：通知是旁路，不能反过来影响动作执行。
  *
  * 发送成功后记录通知引用（`notice_*` 列），申诉生命周期据此编辑原通知；记录失败只 warn。
  *
@@ -244,12 +240,12 @@ async function sendNotice(
   instant: Date,
 ): Promise<void> {
   const dm = await sendDirectNotice(deps, decision, action, instant)
-  // 只有「不可达」与「私聊被限流」才回退群内；其余私聊失败按通知可丢处理，不发群内。
+  // 只有「私聊不可达」才回退群内；其余私聊失败按通知可丢处理，不发群内。
   if (dm !== 'fallback') return
   await sendGroupNotice(deps, decision, action, instant)
 }
 
-/** 私聊投递结果：成功；回退群内（不可达或限流跳过）；失败（其余错误，通知可丢）。 */
+/** 私聊投递结果：成功；回退群内（不可达）；失败（其余错误，通知可丢）。 */
 type DirectNoticeOutcome = 'sent' | 'fallback' | 'failed'
 
 /**
@@ -268,10 +264,6 @@ async function sendDirectNotice(
   instant: Date,
 ): Promise<DirectNoticeOutcome> {
   const target = String(decision.userId)
-  if (!deps.outbound.tryTake(target)) {
-    deps.logger.warn(`出站限流，跳过当事人私聊通知 userId=${decision.userId} decisionId=${decision.id}`)
-    return 'fallback'
-  }
 
   try {
     const message = await callWithRetry(
@@ -307,11 +299,6 @@ async function sendGroupNotice(
   action: Action,
   instant: Date,
 ): Promise<void> {
-  if (!deps.outbound.tryTake(decision.chatId)) {
-    deps.logger.warn(`出站限流，跳过处置通知 chatId=${decision.chatId} decisionId=${decision.id}`)
-    return
-  }
-
   const text = noticeText(action, instant, 'group')
   try {
     const message = await callWithRetry(

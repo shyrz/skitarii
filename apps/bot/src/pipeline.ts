@@ -35,9 +35,10 @@ import type { Logger } from './logger.js'
  *    （事件判别符的差异只影响事件 id，不影响这里）。
  * 3. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
  *    规则匹配同时看正文与发送者身份（后者只服务 sender-name 规则，不落库）。
- *    「本会被处置」（规则分 ≥ `passThreshold`）时另读一次该群误伤样本：命中内容白名单
- *    （同人 + 同内容 + 30 天内被撤销过）直接放行；灰色地带送审时把最近的非空摘录作为复核样例。
- *    低于阈值的正常消息不查样本（零额外开销），查询失败按「无样本」降级。
+ *    误伤样本回写开启（`appealSampleWriteback`，开发中功能）且「本会被处置」（规则分 ≥ `passThreshold`）
+ *    时另读一次该群误伤样本：命中内容白名单（同人 + 同内容 + 30 天内被撤销过）直接放行；
+ *    灰色地带送审时把最近的非空摘录作为复核样例。开关关闭时完全不读样本（白名单与样例都不生效）；
+ *    开启时低于阈值的正常消息仍不查样本（零额外开销），查询失败按「无样本」降级。
  * 4. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
  *    复核失败只记日志，不追加信号，让 `decide` 走「待复核」的 warn 分支且不计累犯。这是既定口径：
  *    复核不可用时绝不能按 `actionHint` 直接动手，那等价于悄悄把 `llmThreshold` 降到 `passThreshold`。
@@ -129,6 +130,11 @@ export interface PipelineDeps {
   executor: ActionExecutor
   logger: Logger
   /**
+   * 误伤样本回写开关（开发中功能，默认关闭）。关闭时不读误伤样本：
+   * 内容白名单不命中、送审不携带 few-shot 样例（等价于样本为空）；开启后与既有行为一致。
+   */
+  appealSampleWriteback?: boolean
+  /**
    * 判定摘要的接收方（owner 判定 feed）。缺省时不发。实现必须自行吞掉发送失败，
    * 不能让它影响审核链路；见 `owner-feed.ts` 的 `createOwnerFeed`。
    */
@@ -217,8 +223,12 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
   const ruleSignals = matchRules(normalized, message.features, config.rules, identity)
   const ruleScore = scoreOf(ruleSignals)
 
-  // 只对「本会被处置」的消息找误伤样本：低于放行阈值的正常消息不付出这次查询。
-  const samples = ruleScore < config.passThreshold ? [] : await loadOverturnedSamples(deps, message, now)
+  // 样本回写默认关闭：关闭时按无样本处理（不查库、白名单不命中、送审不带样例）。
+  // 开启时也只对「本会被处置」的消息找样本：低于放行阈值的正常消息不付出这次查询。
+  const samples =
+    deps.appealSampleWriteback !== true || ruleScore < config.passThreshold
+      ? []
+      : await loadOverturnedSamples(deps, message, now)
 
   // 内容白名单命中就直接放行：跳过复核与 `decide` 的累犯升档，但事件与决策照常落库（事后可回看）。
   const whitelisted = isWhitelisted(samples, message, contentHash, now)

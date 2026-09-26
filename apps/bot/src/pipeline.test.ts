@@ -11,7 +11,6 @@ import { createInMemoryRepos, type ChatMetadataPatch, type InMemoryRepos } from 
 import type { Logger } from './logger.js'
 import { handleIncomingMessage, type CommentThread, type DecisionObservation } from './pipeline.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
-import { createTokenBucket } from './token-bucket.js'
 
 const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} }
 
@@ -85,7 +84,6 @@ function setup(options: { judge?: JudgeStub; cacheJudge?: boolean } = {}) {
     api: recording.api,
     repos: store.repos,
     idempotency: createIdempotencyRegistry(),
-    outbound: createTokenBucket(),
     miniAppUrl: 'https://mini.example.com/app',
     logger: silentLogger,
     now: fixedNow,
@@ -776,7 +774,7 @@ describe('误伤样本回写', () => {
     })
 
     await handleIncomingMessage(
-      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 200 }),
     )
 
@@ -806,7 +804,7 @@ describe('误伤样本回写', () => {
     })
 
     await handleIncomingMessage(
-      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 201 }),
     )
 
@@ -826,7 +824,7 @@ describe('误伤样本回写', () => {
     })
 
     await handleIncomingMessage(
-      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 202 }),
     )
 
@@ -856,12 +854,48 @@ describe('误伤样本回写', () => {
     }
 
     await handleIncomingMessage(
-      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 203 }),
     )
 
     expect(judgeStub.calls).toHaveLength(1)
     expect(judgeStub.calls[0]?.examples).toEqual(['样例6', '样例5', '样例4', '样例3', '样例2'])
+  })
+
+  test('开关关闭（默认）：不查样本、送审不带样例、内容白名单不生效', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    // 预置一条本可命中内容白名单、且带摘录的样本；开关关闭时它必须被完全忽略。
+    await seedOverturnedSample(store, {
+      id: 'sample-off',
+      text: '加v推荐一个渠道',
+      resolvedAt: new Date('2026-09-22T10:00:00Z'),
+      sampleText: '此前的误伤摘录',
+    })
+    let sampleQueries = 0
+    const repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        listOverturnedSamples: async () => {
+          sampleQueries += 1
+          return []
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '加v推荐一个渠道', messageId: 211 }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 211)))
+    // 不查库：读取次数为零，送审材料里也没有样例（指纹与「无样本」一致）。
+    expect(sampleQueries).toBe(0)
+    expect(judgeStub.calls).toHaveLength(1)
+    expect(judgeStub.calls[0]?.examples).toBeUndefined()
+    // 内容白名单不生效：同人同内容也回到常规路径（复核确认违规 → delete），不直接放行。
+    expect(decision?.action).toEqual({ kind: 'delete' })
   })
 
   test('样本查询失败降级为无样本，判定照常（warn）', async () => {
@@ -886,7 +920,7 @@ describe('误伤样本回写', () => {
     }
 
     await handleIncomingMessage(
-      { repos, judge, executor, logger, now: fixedNow },
+      { repos, judge, executor, logger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 204 }),
     )
 
@@ -912,7 +946,7 @@ describe('误伤样本回写', () => {
     }
 
     await handleIncomingMessage(
-      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '这个键盘手感不错', messageId: 205 }),
     )
 
@@ -936,7 +970,7 @@ describe('误伤样本回写', () => {
     }
 
     await handleIncomingMessage(
-      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 206 }),
     )
 
@@ -958,7 +992,7 @@ describe('误伤样本回写', () => {
     })
 
     await handleIncomingMessage(
-      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
       incoming({ text: '加v推荐一个渠道', messageId: 207 }),
     )
 
@@ -1005,6 +1039,7 @@ describe('误伤样本回写', () => {
         executor,
         logger,
         now: fixedNow,
+        appealSampleWriteback: true,
         notifyOwner: async (observation) => {
           observations.push(observation)
         },
@@ -1045,6 +1080,7 @@ describe('误伤样本回写', () => {
         executor,
         logger: silentLogger,
         now: fixedNow,
+        appealSampleWriteback: true,
         notifyOwner: async (observation) => {
           observations.push(observation)
         },
@@ -1077,6 +1113,7 @@ describe('误伤样本回写', () => {
         executor,
         logger: silentLogger,
         now: fixedNow,
+        appealSampleWriteback: true,
         notifyOwner: async (observation) => {
           observations.push(observation)
         },
@@ -1129,7 +1166,6 @@ async function withPipeline(
     api: parts.recording.api,
     repos: parts.store.repos,
     idempotency: createIdempotencyRegistry(),
-    outbound: createTokenBucket(),
     miniAppUrl: 'https://mini.example.com/app',
     logger: silentLogger,
     now: fixedNow,

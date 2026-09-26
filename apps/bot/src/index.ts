@@ -34,6 +34,7 @@ const bot = createBot({
   miniAppUrl: env.MINI_APP_URL,
   ownerUserId: asUserId(env.OWNER_USER_ID),
   ownerFeed: env.OWNER_DEBUG_NOTIFY,
+  appealSampleWriteback: env.APPEAL_SAMPLE_WRITEBACK,
   logger,
 })
 

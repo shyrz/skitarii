@@ -7,7 +7,6 @@ import { createActionExecutor } from './executor.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import type { Logger } from './logger.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
-import { createTokenBucket } from './token-bucket.js'
 
 /**
  * 补偿扫描的行为测试：卡住的决策按仓库里的 `executed` 与幂等闸门决定是否重试，
@@ -36,7 +35,6 @@ function setup() {
     api: recording.api,
     repos: store.repos,
     idempotency,
-    outbound: createTokenBucket(),
     miniAppUrl: 'https://mini.example.com/app',
     logger: silentLogger,
     now: () => now,
@@ -198,7 +196,6 @@ describe('未执行决策的补偿扫描', () => {
       api: recording.api,
       repos: store.repos,
       idempotency,
-      outbound: createTokenBucket(),
       miniAppUrl: 'https://mini.example.com/app',
       logger: silentLogger,
       now: () => now,

@@ -7,7 +7,6 @@ import { createInMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
 import { retryAfterOf, backoffDelayMs } from './telegram-call.js'
-import { createTokenBucket } from './token-bucket.js'
 
 /** 静默日志，测试里不关心输出。 */
 const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} }
@@ -39,13 +38,12 @@ function decisionFixture(overrides: Partial<ModerationDecision> = {}): Moderatio
 /**
  * 组装执行器与它依赖的替身。
  *
- * @param overrides 覆盖 api 处理器、限流桶容量等。
+ * @param overrides 覆盖 api 处理器与日志等。
  * @returns 执行器、录制 api、内存仓储与依赖观察口。
  */
 function setup(
   overrides: {
     handlers?: Parameters<typeof createRecordingApi>[0]
-    capacity?: number
     logger?: Logger
     notifyOwnerFailure?: (decision: ModerationDecision, description: string) => Promise<void>
   } = {},
@@ -53,13 +51,11 @@ function setup(
   const recording: RecordingApi = createRecordingApi(overrides.handlers ?? {})
   const store = createInMemoryRepos()
   const idempotency = createIdempotencyRegistry()
-  const outbound = createTokenBucket({ capacity: overrides.capacity ?? 3 })
   const sleeps: number[] = []
   const executor = createActionExecutor({
     api: recording.api,
     repos: store.repos,
     idempotency,
-    outbound,
     miniAppUrl: 'https://mini.example.com/app',
     logger: overrides.logger ?? silentLogger,
     now: () => new Date('2026-09-23T10:00:00Z'),
@@ -69,7 +65,7 @@ function setup(
     notifyOwnerFailure: overrides.notifyOwnerFailure,
   })
 
-  return { executor, recording, store, idempotency, outbound, sleeps }
+  return { executor, recording, store, idempotency, sleeps }
 }
 
 describe('处置执行', () => {
@@ -171,25 +167,6 @@ describe('处置执行', () => {
     expect(await store.repos.decisions.findNoticeRef(decision.id)).toBeNull()
   })
 
-  test('私聊限流 → 回退群内；群内也限流 → 两边都跳过', async () => {
-    const limited = setup()
-    // 把当事人私聊桶的令牌耗光，群桶仍是满的。
-    for (let index = 0; index < 3; index += 1) limited.outbound.tryTake(String(userId))
-    const first = decisionFixture()
-    await limited.store.repos.decisions.insert(first)
-    await limited.executor.execute(first, { messageId: 42 })
-
-    expect(limited.recording.lastArgsOf('sendMessage')?.[0]).toBe(chatId)
-
-    const allLimited = setup({ capacity: 0 })
-    const second = decisionFixture()
-    await allLimited.store.repos.decisions.insert(second)
-    await allLimited.executor.execute(second, { messageId: 42 })
-
-    expect(allLimited.recording.countOf('sendMessage')).toBe(0)
-    expect(await allLimited.store.repos.decisions.findNoticeRef(second.id)).toBeNull()
-  })
-
   test('通知引用记录失败只 warn，不影响执行完成', async () => {
     const warnings: string[] = []
     const logger: Logger = {
@@ -213,7 +190,6 @@ describe('处置执行', () => {
       api: createRecordingApi().api,
       repos,
       idempotency: createIdempotencyRegistry(),
-      outbound: createTokenBucket(),
       miniAppUrl: 'https://mini.example.com/app',
       logger,
       now: () => new Date('2026-09-23T10:00:00Z'),
@@ -305,18 +281,6 @@ describe('处置执行', () => {
     await executor.execute(decision, { messageId: 42 })
 
     expect(recording.calls).toHaveLength(0)
-    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
-  })
-
-  test('出站限流时放弃通知但动作照常施加', async () => {
-    const { executor, recording, store } = setup({ capacity: 0 })
-    const decision = decisionFixture()
-    await store.repos.decisions.insert(decision)
-
-    await executor.execute(decision, { messageId: 42 })
-
-    expect(recording.countOf('deleteMessage')).toBe(1)
-    expect(recording.countOf('sendMessage')).toBe(0)
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
   })
 

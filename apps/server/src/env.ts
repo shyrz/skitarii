@@ -32,6 +32,14 @@ const serverEnvSchema = z.object({
    * 只接受 'true' / 'false'，其他取值在启动阶段报错。
    */
   OWNER_DEBUG_NOTIFY: z.enum(['true', 'false']).optional().transform((value) => value !== 'false'),
+  /**
+   * 误伤样本回写开关（开发中功能，默认关闭）。只接受 'true' / 'false'；
+   * 未设置与 'false' 都关闭，`'true'` 才启用。
+   */
+  APPEAL_SAMPLE_WRITEBACK: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((value) => value === 'true'),
   LLM_BASE_URL: z.string().min(1).optional(),
   LLM_API_KEY: z.string().min(1).optional(),
   LLM_MODEL: z.string().min(1).optional(),

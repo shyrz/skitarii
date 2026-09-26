@@ -34,3 +34,18 @@ describe('OWNER_DEBUG_NOTIFY 解析', () => {
     expect(() => parseServerEnv({ ...requiredEnv, OWNER_DEBUG_NOTIFY: 'no' })).toThrow(/OWNER_DEBUG_NOTIFY/)
   })
 })
+
+describe('APPEAL_SAMPLE_WRITEBACK 解析', () => {
+  test('未设置默认关闭', () => {
+    expect(parseServerEnv(requiredEnv).APPEAL_SAMPLE_WRITEBACK).toBe(false)
+  })
+
+  test('true 才启用，false 关闭', () => {
+    expect(parseServerEnv({ ...requiredEnv, APPEAL_SAMPLE_WRITEBACK: 'true' }).APPEAL_SAMPLE_WRITEBACK).toBe(true)
+    expect(parseServerEnv({ ...requiredEnv, APPEAL_SAMPLE_WRITEBACK: 'false' }).APPEAL_SAMPLE_WRITEBACK).toBe(false)
+  })
+
+  test('其他取值报错', () => {
+    expect(() => parseServerEnv({ ...requiredEnv, APPEAL_SAMPLE_WRITEBACK: 'yes' })).toThrow(/APPEAL_SAMPLE_WRITEBACK/)
+  })
+})
