@@ -30,27 +30,29 @@ export function isUnpunishableTarget(error: unknown): error is GrammyError {
 }
 
 /**
- * 「bot 无法主动私聊该用户」的描述片段。
+ * 「bot 无法主动私聊该目标」的描述片段。
  *
- * 两种形态：用户从未与 bot 私聊过（`can't initiate conversation with a user`），
- * 或用户拉黑了 bot（`bot was blocked by the user`）。这是平台规则，重试不会改变结果。
+ * 三种形态：用户从未与 bot 私聊过（403 `can't initiate conversation with a user`）、
+ * 用户拉黑了 bot（403 `bot was blocked by the user`）、目标不是可私聊的用户
+ * （400 `chat not found`：对另一个 bot 或已注销账号发私聊必然失败）。都是平台规则，
+ * 重试不会改变结果。
  */
-const PRIVATE_CHAT_UNREACHABLE_PATTERN = /can't initiate conversation with a user|bot was blocked by the user/iu
+const PRIVATE_CHAT_UNREACHABLE_PATTERN = /can't initiate conversation with a user|bot was blocked by the user|chat not found/iu
 
 /**
  * 判断 Telegram 的拒绝是不是「私聊不可达」。
  *
  * 用途：处置通知先走私聊，不可达时回退群内通知（见 executor 的 `sendNotice`）。
- * 只认 403：这两类拒绝固定是 Forbidden；400 的 `chat not found` 一类属于别的故障，
- * 按「通知可丢」处理，不回退群内，避免把无效目标当成可达性判断。
+ * 错误码只认 403 与 400：前两种形态固定是 Forbidden；`chat not found` 是 Bad Request。
+ * 其余错误码属于别的故障，按「通知可丢」处理，不回退群内，避免把无效目标当成可达性判断。
  *
  * @param error 捕获到的异常。
- * @returns 是 GrammyError、`error_code` 为 403 且描述命中时为 `true`（此时 `error` 一定是 GrammyError）。
+ * @returns 是 GrammyError、`error_code` 为 403 或 400 且描述命中时为 `true`（此时 `error` 一定是 GrammyError）。
  */
 export function isPrivateChatUnreachable(error: unknown): error is GrammyError {
   return (
     error instanceof GrammyError &&
-    error.error_code === 403 &&
+    (error.error_code === 403 || error.error_code === 400) &&
     PRIVATE_CHAT_UNREACHABLE_PATTERN.test(error.description)
   )
 }

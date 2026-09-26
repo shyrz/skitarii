@@ -4,6 +4,7 @@ import type { Bot } from 'grammy'
 import type { Update, User } from 'grammy/types'
 import { describe, expect, test } from 'vitest'
 import { createBotRuntime, TELEGRAM_ALLOWED_UPDATES } from './bot.js'
+import { deriveDecisionId, deriveEventId } from './ids.js'
 import type { Logger } from './logger.js'
 
 /**
@@ -183,19 +184,32 @@ function groupMessageUpdate(
   } as Update
 }
 
-/** 预置一份群配置。 */
+/**
+ * 预置一份群配置。
+ *
+ * `whitelist` 默认空；预置 `linkedChatId` 可以跳过元数据探测的 `getChat`，让测试能断言整个调用集合。
+ *
+ * @param store 内存仓储。
+ * @param options 群标识、标题、规则 pattern 与可选的白名单、linked 关系。
+ */
 async function seedChat(
   store: InMemoryRepos,
-  options: { chatId: ReturnType<typeof asChatId>; title: string; pattern: string },
+  options: {
+    chatId: ReturnType<typeof asChatId>
+    title: string
+    pattern: string
+    whitelist?: ReturnType<typeof asUserId>[]
+    linkedChatId?: ReturnType<typeof asChatId> | null
+  },
 ): Promise<void> {
   await store.repos.chats.upsert({
     chatId: options.chatId,
     title: options.title,
     chatType: 'supergroup',
-    linkedChatId: null,
+    linkedChatId: options.linkedChatId ?? null,
     language: 'zh',
     rules: [{ id: 'r-delete', kind: 'keyword', pattern: options.pattern, score: 0.9, actionHint: 'delete', enabled: true }],
-    whitelist: [],
+    whitelist: options.whitelist ?? [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,
@@ -456,5 +470,107 @@ describe('频道与 linked discussion（bot 接线）', () => {
     await harness.bot.handleUpdate(channelPostUpdate(9, '频道贴'))
 
     expect(harness.logs.filter((message) => message.includes('处理更新失败'))).toEqual([])
+  })
+})
+
+describe('入口发送者过滤（bot 接线）', () => {
+  /** 邻居 bot：`is_bot` 为真且 id 与本 bot（42）不同。 */
+  const neighborBotUser: User = { id: 7_000_000_003, is_bot: true, first_name: '邻居 bot', username: 'neighbor_bot' }
+
+  test('其他 bot 的消息进入审核并处置（依赖 Bot-to-Bot Communication Mode）', async () => {
+    const harness = setup()
+    await seedChat(harness.store, {
+      chatId: asChatId(String(DISCUSSION_ID)),
+      title: '测试讨论组',
+      pattern: '加微信',
+    })
+
+    await harness.bot.handleUpdate(
+      groupMessageUpdate(20, {
+        chatId: DISCUSSION_ID,
+        chatTitle: '测试讨论组',
+        messageId: 300,
+        text: '加微信 邻居 bot 的广告',
+        from: neighborBotUser,
+      }),
+    )
+
+    expect(harness.eventInserts()).toBe(1)
+    expect(harness.calls.filter((call) => call.method === 'deleteMessage')).toHaveLength(1)
+  })
+
+  test('自身消息被跳过：不落事件、无任何 API 调用，避免自触发', async () => {
+    const harness = setup()
+    await seedChat(harness.store, {
+      chatId: asChatId(String(DISCUSSION_ID)),
+      title: '测试讨论组',
+      pattern: '加微信',
+      // 预置已关联的群：元数据探测不会发出 getChat，整个调用集合才能干净地断言为空。
+      linkedChatId: asChatId(String(CHANNEL_ID)),
+    })
+
+    await harness.bot.handleUpdate(
+      groupMessageUpdate(21, {
+        chatId: DISCUSSION_ID,
+        chatTitle: '测试讨论组',
+        messageId: 301,
+        text: '加微信 自己发的公告',
+        from: botUser,
+      }),
+    )
+
+    expect(harness.eventInserts()).toBe(0)
+    expect(harness.calls).toEqual([])
+  })
+
+  test('信任名单豁免 bot id：名单内的邻居 bot 消息直接放行，无任何处置调用', async () => {
+    const harness = setup()
+    const discussionId = asChatId(String(DISCUSSION_ID))
+    await seedChat(harness.store, {
+      chatId: discussionId,
+      title: '测试讨论组',
+      pattern: '加微信',
+      whitelist: [asUserId(neighborBotUser.id)],
+      linkedChatId: asChatId(String(CHANNEL_ID)),
+    })
+
+    await harness.bot.handleUpdate(
+      groupMessageUpdate(23, {
+        chatId: DISCUSSION_ID,
+        chatTitle: '测试讨论组',
+        messageId: 303,
+        text: '加微信 友方 bot 的公告',
+        from: neighborBotUser,
+      }),
+    )
+
+    const eventId = deriveEventId(discussionId, 303)
+    const decision = await harness.store.repos.decisions.findById(deriveDecisionId(eventId))
+    // 快速通道：落事件与 pass 决策留痕，但不跑规则、不调 Telegram。
+    expect(decision).toMatchObject({ action: { kind: 'pass' }, score: 0, signals: [] })
+    expect(harness.eventInserts()).toBe(1)
+    expect(harness.calls).toEqual([])
+  })
+
+  test('人类消息行为不变：同一文案照常进入审核并处置', async () => {
+    const harness = setup()
+    await seedChat(harness.store, {
+      chatId: asChatId(String(DISCUSSION_ID)),
+      title: '测试讨论组',
+      pattern: '加微信',
+    })
+
+    await harness.bot.handleUpdate(
+      groupMessageUpdate(22, {
+        chatId: DISCUSSION_ID,
+        chatTitle: '测试讨论组',
+        messageId: 302,
+        text: '加微信 人类广告',
+        from: memberUser,
+      }),
+    )
+
+    expect(harness.eventInserts()).toBe(1)
+    expect(harness.calls.filter((call) => call.method === 'deleteMessage')).toHaveLength(1)
   })
 })

@@ -1,8 +1,8 @@
-import { asChatId, matchRules } from '@skitarii/core'
-import type { Message, MessageEntity, User } from 'grammy/types'
+import { asChatId, matchRules, normalize } from '@skitarii/core'
+import type { InlineKeyboardMarkup, Message, MessageEntity, User } from 'grammy/types'
 import { describe, expect, test } from 'vitest'
 import { defaultChatConfig } from './defaults.js'
-import { extractFeatures, extractSenderIdentity } from './features.js'
+import { composeAnalysisText, extractFeatures, extractSenderIdentity } from './features.js'
 
 /** 发送者构造器：只写与用例相关的字段，其余取固定默认值。 */
 function userWith(overrides: Partial<User>): User {
@@ -22,6 +22,11 @@ function messageWith(overrides: Partial<Message>): Message {
 /** 自定义表情实体。`length` 按 UTF-16 单元计（表情占位符为 2），默认单个字符。 */
 function customEmoji(offset: number, length = 1): MessageEntity {
   return { type: 'custom_emoji', offset, length, custom_emoji_id: 'ce-1' }
+}
+
+/** 内联键盘构造器：每个参数是一行按钮的文本。按钮必须恰好带一种行为字段，统一给 `callback_data`。 */
+function inlineKeyboard(...rows: string[][]): InlineKeyboardMarkup {
+  return { inline_keyboard: rows.map((row) => row.map((text) => ({ text, callback_data: 'cb' }))) }
 }
 
 describe('发送者身份提取', () => {
@@ -142,5 +147,119 @@ describe('via-bot 特征', () => {
     expect(extractFeatures(messageWith({}), '你好').viaBot).toBe(false)
     // `from` 是机器人不等于 via_bot：这走的是 bot 自己的消息，不是经内联机器人转发。
     expect(extractFeatures(messageWith({ from: userWith({ is_bot: true }) }), '你好').viaBot).toBe(false)
+  })
+})
+
+describe('分析文本组合（按钮文本）', () => {
+  test('无按钮时原样返回正文', () => {
+    expect(composeAnalysisText(messageWith({}), '这个键盘手感不错')).toBe('这个键盘手感不错')
+  })
+
+  test('按钮标签 trim 后逐行以 (btn) 前缀拼接在正文之后', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['  加微信  ', '点我'], ['频道']) })
+    expect(composeAnalysisText(message, '今天上新')).toBe('今天上新\n(btn)加微信\n(btn)点我\n(btn)频道')
+  })
+
+  test('空标签与纯空白标签被跳过，全空时原样返回', () => {
+    const mixed = messageWith({ reply_markup: inlineKeyboard(['', '   ', '加微信']) })
+    expect(composeAnalysisText(mixed, '正文')).toBe('正文\n(btn)加微信')
+
+    const blank = messageWith({ reply_markup: inlineKeyboard(['', ''], [' ']) })
+    expect(composeAnalysisText(blank, '正文')).toBe('正文')
+  })
+
+  test('无正文时直接以 (btn) 行开头，不带前导换行', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['加微信', '点我']) })
+    expect(composeAnalysisText(message, '')).toBe('(btn)加微信\n(btn)点我')
+  })
+
+  test('空 inline_keyboard 视作无按钮', () => {
+    const message = messageWith({ reply_markup: { inline_keyboard: [] } })
+    expect(composeAnalysisText(message, '正文')).toBe('正文')
+  })
+
+  test('最多取前 10 个标签', () => {
+    const labels = Array.from({ length: 12 }, (_, index) => `按钮${index + 1}`)
+    const message = messageWith({ reply_markup: inlineKeyboard(labels) })
+    const lines = composeAnalysisText(message, '正文').split('\n')
+
+    expect(lines[0]).toBe('正文')
+    expect(lines.slice(1)).toEqual(labels.slice(0, 10).map((label) => `(btn)${label}`))
+  })
+
+  test('单个标签截断到 64 个 Unicode 码点，不拆散代理对', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['😀'.repeat(70)]) })
+    const label = composeAnalysisText(message, '正文').split('\n')[1] ?? ''
+
+    // 前缀之外仍是完整表情：按码点截断，不是半个代理对拼出的替换字符。
+    expect(label).toBe(`(btn)${'😀'.repeat(64)}`)
+  })
+
+  test('非内联键盘（回复键盘 / 强制回复）不受影响', () => {
+    // Telegram 的 `Message.reply_markup` 类型只有内联键盘，这里模拟协议退化形态做防御性验证。
+    const replyKeyboard = messageWith({
+      reply_markup: { keyboard: [[{ text: '加微信' }]], resize_keyboard: true } as unknown as InlineKeyboardMarkup,
+    })
+    expect(composeAnalysisText(replyKeyboard, '今天上新')).toBe('今天上新')
+
+    const forceReply = messageWith({ reply_markup: { force_reply: true } as unknown as InlineKeyboardMarkup })
+    expect(composeAnalysisText(forceReply, '今天上新')).toBe('今天上新')
+  })
+
+  test('caption 消息同样组合', () => {
+    // caption 与按钮共存是媒体广告的常见形态；调用方传入的 base 就是 caption。
+    const message = messageWith({ caption: '看图', reply_markup: inlineKeyboard(['加微信']) })
+    expect(composeAnalysisText(message, message.caption ?? '')).toBe('看图\n(btn)加微信')
+  })
+
+  test('无正文只有按钮：mediaType 仍按原始文本判为 other，不被分析文本带偏', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['加微信']) })
+    const text = composeAnalysisText(message, message.text ?? message.caption ?? '')
+
+    expect(text).toBe('(btn)加微信')
+    // 分析文本非空，但消息形态没有正文/caption：不能被误判为 text。
+    expect(extractFeatures(message, text).mediaType).toBe('other')
+    // 对照：有正文的消息照常是 text。
+    expect(extractFeatures(messageWith({ text: '正文' }), '正文').mediaType).toBe('text')
+  })
+})
+
+/** 链路用例共用的 keyword 规则：命中「加微信」即 0.4 分。 */
+const AD_RULE = {
+  id: 'r-ad',
+  kind: 'keyword' as const,
+  pattern: '加微信',
+  score: 0.4,
+  actionHint: 'delete' as const,
+  enabled: true,
+}
+
+describe('分析文本 × 归一化 × 规则匹配（链路）', () => {
+  test('(btn) 标记经归一化原样存活，每行按钮文本仍可分辨', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['加微信', '点我', '领取']) })
+    const normalized = normalize(composeAnalysisText(message, '正文'))
+
+    expect(normalized).toBe('正文 (btn)加微信 (btn)点我 (btn)领取')
+  })
+
+  test('无正文只有按钮：归一化后以 (btn) 开头，标签照常命中 keyword 规则', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['加微信']) })
+    const text = composeAnalysisText(message, '')
+
+    expect(normalize(text)).toBe('(btn)加微信')
+    expect(matchRules(normalize(text), extractFeatures(message, text), [AD_RULE], '')).toEqual([
+      { kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 },
+    ])
+  })
+
+  test('标签边界不被粘连：正文尾「加微」与标签头「信点我」不拼成「加微信」', () => {
+    const message = messageWith({ reply_markup: inlineKeyboard(['信点我']) })
+    const text = composeAnalysisText(message, '加微')
+    const normalized = normalize(text)
+
+    // 旧的全角段标记会被归一化拆掉，两个词拼成「加微信」；(btn) 阻断粘连，跨边界不构成 keyword。
+    expect(normalized).toBe('加微 (btn)信点我')
+    expect(normalized).not.toContain('加微信')
+    expect(matchRules(normalized, extractFeatures(message, text), [AD_RULE], '')).toEqual([])
   })
 })

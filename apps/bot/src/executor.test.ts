@@ -116,14 +116,15 @@ describe('处置执行', () => {
   })
 
   test.each([
-    ["Forbidden: bot can't initiate conversation with a user"],
-    ['Forbidden: bot was blocked by the user'],
-  ])('私聊不可达（%s）→ 回退群内通知', async (description) => {
+    [403, "Forbidden: bot can't initiate conversation with a user"],
+    [403, 'Forbidden: bot was blocked by the user'],
+    [400, 'Bad Request: chat not found'],
+  ])('私聊不可达（%i %s）→ 回退群内通知', async (errorCode, description) => {
     const { executor, recording, store } = setup({
       handlers: {
         sendMessage: (target) => {
           if (target === userId) {
-            throw new GrammyError('failed', { ok: false, error_code: 403, description }, 'sendMessage', {})
+            throw new GrammyError('failed', { ok: false, error_code: errorCode, description }, 'sendMessage', {})
           }
           return { message_id: 9 }
         },
@@ -143,13 +144,43 @@ describe('处置执行', () => {
     expect(await store.repos.decisions.findNoticeRef(decision.id)).toEqual({ chatId, messageId: 9 })
   })
 
+  test('bot 目标私聊必然失败（chat not found）→ 回退群内通知，不再静默丢弃', async () => {
+    const botTarget = asUserId(7_000_000_003)
+    const { executor, recording, store } = setup({
+      handlers: {
+        sendMessage: (target) => {
+          if (target === botTarget) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 400, description: 'Bad Request: chat not found' },
+              'sendMessage',
+              {},
+            )
+          }
+          return { message_id: 9 }
+        },
+      },
+    })
+    const decision = decisionFixture({ userId: botTarget })
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    // 对 bot 的私聊是平台级必然失败：通知要落到群里，处置本身照常完成。
+    const args = recording.lastArgsOf('sendMessage') ?? []
+    expect(args[0]).toBe(chatId)
+    expect(String(args[1])).toBe('🚫 已删除一条违规消息。')
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
+    expect(await store.repos.decisions.findNoticeRef(decision.id)).toEqual({ chatId, messageId: 9 })
+  })
+
   test('私聊其余失败按通知可丢处理，不回退群内', async () => {
     const { executor, recording, store } = setup({
       handlers: {
         sendMessage: () => {
           throw new GrammyError(
             'failed',
-            { ok: false, error_code: 400, description: 'Bad Request: chat not found' },
+            { ok: false, error_code: 400, description: 'Bad Request: message text is empty' },
             'sendMessage',
             {},
           )

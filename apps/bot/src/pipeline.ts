@@ -107,7 +107,7 @@ export interface IncomingMessage {
   chatType: ChatType
   messageId: number
   userId: UserId
-  /** 原文（正文或 caption）。是内容哈希与摘录的唯一来源。 */
+  /** 分析文本：正文/caption + 内联键盘按钮文本，见 `composeAnalysisText`。是内容哈希与摘录的唯一来源。 */
   text: string
   features: MessageFeatures
   /**
@@ -147,7 +147,7 @@ export interface PipelineDeps {
  * 一条判定的摘要数据，供 owner 判定 feed 渲染。
  *
  * 字段一律取读回的权威决策（`stored`）：重投递时本轮重算的档位与分数可能已经变化，
- * feed 说的是库里那条判定。`text` 是消息原文而非归一化文本，也不是落库摘录：
+ * feed 说的是库里那条判定。`text` 是分析文本而非归一化文本，也不是落库摘录：
  * 放行消息不落摘录，但 feed 同样要能看到它。
  */
 export interface DecisionObservation {
@@ -155,7 +155,7 @@ export interface DecisionObservation {
   chatTitle: string
   messageId: number
   userId: UserId
-  /** 消息原文（正文或 caption）。 */
+  /** 分析文本：正文/caption + 内联键盘按钮文本，见 `composeAnalysisText`。 */
   text: string
   /** 判定信号，按产生顺序：规则命中在前、（灰色地带的）复核结论在后。 */
   signals: Signal[]

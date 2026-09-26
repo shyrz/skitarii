@@ -15,7 +15,7 @@ import {
 import { createChatMetadataService } from './chat-metadata.js'
 import { createDecisionRetryService, type DecisionRetryService } from './decision-retry.js'
 import { createActionExecutor } from './executor.js'
-import { contentHashOf, extractFeatures, extractSenderIdentity } from './features.js'
+import { composeAnalysisText, contentHashOf, extractFeatures, extractSenderIdentity } from './features.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createLogger, type Logger } from './logger.js'
 import { createOwnerFailureNotifier, createOwnerFeed } from './owner-feed.js'
@@ -215,7 +215,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
    * 审核一条群消息：过滤、提取、提交管线。新消息与编辑消息共用同一个入口，避免两份过滤逻辑漂移。
    *
    * 只审群与超级群：私聊是命令与申诉通知的通道，频道消息（`channel_post`）不属于本节。
-   * 其他 bot 的消息不审：既避免 bot 互相触发，也避免把审核结果反馈给自动化流程。
+   * 其他 bot 的消息会进入审核（依赖 BotFather 的 Bot-to-Bot Communication Mode），仅跳过自身以避免自触发；
+   * 友方 bot 可用信任名单豁免。官方要求开启该模式的部署自备防循环，本 bot 只做单向审核、不回复也不与其他 bot 对话。
    * 频道自动转发到讨论组的根帖（`is_automatic_forward`）不审：它是频道帖子的镜像，
    * 处置它删不掉原帖，且发送者可能是真实管理员，按普通发言审会误伤（见下）。
    * Telegram 服务账号（777000）的消息不审：那是历史形态的自动转发，与之并列过滤。
@@ -235,10 +236,11 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
     // 放过去会把频道帖子当群内发言处置（误伤管理员、也删不到原帖）。
     if (message.is_automatic_forward === true) return
 
+    // 只跳过自身（`ctx.me` 是 grammY 持有的自身身份），其他 bot 的消息按普通成员语义进入审核。
     const from = ctx.from
     if (
       from === undefined ||
-      from.is_bot ||
+      from.id === ctx.me.id ||
       from.id === TELEGRAM_SERVICE_ACCOUNT_ID ||
       // 以频道/聊天身份发送（sender_chat 存在）的消息不审：匿名管理员会以群身份发言，
       // 按普通用户处置会误罚管理员；自动转发的根帖已在上方单独跳过。
@@ -249,7 +251,9 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       return
     }
 
-    const text = message.text ?? message.caption ?? ''
+    // 分析文本 = 正文/caption + 按钮文本（每行以 `(btn)` 开头）；按钮文本会进入归一化、
+    // 规则匹配、复核提示词、内容哈希、feed 与摘录。广告常把载荷放在按钮上，只看正文会漏判。
+    const text = composeAnalysisText(message, message.text ?? message.caption ?? '')
     // 频道评论：讨论组里的评论通过回复一条「频道帖子转发」挂到原帖下，只有频道用户名 + 帖子 id
     // 拼出的深链才点得进评论上下文（t.me/c 链接在评论区打不开目标）。拿不到频道用户名时退回 null。
     const forwardOrigin = message.reply_to_message?.forward_origin
@@ -281,7 +285,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
 
   bot.on('edited_message', async (ctx) => {
     const message = ctx.editedMessage
-    const text = message.text ?? message.caption ?? ''
+    // 与新消息同一条组合口径：按钮文本一并进入分析文本与 editDate 兜底哈希。
+    const text = composeAnalysisText(message, message.text ?? message.caption ?? '')
     // Telegram 的编辑更新必带 edit_date；若协议退化导致缺失，用内容哈希前 16 位构造稳定数值兜底：
     // 管线随后还会在判别符里拼上内容哈希（`edit:${editDate}:${内容哈希前 16 位}`），两项组合后
     // 同一编辑的重投递仍得到同一事件 id，内容不同的编辑各自成事件。
@@ -351,7 +356,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
  * 建立配置好的 bot 实例。
  *
  * 中间件：
- * - `message`：群与超级群里的每条消息走审核管线。私聊不在范围内；频道自动转发的根帖与无发送者消息只登记元数据。
+ * - `message`：群与超级群里的每条消息走审核管线（其他 bot 的消息同样审核，只跳过自身）。
+ *   私聊不在范围内；频道自动转发的根帖与无发送者消息只登记元数据。
  * - `edited_message`：编辑后的群消息重走同一条管线；每次编辑产生独立事件与决策。
  * - `channel_post`：只登记频道元数据（类型、标题、linked 讨论组），不审帖子、不落帖子内容。
  * - `my_chat_member`：bot 被加入/升为管理员时登记或刷新群/频道元数据；被移出/降权时保留配置。

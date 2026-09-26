@@ -23,14 +23,17 @@ const BARE_HOST = /(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}/u
 /**
  * 提取消息特征。
  *
+ * `mediaType` 是例外：它按消息自带的原始正文/caption 判定，不用传入的分析文本——
+ * 无正文、只有按钮的消息分析文本非空，按分析文本判会把这类消息误标为 `text`。
+ *
  * @param message grammY 的消息对象。
- * @param text 消息文本（正文或 caption）；与 `contentHash` 的输入必须是同一份。
+ * @param text 分析文本（正文/caption + 按钮文本，见 {@link composeAnalysisText}）；与 `contentHash` 的输入必须是同一份。
  * @returns 领域特征。`length` 按 Unicode 码点计（与用户观感一致），空文本为 0。
  */
 export function extractFeatures(message: Message, text: string): MessageFeatures {
   return {
     hasLink: hasLink(message, text),
-    mediaType: mediaTypeOf(message, text),
+    mediaType: mediaTypeOf(message),
     length: Array.from(text).length,
     customEmojiCount: customEmojiCount(message),
     emojiCount: emojiCount(message, text),
@@ -39,13 +42,61 @@ export function extractFeatures(message: Message, text: string): MessageFeatures
 }
 
 /**
- * 内容哈希：原文的 sha256，作 LLM 缓存键与重复消息识别。
+ * 内容哈希：分析文本的 sha256，作 LLM 缓存键与重复消息识别。
  *
- * @param text 消息原文（正文或 caption）。
+ * @param text 分析文本（正文/caption + 按钮文本，见 {@link composeAnalysisText}）。
  * @returns 十六进制摘要。
  */
 export function contentHashOf(text: string): string {
   return sha256Hex(text)
+}
+
+/**
+ * 按钮文本行标记：每个按钮标签独占一行、以此开头。
+ *
+ * 为什么不用 `【按钮】` 之类的全角段标记：`normalize` 会把夹在汉字之间的标点整段删除，
+ * 段标记会被拆词折叠整段吃掉，相邻正文与标签还会粘连；`(btn)` 是 ASCII 括号 + 拉丁字母，
+ * 与两侧汉字组合时不属于「两侧都是方块字」的折叠条件，经归一化原样存活
+ * （分隔换行折叠为空格，标记本身不丢），规则匹配与复核都看得见按钮来源。
+ */
+const BUTTON_LABEL_MARKER = '(btn)'
+
+/** 进入分析文本的按钮上限。键盘可以塞很多行，取前 10 个足以覆盖广告载荷又不让文本无界膨胀。 */
+const MAX_BUTTON_LABELS = 10
+
+/** 单个按钮标签的截断长度（Unicode 码点）：与正文按码点计的口径一致。 */
+const MAX_BUTTON_LABEL_CODE_POINTS = 64
+
+/**
+ * 组合审核分析文本：正文/caption 之后逐行追加内联键盘的按钮文本，每行以 `(btn)` 开头。
+ *
+ * 广告号常把联系方式、引流话术放进按钮（正文只留一句人话），只审正文会漏判；
+ * 组合后的文本进入归一化、规则匹配、复核提示词、内容哈希、feed 与摘录。按钮文本不是正文，
+ * 每行用 `(btn)` 前缀标出来源，便于人与模型区分。只取内联键盘（`inline_keyboard`），
+ * 回复键盘、强制回复等形态是客户端 UI，不携带可审文本，原样返回 base。
+ *
+ * 提取口径：按行展平后 `trim`、跳过空串、最多取前 10 个，单个标签截断到 64 个 Unicode 码点
+ * （按码点切，不拆散代理对）。没有按钮或有效标签为空时原样返回 base——不插入空标记行；
+ * base 为空时不带前导换行，直接以首个 `(btn)` 行开头。
+ *
+ * @param message 消息对象。
+ * @param baseText 正文或 caption；无文本时为 `''`。
+ * @returns 分析文本。
+ */
+export function composeAnalysisText(message: Message, baseText: string): string {
+  const replyMarkup = message.reply_markup
+  if (replyMarkup === undefined || !('inline_keyboard' in replyMarkup)) return baseText
+
+  const labels = replyMarkup.inline_keyboard
+    .flat()
+    .map((button) => button.text.trim())
+    .filter((label) => label.length > 0)
+    .slice(0, MAX_BUTTON_LABELS)
+    .map((label) => Array.from(label).slice(0, MAX_BUTTON_LABEL_CODE_POINTS).join(''))
+  if (labels.length === 0) return baseText
+
+  const markerLines = labels.map((label) => `${BUTTON_LABEL_MARKER}${label}`).join('\n')
+  return baseText.length === 0 ? markerLines : `${baseText}\n${markerLines}`
 }
 
 /**
@@ -67,7 +118,7 @@ export function extractSenderIdentity(from: User): string {
  * 判定是否含链接。
  *
  * @param message 消息对象。
- * @param text 消息文本。
+ * @param text 分析文本（正文/caption + 按钮文本）。
  * @returns 有 URL 实体或文本里出现裸域名时为 `true`。
  */
 function hasLink(message: Message, text: string): boolean {
@@ -111,11 +162,11 @@ const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'graphem
  * 不再重复计入；占位符不是表情（如字母、数字）时该自定义表情在簇计数里没有任何痕迹，
  * 按 `custom_emoji` 实体补计 1。因此 `emojiCount >= customEmojiCount` 恒成立。
  *
- * `text` 由调用方完成 text/caption 合并（传的是与 `contentHash` 相同的 `message.text ?? message.caption`），
+ * `text` 是调用方给出的分析文本（正文/caption + 按钮文本，与 `contentHash` 的输入同一份），
  * 本函数不读 `message.caption`；caption 上的实体从 `caption_entities` 取，与文本侧保持一致。
  *
  * @param message 消息对象。
- * @param text 消息文本（正文或 caption）。
+ * @param text 分析文本（正文/caption + 按钮文本）。
  * @returns 表情总数。
  */
 function emojiCount(message: Message, text: string): number {
@@ -138,13 +189,15 @@ function emojiCount(message: Message, text: string): number {
 /**
  * 判定媒体类型。带 caption 的图片仍算 `photo`：媒体类型描述的是消息形态，不是文本来源。
  *
+ * 用消息自带的原始正文/caption（`message.text ?? message.caption`）而不是传入的分析文本：
+ * 无正文、只有按钮的消息分析文本非空，按分析文本判会被误标为 `text`（形态其实是 `other`）。
+ *
  * @param message 消息对象。
- * @param text 消息文本。
  * @returns 领域媒体类型。
  */
-function mediaTypeOf(message: Message, text: string): MessageFeatures['mediaType'] {
+function mediaTypeOf(message: Message): MessageFeatures['mediaType'] {
   if (message.photo !== undefined) return 'photo'
   if (message.video !== undefined) return 'video'
   if (message.sticker !== undefined) return 'sticker'
-  return text.length > 0 ? 'text' : 'other'
+  return (message.text ?? message.caption ?? '').length > 0 ? 'text' : 'other'
 }

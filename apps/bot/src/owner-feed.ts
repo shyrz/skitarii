@@ -210,7 +210,7 @@ function describeAction(action: Action, now: Date): string {
 /**
  * 渲染内容行的正文：`\s+` 折叠为单空格并 trim，按 Unicode 码点截断到 {@link TEXT_LIMIT}。
  *
- * @param text 消息原文。
+ * @param text 分析文本（正文/caption + 按钮文本）。
  * @returns 摘要文本；无可见内容时为 {@link NO_TEXT}。
  */
 function contentText(text: string): string {
