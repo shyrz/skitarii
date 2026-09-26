@@ -59,7 +59,8 @@ export const appealState = pgEnum('appeal_state', ['open', 'upheld', 'overturned
 export const subscriptionState = pgEnum('subscription_state', ['active', 'expired', 'revoked'])
 
 /**
- * 群配置。`rules` 与阈值拆开存：阈值是查询条件（筛出待审群、做报表），规则集是整块读取的 JSONB。
+ * 群配置。`rules` 与阈值拆开存：阈值是查询条件（筛出待审群、做报表），规则集是整块读取的 JSONB；
+ * 信任名单同为整块读取的 JSONB（`whitelist`），其内容合法性由面板写入边界与读取侧宽松解析共同兜底。
  * 阈值顺序与时长由 CHECK 约束保证，写入方不必重复校验业务不变量。
  *
  * `chat_type` 带 `supergroup` 兼容默认值：迁移前的历史行拿不到真实类型，先按最常见的形态落库，
@@ -78,6 +79,11 @@ export const chats = pgTable(
     language: chatLanguage('language').notNull(),
     /** `Rule[]` 的 JSONB 形态；读取时按 `unknown` 处理，由仓储解析成领域类型。 */
     rules: jsonb('rules').notNull(),
+    /**
+     * 信任名单（数字数组）的 JSONB 形态。读取侧对非法数据回落空数组（见 `mapping.ts`），
+     * 因此这里只保证 NOT NULL，不在 DDL 上限制数组内容。
+     */
+    whitelist: jsonb('whitelist').notNull().default([]),
     passThreshold: real('pass_threshold').notNull(),
     llmThreshold: real('llm_threshold').notNull(),
     muteDurationMinutes: integer('mute_duration_minutes').notNull(),

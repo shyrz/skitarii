@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest'
 import { ZodError } from 'zod'
 import {
   parseChatRules,
+  parseChatWhitelist,
   toAction,
   toAppeal,
   toChatConfig,
@@ -31,6 +32,7 @@ const chatRowFixture: ChatRow = {
   linkedChatId: '-1009999999999',
   language: 'zh',
   rules: [ruleFixture],
+  whitelist: [7_000_000_001, 7_000_000_002],
   passThreshold: 0.35,
   llmThreshold: 0.8,
   muteDurationMinutes: 60,
@@ -120,10 +122,35 @@ describe('JSONB 解析与行映射', () => {
       linkedChatId: '-1009999999999',
       language: 'zh',
       rules: [ruleFixture],
+      whitelist: [7_000_000_001, 7_000_000_002],
       passThreshold: 0.35,
       llmThreshold: 0.8,
       muteDurationMinutes: 60,
     })
+  })
+
+  test('信任名单解析：正安全整数数组保真，顺序不变', () => {
+    expect(parseChatWhitelist([7_000_000_001, 42])).toEqual([7_000_000_001, 42])
+    expect(parseChatWhitelist([])).toEqual([])
+  })
+
+  test.each([
+    ['非数组', 'not-an-array'],
+    ['null', null],
+    ['含小数', [1.5]],
+    ['含负数', [-1]],
+    ['含 0', [0]],
+    ['含字符串', ['42']],
+    ['含超安全整数', [Number.MAX_SAFE_INTEGER + 1]],
+    ['混合合法与非法元素', [7_000_000_001, -1]],
+  ])('信任名单非法数据（%s）整体回落空数组', (_label, value) => {
+    expect(parseChatWhitelist(value)).toEqual([])
+  })
+
+  test('坏白名单不阻断配置映射：回落空数组，其余字段照常', () => {
+    const config = toChatConfig({ ...chatRowFixture, whitelist: 'broken' })
+    expect(config.whitelist).toEqual([])
+    expect(config.rules).toEqual([ruleFixture])
   })
 
   test('linked_chat_id 为空列映射成 null（不是 undefined 或空串）', () => {

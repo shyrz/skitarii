@@ -126,7 +126,7 @@ docker run --rm --env-file .env -p 3000:3000 skitarii
 | `DATABASE_URL` | 是 | Postgres 连接串（postgres.js 格式）；迁移与服务都读它。 |
 | `MINI_APP_URL` | 是 | 申诉按钮的目标地址，形如 `${MINI_APP_URL}?startapp=${decisionId}`。 |
 | `OWNER_USER_ID` | 是 | 申诉负责人（Telegram 数字 id）：新申诉私聊该用户，也只有该用户能维持/撤销。 |
-| `OWNER_DEBUG_NOTIFY` | 否 | owner 判定 feed 开关：每条过审消息（含放行）私聊 owner 一条判定摘要。缺省开启；只接受 `true`/`false`，置 `false` 关闭。 |
+| `OWNER_DEBUG_NOTIFY` | 否 | owner 判定 feed 开关：每条过审消息（含放行；信任名单直放的除外）私聊 owner 一条判定摘要。缺省开启；只接受 `true`/`false`，置 `false` 关闭。 |
 | `PUBLIC_URL` | 否 | 服务对外根地址；非空时启动阶段自动注册 webhook，空串或缺省跳过。 |
 | `PORT` | 否 | HTTP 监听端口，缺省 3000；Zeabur 等平台会注入自己的值。 |
 | `LLM_BASE_URL` | 否 | 云端 LLM 的 OpenAI 兼容服务根地址，不含 `/chat/completions`。 |
@@ -298,11 +298,12 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
   "muteDurationMinutes": 60,
   "rules": [
     { "id": "default-ad-wechat", "kind": "keyword", "pattern": "加微信", "score": 0.4, "actionHint": "delete", "enabled": true }
-  ]
+  ],
+  "whitelist": [7000000001]
 }
 ```
 
-响应就是 `ChatConfig` 本体。`language` 目前只读（切换不在本批范围）；`chatType` / `linkedChatId` 同样是只读登记事实，本批只暴露不改。未知群 `404 {"error":"chat_not_found"}`。
+响应就是 `ChatConfig` 本体。`language` 目前只读（切换不在本批范围）；`chatType` / `linkedChatId` 同样是只读登记事实，本批只暴露不改。`whitelist` 是手工信任名单（名单内账号的消息直接放行，见「关键约定」）。未知群 `404 {"error":"chat_not_found"}`。
 
 #### `PUT /api/panel/chats/:chatId/config`
 
@@ -313,17 +314,18 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
     "passThreshold": 0.3,
     "llmThreshold": 0.8,
     "muteDurationMinutes": 60,
-    "rules": [{ "id": "default-ad-wechat", "kind": "keyword", "pattern": "加微信", "score": 0.4, "actionHint": "delete", "enabled": true }]
+    "rules": [{ "id": "default-ad-wechat", "kind": "keyword", "pattern": "加微信", "score": 0.4, "actionHint": "delete", "enabled": true }],
+    "whitelist": [7000000001]
   }
 }
 ```
 
-全量替换规则与阈值，保留 `title` / `chatType` / `linkedChatId` / `language`；保存后管线立即读到新配置。`rules` 里的 `id` 可省略或为空串，服务端分配 `custom-<8位十六进制>` 并随响应返回。面板保存与 bot 的元数据刷新走不同语句（前者全量、后者只清单列），并发时不会互相覆盖：元数据刷新永远不写规则列。
+全量替换规则、信任名单与阈值，保留 `title` / `chatType` / `linkedChatId` / `language`；保存后管线立即读到新配置。`rules` 里的 `id` 可省略或为空串，服务端分配 `custom-<8位十六进制>` 并随响应返回；`whitelist` 的重复项由服务端去重、不报错。面板保存与 bot 的元数据刷新走不同语句（前者全量、后者只清单列），并发时不会互相覆盖：元数据刷新永远不写规则列。
 
 响应包装：GET 直接返回配置本体，PUT 把同一形状包在 `config` 键下，前端解析时不要混用。判定顺序是结构 → 鉴权 → 群存在 → 语义校验：未知群即使配置非法也先返回 `404 chat_not_found`。`details` 最多 50 条，超出时截断并以 `…等 N 条其他错误` 汇总。
 
-- `200 {"config":{...}}`：与 GET 同形（注意外层包了 `config` 键），含服务端分配后的 id
-- `400 {"error":"invalid_request","details":[...]}`：逐条指出第几条规则的哪个字段。校验口径：`0 ≤ passThreshold ≤ llmThreshold ≤ 1`；`muteDurationMinutes` 为 1..43200 的整数；规则至多 100 条、id 不得重复；`kind` 取 `keyword | regex | link-domain | sender-name | custom-emoji | emoji-count | via-bot`；`pattern` 非空（纯空白同样拒绝），`regex` / `sender-name` 需能按 `u` 标志编译，`custom-emoji` / `emoji-count` 需为十进制计数，`via-bot` 不使用 pattern（允许空串）；`score ∈ [0,1]`；`actionHint` 取五个档位；`enabled` 为布尔
+- `200 {"config":{...}}`：与 GET 同形（注意外层包了 `config` 键），含服务端分配后的 id 与去重后的白名单
+- `400 {"error":"invalid_request","details":[...]}`：逐条指出第几条规则的哪个字段。校验口径：`0 ≤ passThreshold ≤ llmThreshold ≤ 1`；`muteDurationMinutes` 为 1..43200 的整数；规则至多 100 条、id 不得重复；`kind` 取 `keyword | regex | link-domain | sender-name | custom-emoji | emoji-count | via-bot`；`pattern` 非空（纯空白同样拒绝），`regex` / `sender-name` 需能按 `u` 标志编译，`custom-emoji` / `emoji-count` 需为十进制计数，`via-bot` 不使用 pattern（允许空串）；`score ∈ [0,1]`；`actionHint` 取五个档位；`enabled` 为布尔；`whitelist` 必须为数组（缺字段同样拒绝）、元素为正安全整数用户 ID、去重后至多 50 条（重复项自动去重，不报错）
 - `401 {"error":"init_data_invalid"}` / `403 {"error":"forbidden"}`
 - `404 {"error":"chat_not_found"}`：群未登记（保存不会隐式创建群配置）
 
@@ -433,7 +435,9 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **双阈值决定要不要花钱。** `passThreshold` 以下直接放行；`llmThreshold` 以上直接按命中的规则处置；只有落在中间的样本才调用 LLM。灰色地带没拿到复核结论时返回 `warn`，不执行破坏性动作。
 
-**规则与阈值可在面板里编辑。** 规则集、双阈值与禁言时长在 Mini App 面板的「规则」页签编辑，保存后立即生效（管线每条消息读配置）。保存边界会挡住坏数据（阈值乱序、坏正则、非法枚举、超量规则等）并逐条指出第几条规则的哪个字段，与 README 既有口径「规则编译失败在保存接口暴露」一致。
+**规则、阈值与信任名单可在面板里编辑。** 规则集、双阈值、禁言时长与信任名单在 Mini App 面板的「规则」页签编辑，保存后立即生效（管线每条消息读配置）。保存边界会挡住坏数据（阈值乱序、坏正则、非法枚举、超量规则、非法白名单等）并逐条指出第几条规则的哪个字段、第几个白名单元素，与 README 既有口径「规则编译失败在保存接口暴露」一致。
+
+**信任名单直接放行。** 每个群/频道一份手工信任名单（上限 50 个账号、服务端去重）：名单内账号的消息在配置载入后直接落一条 `pass` 决策（score 0、signals 空）并返回，不查误伤样本、不跑规则、不调复核、不施加动作；新消息与编辑消息同样适用，事件与决策照常落库供回看。它与内容白名单（误伤样本）互不影响，二者可以同时存在。名单命中不走审核链路，**也不发 owner 判定 feed**——信任名单的语义就是不逐条打扰。
 
 **默认配置只在群/频道首次登记时写入。** 新对话拿到 15 条默认规则（含 `default-emoji-flood`：表情总数 ≥6；`default-inline-bot`：经内联机器人发送，pattern 不使用），此后配置以数据库为准；已登记的群不会自动追加新默认规则，需要时在面板手动添加。频道与讨论组各自登记、各自成套配置，互不套用（详见「频道与讨论组（Phase 3a）」）。表情总数把普通 Unicode 表情也计入（`custom-emoji` 只覆盖付费自定义表情），按用户感知每个表情恰计一次（ZWJ 序列如家庭表情计 1，不再按码位拆开）；两者叠加后有意的语义收紧：≥6 个自定义表情会同时命中 `default-emoji-burst` 与 `default-emoji-flood`（0.8 直接处置）。
 
@@ -482,7 +486,8 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 - 误伤样本回写：复核缓存的判定指纹在 Phase 2c 升到 v2（把样例纳入键），旧指纹的缓存不再命中，等 30 天保留期清理自然消失；内容白名单的自动放行窗口固定 30 天、样本回看窗口 90 天，都不随群配置调整。
 - 频道与讨论组：频道帖只登记元数据（`channel_post` 不审核、不落内容），评论按讨论组自身规则审；订阅链接与成员观测见「频道订阅（Phase 3b）」。旧 `subscriptions` 表保留、未迁移。
 - 日聚合按 UTC 切日：`ChatConfig` 里没有时区字段，跨时区部署的看板边界会有一天偏差，比值类指标不受影响。
-- 规则集、阈值与禁言时长可以在面板里编辑，也可以直接改数据库或走 `ChatRepo.upsert`：两处没有版本协调（单 owner 最后写入胜），并发编辑面板与数据库不会互相提示。
+- 规则集、阈值、禁言时长与信任名单可以在面板里编辑，也可以直接改数据库或走 `ChatRepo.upsert`：两处没有版本协调（单 owner 最后写入胜），并发编辑面板与数据库不会互相提示。
+- 信任名单的读取口径刻意宽松：`chats.whitelist` 不是正安全整数数组时（含混入负数、小数、字符串）读取侧整体回落空数组，坏数据只让名单失效、不阻断判定；上限 50 只在面板写入边界强制，直接写库可以超过，领域类型不承诺该不变量的运行时成立。
 - 单进程假设：幂等闸门与令牌桶都在进程内，多实例部署前需要把它们挪到共享存储。
 - 累犯计数在并发处理下的阈值竞态：`countPriorViolations` 读的是已落库的决策数，同一用户两条消息被并发处理时，两边都可能数到「还差一条」而不加重档位（漏加重）。窗口内累计三次的判定因此是尽力而为，不保证严格；要严格需要给 `(chatId, userId)` 加锁或改成数据库侧的原子计数。
 - 时间源没有贯穿 `decide`：`mute` 的解禁时刻由 `packages/core` 的 `decide` 直接读 `Date.now()` 算出，不经过管线注入的 `now`。正常运行时两者是同一个挂钟，影响只在测试与本地跑批：要用自定义时间源断言 `mute.until` 时得先冻结 `Date`。

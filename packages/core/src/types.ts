@@ -80,6 +80,12 @@ export interface ChatConfig {
   linkedChatId: ChatId | null
   language: 'zh' | 'en'
   rules: Rule[]
+  /**
+   * 手工信任名单：名单内账号的消息直接放行，不跑规则与复核、不施加动作，
+   * 事件与决策仍照常落库（pass）供回看。每个群/频道各自一份，与内容白名单互不影响。
+   * 去重、上限 50 与正安全整数由面板写入边界强制（见 `apps/server/src/panel.ts`）。
+   */
+  whitelist: UserId[]
   /** 分数低于此值直接放行，不进 LLM。 */
   passThreshold: number
   /** 分数达到此值直接按 `actionHint` 处置，不进 LLM；介于两阈值之间才送 LLM 复核。 */

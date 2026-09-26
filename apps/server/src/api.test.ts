@@ -110,6 +110,7 @@ async function seedDecision(store: InMemoryRepos, userId: number = USER_ID): Pro
     linkedChatId: null,
     language: 'zh',
     rules: [],
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,

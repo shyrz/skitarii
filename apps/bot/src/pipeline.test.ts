@@ -31,6 +31,7 @@ const chatConfig: ChatConfig = {
     { id: 'r-ad', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
     { id: 'r-rebate', kind: 'keyword', pattern: '刷单', score: 0.5, actionHint: 'mute', enabled: true },
   ],
+  whitelist: [],
   passThreshold: 0.3,
   llmThreshold: 0.8,
   muteDurationMinutes: 60,
@@ -255,6 +256,8 @@ describe('消息管线', () => {
     expect(registered).not.toBeNull()
     expect(registered?.language).toBe('zh')
     expect(registered?.rules.length).toBeGreaterThan(0)
+    // 信任名单默认空：新群先按规则审。
+    expect(registered?.whitelist).toEqual([])
   })
 
   test('首次登记记录 update 里的聊天类型（basic group 不落成 supergroup 默认值）', async () => {
@@ -962,6 +965,136 @@ describe('误伤样本回写', () => {
     expect(judgeStub.calls).toEqual([])
     const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 207)))
     expect(decision?.action).toEqual({ kind: 'pass' })
+  })
+
+  test('信任名单：名单内账号直接放行，不查样本、不调复核、不执行动作', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert({ ...chatConfig, whitelist: [userId] })
+    // 同内容的误伤样本也在库里：信任名单先于内容白名单判定，不应读它、也不保留规则命中。
+    await seedOverturnedSample(store, {
+      id: 'sample-trusted',
+      text: '加v推荐一个渠道',
+      resolvedAt: new Date('2026-09-22T10:00:00Z'),
+    })
+
+    let sampleQueries = 0
+    const repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        listOverturnedSamples: async () => {
+          sampleQueries += 1
+          return []
+        },
+      },
+    }
+    const infos: string[] = []
+    const logger: Logger = {
+      info: (message: string) => {
+        infos.push(message)
+      },
+      warn: () => {},
+      error: () => {},
+    }
+    const observations: DecisionObservation[] = []
+
+    await handleIncomingMessage(
+      {
+        repos,
+        judge,
+        executor,
+        logger,
+        now: fixedNow,
+        notifyOwner: async (observation) => {
+          observations.push(observation)
+        },
+      },
+      incoming({ text: '加v推荐一个渠道', messageId: 208 }),
+    )
+
+    const eventId = deriveEventId(chatId, 208)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(eventId))
+    // 分数与信号都归零：不经过规则与复核，也不执行任何动作；放行没有待施加的动作，executed 直接置位。
+    expect(decision).toMatchObject({
+      action: { kind: 'pass' },
+      score: 0,
+      signals: [],
+      executed: true,
+    })
+    expect(sampleQueries).toBe(0)
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.calls).toEqual([])
+    // 快速通道直接放行、不经过判定，也就不发 owner 判定 feed。
+    expect(observations).toEqual([])
+    expect(store.sampleOf(eventId)).toBeNull()
+    // info 日志带 decisionId，回看这条快速通道时能对上决策。
+    expect(
+      infos.some((message) => message.includes('信任名单命中') && message.includes(String(decision?.id))),
+    ).toBe(true)
+  })
+
+  test('信任名单：名单外账号不受影响，照常走规则与复核', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert({ ...chatConfig, whitelist: [asUserId(7_000_000_999)] })
+    const observations: DecisionObservation[] = []
+
+    await handleIncomingMessage(
+      {
+        repos: store.repos,
+        judge,
+        executor,
+        logger: silentLogger,
+        now: fixedNow,
+        notifyOwner: async (observation) => {
+          observations.push(observation)
+        },
+      },
+      incoming({ text: '加v推荐一个渠道', messageId: 209 }),
+    )
+
+    expect(judgeStub.calls).toHaveLength(1)
+    // 对照：非白名单路径照常发判定 feed，证明替身接线有效，名单命中用例的「未调用」不是空断言。
+    expect(observations).toHaveLength(1)
+    expect(recording.countOf('deleteMessage')).toBe(1)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 209)))
+    expect(decision?.signals).toEqual([
+      { kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 },
+      { kind: 'llm', verdict: 'spam', confidence: 0.9 },
+    ])
+    expect(decision?.action).toEqual({ kind: 'delete' })
+  })
+
+  test('信任名单：编辑消息同样直接放行（事件判别符不改变快速通道）', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert({ ...chatConfig, whitelist: [userId] })
+    const editDate = 1_758_600_123
+    const observations: DecisionObservation[] = []
+
+    await handleIncomingMessage(
+      {
+        repos: store.repos,
+        judge,
+        executor,
+        logger: silentLogger,
+        now: fixedNow,
+        notifyOwner: async (observation) => {
+          observations.push(observation)
+        },
+      },
+      incoming({ text: '加v推荐一个渠道', messageId: 210, editDate }),
+    )
+
+    const eventId = deriveEventId(
+      chatId,
+      210,
+      `edit:${editDate}:${contentHashOf('加v推荐一个渠道').slice(0, 16)}`,
+    )
+    const decision = await store.repos.decisions.findById(deriveDecisionId(eventId))
+    expect(decision).toMatchObject({ action: { kind: 'pass' }, score: 0, signals: [] })
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.calls).toEqual([])
+    // 编辑消息同样走快速通道：事件判别符不同，但不产生 owner 判定 feed。
+    expect(observations).toEqual([])
   })
 })
 

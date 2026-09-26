@@ -195,6 +195,7 @@ async function seedChat(
     linkedChatId: null,
     language: 'zh',
     rules: [{ id: 'r-delete', kind: 'keyword', pattern: options.pattern, score: 0.9, actionHint: 'delete', enabled: true }],
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,

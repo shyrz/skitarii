@@ -39,6 +39,7 @@ async function seedAppeal(store: InMemoryRepos, action: ModerationDecision['acti
     linkedChatId: null,
     language: 'zh',
     rules: [],
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,

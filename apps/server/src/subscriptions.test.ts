@@ -199,6 +199,7 @@ async function seedChats(store: InMemoryRepos): Promise<void> {
   const base = {
     language: 'zh' as const,
     rules: [],
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,

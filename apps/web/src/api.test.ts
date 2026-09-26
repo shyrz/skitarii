@@ -256,9 +256,10 @@ describe('规则配置客户端', () => {
     rules: [
       { id: 'custom-a1b2c3d4', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
     ],
+    whitelist: [7_000_000_001],
   }
 
-  test('GET：chatId 进路径，解析阈值与规则表', async () => {
+  test('GET：chatId 进路径，解析阈值、规则表与信任名单', async () => {
     const spy = vi.fn(async () => new Response(JSON.stringify(CONFIG), { status: 200 }))
     vi.stubGlobal('fetch', spy)
 
@@ -267,9 +268,10 @@ describe('规则配置客户端', () => {
     expect(String((spy.mock.calls[0] as unknown[])[0])).toBe('/api/panel/chats/-1001/config?initData=init')
     expect(config.rules[0]?.actionHint).toBe('delete')
     expect(config.muteDurationMinutes).toBe(60)
+    expect(config.whitelist).toEqual([7_000_000_001])
   })
 
-  test('PUT：Content-Type 与 body 全字段，返回服务端分配 id 后的完整 config', async () => {
+  test('PUT：Content-Type 与 body 全字段（含 whitelist），返回服务端分配 id 后的完整 config', async () => {
     const spy = vi.fn(async () => new Response(JSON.stringify({ config: CONFIG }), { status: 200 }))
     vi.stubGlobal('fetch', spy)
 
@@ -278,6 +280,7 @@ describe('规则配置客户端', () => {
       llmThreshold: 0.8,
       muteDurationMinutes: 60,
       rules: [{ id: '', kind: 'keyword' as const, pattern: '加微信', score: 0.4, actionHint: 'delete' as const, enabled: true }],
+      whitelist: [7_000_000_001, 7_000_000_002],
     }
     const config = await savePanelConfig('-1001', 'init', input)
 
@@ -285,13 +288,14 @@ describe('规则配置客户端', () => {
     expect(url).toBe('/api/panel/chats/-1001/config')
     expect(init.method).toBe('PUT')
     expect(init.headers).toEqual({ 'Content-Type': 'application/json' })
-    // body 全字段：initData + 完整 config 结构（阈值、禁言时长、整条规则）
+    // body 全字段：initData + 完整 config 结构（阈值、禁言时长、整条规则、信任名单）
     expect(JSON.parse(String(init.body))).toEqual({ initData: 'init', config: input })
     // 响应解析含 chatId/title/language，且空串 id 已被分配为正式 id
     expect(config.chatId).toBe('-1001')
     expect(config.title).toBe('测试群')
     expect(config.language).toBe('zh')
     expect(config.rules[0]?.id).toBe('custom-a1b2c3d4')
+    expect(config.whitelist).toEqual([7_000_000_001])
   })
 
   test('400 且 error=invalid_request 归为 InvalidRequestError，details 完整数组相等（顺序保留）', async () => {
@@ -303,6 +307,7 @@ describe('规则配置客户端', () => {
       llmThreshold: 0.8,
       muteDurationMinutes: 60,
       rules: [],
+      whitelist: [],
     }).catch((e: unknown) => e)
 
     expect(error).toBeInstanceOf(InvalidRequestError)
@@ -313,7 +318,13 @@ describe('规则配置客户端', () => {
     stubFetch(400, { error: 'bad_request' })
 
     await expect(
-      savePanelConfig('-1001', 'i', { passThreshold: 0.3, llmThreshold: 0.8, muteDurationMinutes: 60, rules: [] }),
+      savePanelConfig('-1001', 'i', {
+        passThreshold: 0.3,
+        llmThreshold: 0.8,
+        muteDurationMinutes: 60,
+        rules: [],
+        whitelist: [],
+      }),
     ).rejects.toThrow('HTTP 400')
   })
 
@@ -325,6 +336,7 @@ describe('规则配置客户端', () => {
       llmThreshold: 0.8,
       muteDurationMinutes: 60,
       rules: [],
+      whitelist: [],
     }).catch((e: unknown) => e)
 
     expect(error).toBeInstanceOf(InvalidRequestError)
@@ -332,7 +344,7 @@ describe('规则配置客户端', () => {
   })
 
   test('保存路径的错误归类：404 → NotFoundError，403 → ForbiddenError', async () => {
-    const input = { passThreshold: 0.3, llmThreshold: 0.8, muteDurationMinutes: 60, rules: [] }
+    const input = { passThreshold: 0.3, llmThreshold: 0.8, muteDurationMinutes: 60, rules: [], whitelist: [] }
 
     stubFetch(404)
     await expect(savePanelConfig('-9999', 'i', input)).rejects.toBeInstanceOf(NotFoundError)

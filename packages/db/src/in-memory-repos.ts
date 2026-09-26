@@ -98,10 +98,11 @@ export function createInMemoryRepos(): InMemoryRepos {
       async updateRulesConfig(chatId: ChatId, patch): Promise<void> {
         const stored = chats.get(chatId)
         if (stored === undefined) return
-        // 与 PG 的单列 UPDATE 对齐：只覆盖规则与阈值，元数据与语言保持库里的值。
+        // 与 PG 的单列 UPDATE 对齐：只覆盖规则、白名单与阈值，元数据与语言保持库里的值。
         chats.set(chatId, {
           ...stored,
           rules: patch.rules,
+          whitelist: patch.whitelist,
           passThreshold: patch.passThreshold,
           llmThreshold: patch.llmThreshold,
           muteDurationMinutes: patch.muteDurationMinutes,

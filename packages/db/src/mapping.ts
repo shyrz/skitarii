@@ -13,6 +13,7 @@ import {
   type Subscription,
   type SubscriptionLink,
   type SubscriptionMember,
+  type UserId,
 } from '@skitarii/core'
 import { z } from 'zod'
 import { SAMPLE_TEXT_MAX_LENGTH, type AppealRow, type ChatRow, type DailyAggregateRow, type MessageEventRow, type ModerationDecisionRow, type SubscriptionLinkRow, type SubscriptionMemberRow, type SubscriptionRow } from './schema.js'
@@ -25,7 +26,8 @@ import { SAMPLE_TEXT_MAX_LENGTH, type AppealRow, type ChatRow, type DailyAggrega
  * 由编译器对齐，任何一侧新增取值都会在这里编译失败。
  *
  * 解析失败一律抛错而不是回退默认值：坏数据应当让运维看见（日志里带事件 id 可定位），
- * 而不是让一条解析失败的消息静默按「无规则」放行。
+ * 而不是让一条解析失败的消息静默按「无规则」放行。唯一例外是 `chats.whitelist`：
+ * 它只是放行优化，坏数据失效即可，不能让整条判定链路失败（见 `parseChatWhitelist`）。
  */
 
 /** `Rule[]` 的 JSONB 形状。与领域 `Rule` 的字段一一对应。 */
@@ -39,6 +41,11 @@ const ruleSchema = z.object({
 })
 
 const ruleListSchema = z.array(ruleSchema)
+
+/** `ChatConfig['whitelist']` 的 JSONB 形状：正安全整数的用户 ID 数组。 */
+const whitelistSchema = z.array(
+  z.custom<number>((value) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0),
+)
 
 /** `Signal[]` 的 JSONB 形状。判别字段是 `kind`，与领域联合一一对应。 */
 const signalSchema = z.discriminatedUnion('kind', [
@@ -61,6 +68,20 @@ export function parseChatRules(value: unknown): Rule[] {
 }
 
 /**
+ * 解析 `chats.whitelist`。
+ *
+ * 与 {@link parseChatRules} 的严格口径不同：信任名单是放行优化，坏数据只该让它失效，
+ * 不能阻断判定——读取侧回落空数组，保持既有宽松口径。写入侧（面板）负责校验、去重与上限。
+ *
+ * @param value JSONB 列的原始值（`unknown`）。
+ * @returns 领域白名单；非数字数组（含混入负数、小数、非安全整数）时为空数组。
+ */
+export function parseChatWhitelist(value: unknown): UserId[] {
+  const parsed = whitelistSchema.safeParse(value)
+  return parsed.success ? parsed.data.map((id) => asUserId(id)) : []
+}
+
+/**
  * `chats` 行 → 群配置。
  *
  * @param row 数据库行。
@@ -74,6 +95,7 @@ export function toChatConfig(row: ChatRow): ChatConfig {
     linkedChatId: row.linkedChatId === null ? null : asChatId(row.linkedChatId),
     language: row.language,
     rules: parseChatRules(row.rules),
+    whitelist: parseChatWhitelist(row.whitelist),
     passThreshold: row.passThreshold,
     llmThreshold: row.llmThreshold,
     muteDurationMinutes: row.muteDurationMinutes,

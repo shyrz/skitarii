@@ -9,12 +9,18 @@ import type {
   PanelRuleKind,
 } from '../api.js'
 import { RULE_ACTION_LABEL, RULE_KIND_LABEL } from './util.js'
+import {
+  WHITELIST_EMPTY,
+  WHITELIST_HINT,
+  WHITELIST_RISK,
+  addWhitelistUser,
+} from './whitelist.js'
 
 /**
- * 规则页签：按群编辑阈值、禁言时长与规则集，保存后立即生效（管线每条消息读配置）。
+ * 规则页签：按群编辑阈值、禁言时长、规则集与信任名单，保存后立即生效（管线每条消息读配置）。
  *
  * 编辑全部落在本地草稿上，「保存」才一次性 PUT 全量替换；保存返回后以服务端 config
- * 覆盖本地（拿到分配后的正式 id）。删除规则与结案确认同模式：第一次点只展开确认条。
+ * 覆盖本地（拿到分配后的正式 id、去重后的白名单）。删除规则与结案确认同模式：第一次点只展开确认条。
  */
 
 /** 选项直接取标签表的键，新增匹配方式时只改 util 一处，不会出现「有 kind 没选项」的漂移。 */
@@ -34,6 +40,7 @@ function toDraft(config: PanelConfigDto): PanelConfigInput {
     llmThreshold: config.llmThreshold,
     muteDurationMinutes: config.muteDurationMinutes,
     rules: config.rules,
+    whitelist: config.whitelist,
   }
 }
 
@@ -58,6 +65,9 @@ export function RulesTab({
   const [notice, setNotice] = useState<string | null>(null)
   /** 400 的逐条校验错误，或非校验类保存失败的单行提示。 */
   const [saveErrors, setSaveErrors] = useState<string[]>([])
+  /** 信任名单的输入草稿与就地提示；只影响本地，随下次保存一起提交。 */
+  const [whitelistInput, setWhitelistInput] = useState('')
+  const [whitelistError, setWhitelistError] = useState<string | null>(null)
   const localCounter = useRef(0)
   /** 请求序号：快速换群时旧响应靠它识别并丢弃，不覆盖新群的草稿。 */
   const loadSeq = useRef(0)
@@ -70,6 +80,8 @@ export function RulesTab({
       setSaveErrors([])
       setEditingId(null)
       setConfirmingDelete(null)
+      setWhitelistInput('')
+      setWhitelistError(null)
       try {
         const config = await fetchPanelConfig(id, initData)
         if (seq !== loadSeq.current) return // 期间已换群，丢弃过期响应
@@ -133,6 +145,31 @@ export function RulesTab({
     [mutate],
   )
 
+  /** 追加信任账号：本地校验正整数、去重与上限，失败就地提示、不改草稿。 */
+  const addWhitelist = useCallback(() => {
+    if (draft === null) return
+    const result = addWhitelistUser(draft.whitelist, whitelistInput)
+    if (!result.ok) {
+      setWhitelistError(result.message)
+      return
+    }
+    mutate((current) => ({ ...current, whitelist: result.whitelist }))
+    setWhitelistInput('')
+    setWhitelistError(null)
+  }, [draft, whitelistInput, mutate])
+
+  /** 移除信任账号：只改草稿，仍需「保存」才落库。 */
+  const removeWhitelist = useCallback(
+    (userId: number) => {
+      mutate((current) => ({
+        ...current,
+        whitelist: current.whitelist.filter((id) => id !== userId),
+      }))
+      setWhitelistError(null)
+    },
+    [mutate],
+  )
+
   const onSave = useCallback(async () => {
     if (draft === null || !dirty || saving) return
     setSaving(true)
@@ -154,6 +191,8 @@ export function RulesTab({
       setDirty(false)
       setEditingId(null)
       setConfirmingDelete(null)
+      setWhitelistInput('')
+      setWhitelistError(null)
       setNotice('已保存，立即生效')
     } catch (error) {
       if (error instanceof InvalidRequestError) {
@@ -174,6 +213,8 @@ export function RulesTab({
     setConfirmingDelete(null)
     setSaveErrors([])
     setNotice(null)
+    setWhitelistInput('')
+    setWhitelistError(null)
   }, [saved])
 
   return (
@@ -328,6 +369,61 @@ export function RulesTab({
             <p className="footnote">
               规则按归一化后的形态书写（如「加v」会被归一为「加微信」）。
             </p>
+          </section>
+
+          <section aria-label="信任名单">
+            <h2 className="section-title">信任名单（{draft.whitelist.length}）</h2>
+            <p className="list-sub">{WHITELIST_HINT}</p>
+            {draft.whitelist.length === 0 && <p className="empty-state">{WHITELIST_EMPTY}</p>}
+            {draft.whitelist.map((userId) => (
+              <article className="list-card" key={userId}>
+                <div className="row-between">
+                  <p className="list-title">{userId}</p>
+                  <button
+                    type="button"
+                    className="text-btn danger"
+                    disabled={saving}
+                    onClick={() => removeWhitelist(userId)}
+                  >
+                    移除
+                  </button>
+                </div>
+              </article>
+            ))}
+            <div className="rule-edit-row">
+              <input
+                className="input mono"
+                inputMode="numeric"
+                placeholder="用户 ID"
+                value={whitelistInput}
+                disabled={saving}
+                onChange={(event) => {
+                  setWhitelistInput(event.target.value)
+                  setWhitelistError(null)
+                }}
+                aria-label="要信任的账号用户 ID"
+              />
+              <button
+                type="button"
+                className="btn btn-secondary"
+                disabled={saving}
+                onClick={addWhitelist}
+              >
+                添加
+              </button>
+            </div>
+            {whitelistError !== null && (
+              <p className="form-error" role="alert">
+                {whitelistError}
+              </p>
+            )}
+            <div
+              className="notice-banner"
+              style={{ ['--tone' as string]: 'var(--tone-caution)', marginTop: 12 }}
+            >
+              <span className="notice-dot" aria-hidden="true" />
+              <p style={{ margin: 0 }}>{WHITELIST_RISK}</p>
+            </div>
           </section>
 
           <section aria-label="保存">

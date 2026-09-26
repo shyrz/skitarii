@@ -30,17 +30,20 @@ import type { Logger } from './logger.js'
  *    同一秒内先编辑成正常内容、再改成违规内容时，若两次共用判别符，第二个事件会与第一个碰撞、
  *    被静默去重，违规内容留在群里却不再被处置。代价是编辑回退到早前内容时 id 与早前那次相同、
  *    跳过重审（同一状态已经审过，视为幂等）。
- * 2. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
+ * 2. 手工信任名单先于判定：`config.whitelist` 命中当前用户时直接落一条 pass 决策（score 0、signals 空）
+ *    并返回，不查内容白名单、不跑规则、不调复核、不施加动作；名单外账号不受影响。编辑消息走同一条快速通道
+ *    （事件判别符的差异只影响事件 id，不影响这里）。
+ * 3. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
  *    规则匹配同时看正文与发送者身份（后者只服务 sender-name 规则，不落库）。
  *    「本会被处置」（规则分 ≥ `passThreshold`）时另读一次该群误伤样本：命中内容白名单
  *    （同人 + 同内容 + 30 天内被撤销过）直接放行；灰色地带送审时把最近的非空摘录作为复核样例。
  *    低于阈值的正常消息不查样本（零额外开销），查询失败按「无样本」降级。
- * 3. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
+ * 4. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
  *    复核失败只记日志，不追加信号，让 `decide` 走「待复核」的 warn 分支且不计累犯。这是既定口径：
  *    复核不可用时绝不能按 `actionHint` 直接动手，那等价于悄悄把 `llmThreshold` 降到 `passThreshold`。
- * 4. `decide` 出最终处置，落决策（同样用派生 id，重放不产生第二条）。
- * 5. 非放行处置补写正文摘录（是否补写以库里那条决策为准，不用本轮重算的档位），再交给执行器施加到 Telegram。
- * 6. 若配置了 `notifyOwner`，在施加动作前私聊 owner 一条判定摘要：摘要是「判定」而非「执行结果」，
+ * 5. `decide` 出最终处置，落决策（同样用派生 id，重放不产生第二条）。
+ * 6. 非放行处置补写正文摘录（是否补写以库里那条决策为准，不用本轮重算的档位），再交给执行器施加到 Telegram。
+ * 7. 若配置了 `notifyOwner`，在施加动作前私聊 owner 一条判定摘要：摘要是「判定」而非「执行结果」，
  *    动作被 Telegram 拒绝也不改变它；只在决策尚未执行时发，重投递不会重复通知。
  */
 
@@ -188,6 +191,27 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
   })
 
   const config = await loadConfig(deps, message)
+
+  // 手工信任名单先于其余判定：命中即直接放行，跳过样本查询、规则、复核与执行。
+  // 事件与决策照常落库（pass）供回看；`executed` 直接置位，放行没有待施加的动作，也不该落进补偿扫描。
+  if (config.whitelist.includes(message.userId)) {
+    await deps.repos.decisions.insert({
+      id: decisionId,
+      eventId,
+      chatId: message.chatId,
+      userId: message.userId,
+      action: { kind: 'pass' },
+      score: 0,
+      signals: [],
+      decidedAt: now(),
+      executed: true,
+    })
+    deps.logger.info(
+      `信任名单命中，直接放行 chatId=${message.chatId} userId=${message.userId} messageId=${message.messageId} decisionId=${decisionId}`,
+    )
+    return config
+  }
+
   const normalized = normalize(message.text)
   const identity = normalize(message.senderIdentity)
   const ruleSignals = matchRules(normalized, message.features, config.rules, identity)

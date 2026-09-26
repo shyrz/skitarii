@@ -118,6 +118,8 @@ export function defaultChatConfig(
     language,
     // 复制一份：默认规则是模块级常量，不随调用方的改动漂移。
     rules: DEFAULT_RULES.map((rule) => ({ ...rule })),
+    // 信任名单默认空：新群先按规则审，误伤多了再手工加人。
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: DEFAULT_MUTE_DURATION_MINUTES,

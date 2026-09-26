@@ -197,6 +197,7 @@ describe('内存实现：群登记与元数据刷新', () => {
     linkedChatId: asChatId('-1009999999999'),
     language: 'zh' as const,
     rules: [{ id: 'r-owner', kind: 'keyword' as const, pattern: '广告', score: 0.4, actionHint: 'delete' as const, enabled: true }],
+    whitelist: [asUserId(7_000_000_001)],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,
@@ -252,12 +253,13 @@ describe('内存实现：群登记与元数据刷新', () => {
     expect(await store.repos.chats.findByChatId(chatId)).toBeNull()
   })
 
-  test('updateRulesConfig 只改规则与阈值，元数据与语言原样保留', async () => {
+  test('updateRulesConfig 只改规则、白名单与阈值，元数据与语言原样保留', async () => {
     const store = createInMemoryRepos()
     await store.repos.chats.upsert(config)
 
     await store.repos.chats.updateRulesConfig(chatId, {
       rules: [],
+      whitelist: [asUserId(7_000_000_009)],
       passThreshold: 0.5,
       llmThreshold: 0.9,
       muteDurationMinutes: 120,
@@ -265,6 +267,7 @@ describe('内存实现：群登记与元数据刷新', () => {
 
     const stored = await store.repos.chats.findByChatId(chatId)
     expect(stored?.rules).toEqual([])
+    expect(stored?.whitelist).toEqual([7_000_000_009])
     expect(stored?.passThreshold).toBe(0.5)
     expect(stored?.llmThreshold).toBe(0.9)
     expect(stored?.muteDurationMinutes).toBe(120)

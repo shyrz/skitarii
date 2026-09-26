@@ -29,6 +29,7 @@ async function seedChat(store: InMemoryRepos, chatId: ChatId, title: string): Pr
     linkedChatId: null,
     language: 'zh',
     rules: [],
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,

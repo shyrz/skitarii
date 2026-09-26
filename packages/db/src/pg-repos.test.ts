@@ -65,6 +65,7 @@ const chatConfigFixture: ChatConfig = {
   linkedChatId: asChatId('-1009999999999'),
   language: 'zh',
   rules: [{ id: 'rule-1', kind: 'keyword', pattern: '广告', score: 0.4, actionHint: 'delete', enabled: true }],
+  whitelist: [asUserId(7_000_000_001), asUserId(7_000_000_002)],
   passThreshold: 0.35,
   llmThreshold: 0.8,
   muteDurationMinutes: 60,
@@ -227,25 +228,27 @@ describe('写入语句的形状与参数化', () => {
     const [statement] = recorded
     expect(statement?.query).toContain('insert into "chats"')
     expect(statement?.query).toContain('on conflict ("chat_id") do update set')
-    // 列顺序：chat_id / title / chat_type / linked_chat_id / language / rules / 三个数值列。
+    // 列顺序：chat_id / title / chat_type / linked_chat_id / language / rules / whitelist / 三个数值列。
     const params = statement?.params ?? []
     expect(params.slice(0, 5)).toEqual(['-1001234567890', '测试群', 'supergroup', '-1009999999999', 'zh'])
     // jsonb 列在驱动层序列化成 JSON 字符串后作为单个参数传入。
     expect(JSON.parse(String(params[5]))).toEqual(chatConfigFixture.rules)
-    expect(params.slice(6, 9)).toEqual([0.35, 0.8, 60])
+    expect(JSON.parse(String(params[6]))).toEqual(chatConfigFixture.whitelist)
+    expect(params.slice(7, 10)).toEqual([0.35, 0.8, 60])
     // 冲突更新分支重复一遍配置字段，最后一项是刷新过的 updated_at。
-    expect(params.slice(9, 18)).toEqual([
+    expect(params.slice(10, 20)).toEqual([
       '测试群',
       'supergroup',
       '-1009999999999',
       'zh',
       params[5],
+      params[6],
       0.35,
       0.8,
       60,
-      params[17],
+      params[19],
     ])
-    expect(String(params[17])).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(String(params[19])).toMatch(/^\d{4}-\d{2}-\d{2}T/)
   })
 
   test('首次登记用 on conflict do nothing：已存在的行绝不被默认配置覆盖', async () => {
@@ -322,6 +325,7 @@ describe('读语句', () => {
         '-1009999999999',
         'zh',
         chatConfigFixture.rules,
+        chatConfigFixture.whitelist,
         0.35,
         0.8,
         60,
@@ -851,10 +855,11 @@ describe('订阅链接与成员仓储的 SQL 形状', () => {
     expect(statement?.params).toEqual(['channel', '-1001234567890', 11])
   })
 
-  test('规则/阈值更新只写规则列，绝不碰元数据与语言列', async () => {
+  test('规则/白名单/阈值更新只写配置列，绝不碰元数据与语言列', async () => {
     const { repos, recorded } = createPgReposRecording([])
     await repos.chats.updateRulesConfig(asChatId('-1001234567890'), {
       rules: chatConfigFixture.rules,
+      whitelist: chatConfigFixture.whitelist,
       passThreshold: 0.2,
       llmThreshold: 0.7,
       muteDurationMinutes: 30,
@@ -862,9 +867,11 @@ describe('订阅链接与成员仓储的 SQL 形状', () => {
 
     const [statement] = recorded
     expect(statement?.query).toContain('"rules" = $1')
-    expect(statement?.query).toContain('"pass_threshold" = $2')
-    expect(statement?.query).toContain('"llm_threshold" = $3')
-    expect(statement?.query).toContain('"mute_duration_minutes" = $4')
+    expect(statement?.query).toContain('"whitelist" = $2')
+    expect(statement?.query).toContain('"pass_threshold" = $3')
+    expect(statement?.query).toContain('"llm_threshold" = $4')
+    expect(statement?.query).toContain('"mute_duration_minutes" = $5')
+    expect(JSON.parse(String(statement?.params?.[1]))).toEqual(chatConfigFixture.whitelist)
     expect(statement?.query).not.toContain('"title" =')
     expect(statement?.query).not.toContain('"chat_type" =')
     expect(statement?.query).not.toContain('"linked_chat_id" =')
@@ -910,6 +917,8 @@ describe('迁移产物', () => {
     )
     expect(sql).toContain(`char_length("message_events"."sample_text") <= ${SAMPLE_TEXT_MAX_LENGTH}`)
     expect(sql).toContain('CREATE UNIQUE INDEX "appeals_decision_unique"')
+    // 信任名单批次：chats 多一列 jsonb 数字数组，默认空数组（历史行自动获得 `[]`）。
+    expect(sql).toContain('ADD COLUMN "whitelist" jsonb DEFAULT \'[]\'::jsonb NOT NULL;')
   })
 
   test('journal 与迁移文件一致：每个 tag 都有同名 SQL，序号连续', () => {
@@ -925,13 +934,13 @@ describe('迁移产物', () => {
     }
   })
 
-  test('0009 snapshot 记录订阅链接/成员表，journal 末尾指向它且保留 0008', () => {
+  test('0009 snapshot 记录订阅链接/成员表，journal 保留 0009 与 0008', () => {
     const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
     const journal = JSON.parse(readFileSync(join(migrationsDir, 'meta', '_journal.json'), 'utf8')) as {
       entries: Array<{ idx: number; tag: string }>
     }
-    const last = journal.entries.at(-1)
-    expect(last).toEqual({ idx: 9, tag: '0009_petite_trauma', version: '7', when: expect.any(Number), breakpoints: true })
+    const entry = journal.entries[9]
+    expect(entry).toEqual({ idx: 9, tag: '0009_petite_trauma', version: '7', when: expect.any(Number), breakpoints: true })
     // 3a 的 0008 不被覆盖。
     expect(journal.entries[8]).toEqual({
       idx: 8,
@@ -960,6 +969,44 @@ describe('迁移产物', () => {
     expect(memberColumns?.check_token?.type).toBe('uuid')
     // 旧订阅表仍在快照里（不 drop、不 rename）。
     expect(snapshot.tables['public.subscriptions']).toBeDefined()
+  })
+
+  test('0010 snapshot 记录 chats.whitelist（jsonb 默认空数组），journal 末尾指向它且保留 0009', () => {
+    const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
+    const journal = JSON.parse(readFileSync(join(migrationsDir, 'meta', '_journal.json'), 'utf8')) as {
+      entries: Array<{ idx: number; tag: string }>
+    }
+    const last = journal.entries.at(-1)
+    expect(last).toMatchObject({ idx: 10, version: '7', breakpoints: true })
+    // 3b 的 0009 不被覆盖。
+    expect(journal.entries[9]).toEqual({
+      idx: 9,
+      tag: '0009_petite_trauma',
+      version: '7',
+      when: expect.any(Number),
+      breakpoints: true,
+    })
+
+    const tag = last?.tag ?? ''
+    expect(tag).toMatch(/^0010_/u)
+    const sql0010 = readFileSync(join(migrationsDir, `${tag}.sql`), 'utf8')
+    expect(sql0010).toContain('ADD COLUMN "whitelist" jsonb DEFAULT \'[]\'::jsonb NOT NULL;')
+    // 只加列：不改既有配置列，也不引入新的 DDL 约束。
+    expect(sql0010).not.toContain('DROP')
+    expect(sql0010).not.toContain('"rules"')
+
+    const snapshot = JSON.parse(
+      readFileSync(join(migrationsDir, 'meta', '0010_snapshot.json'), 'utf8'),
+    ) as {
+      tables: Record<string, { columns: Record<string, { name: string; type: string; notNull: boolean; default?: unknown }> }>
+    }
+    expect(snapshot.tables['public.chats']?.columns.whitelist).toEqual({
+      name: 'whitelist',
+      type: 'jsonb',
+      primaryKey: false,
+      notNull: true,
+      default: "'[]'::jsonb",
+    })
   })
 
   test('0009 迁移只建新表：不 drop/alter 旧 subscriptions，且没有跨 HTTP 的 DB 事务用法', () => {

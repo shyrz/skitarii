@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import {
   asChatId,
+  asUserId,
   type AppealState,
   type ChatConfig,
   type DailyAggregate,
@@ -64,6 +65,9 @@ const APPEAL_STATES: ReadonlySet<string> = new Set(['open', 'upheld', 'overturne
 
 /** 保存配置时接受的规则条数上限：再多就该换配置方式，而不是继续手改面板。 */
 const MAX_RULES = 100
+
+/** 信任名单条数上限。名单是人工维护的例外集合，50 远超自用规模；再大就该改用规则或内容白名单。 */
+const MAX_WHITELIST = 50
 
 /** 禁言时长上限（分钟）：30 天。防误输入，也避免成员被无限期留在禁言里。 */
 const MAX_MUTE_DURATION_MINUTES = 43_200
@@ -385,13 +389,16 @@ export async function getPanelChatConfig(
   return { status: 200, body: config }
 }
 
-/** PUT 请求体的结构校验。语义校验（阈值、时长、逐条规则）在 {@link validateConfigData} 里给可读 details。 */
+/** PUT 请求体的结构校验。语义校验（阈值、时长、逐条规则、白名单）在 {@link validateConfigData} 里给可读 details。 */
 const chatConfigBodySchema = z.object({
   initData: z.string().min(1),
   config: z.object({
     passThreshold: z.number(),
     llmThreshold: z.number(),
     muteDurationMinutes: z.number(),
+    // 白名单的类型/范围由 validateConfigData 逐条给中文 details；这里只要求字段存在（z.unknown 会放行 undefined，
+    // 由语义层把「缺字段」与「非数组」一起按「需要数组」拒绝）。
+    whitelist: z.unknown(),
     rules: z.array(
       z.object({
         id: z.string().optional(),
@@ -406,18 +413,18 @@ const chatConfigBodySchema = z.object({
 })
 
 /**
- * 保存某群的审核配置：全量替换规则与阈值，保留 `title` / `chatType` / `linkedChatId` / `language`。
+ * 保存某群的审核配置：全量替换规则、信任名单与阈值，保留 `title` / `chatType` / `linkedChatId` / `language`。
  *
  * 为什么全量替换：面板持有整份配置，逐条 diff 需要版本号与并发协调；单 owner 场景下
  * 「最后写入胜」更简单，也让「保存后立即生效」的语义没有中间态（管线每条消息读配置）。
  * 元数据列（来自 `existing`）随全量写入一起回填，因此面板保存不会把登记的群类型或 linked 关系冲掉。
  *
  * 校验分两层：结构（类型、必需字段）由 zod 挡；语义与规则内容由 {@link validateConfigData}
- * 逐条给 details（指出第几条规则的哪个字段），与 README「规则编译失败在保存接口暴露」的口径一致。
+ * 逐条给 details（指出第几条规则的哪个字段、第几个白名单元素），与 README「规则编译失败在保存接口暴露」的口径一致。
  *
  * @param deps 面板依赖。
  * @param input `chatId` 来自路径，`body` 为未解析的请求体。
- * @returns 200 保存后的配置（含服务端分配的规则 id）；400 校验失败；401 / 403 鉴权失败；404 群未登记。
+ * @returns 200 保存后的配置（含服务端分配的规则 id、去重后的白名单）；400 校验失败；401 / 403 鉴权失败；404 群未登记。
  */
 export async function putPanelChatConfig(
   deps: PanelApiDeps,
@@ -443,14 +450,16 @@ export async function putPanelChatConfig(
   const next: ChatConfig = {
     ...existing,
     rules: validation.rules,
+    whitelist: validation.whitelist,
     passThreshold: parsed.data.config.passThreshold,
     llmThreshold: parsed.data.config.llmThreshold,
     muteDurationMinutes: parsed.data.config.muteDurationMinutes,
   }
-  // 只写规则与阈值列：元数据（title / chatType / linkedChatId）由 bot 的登记/刷新路径维护，
+  // 只写规则、白名单与阈值列：元数据（title / chatType / linkedChatId）由 bot 的登记/刷新路径维护，
   // 面板内存里的旧值不能随保存回写，否则会覆盖并发的元数据刷新。
   await deps.repos.chats.updateRulesConfig(next.chatId, {
     rules: next.rules,
+    whitelist: next.whitelist,
     passThreshold: next.passThreshold,
     llmThreshold: next.llmThreshold,
     muteDurationMinutes: next.muteDurationMinutes,
@@ -464,6 +473,8 @@ interface ConfigData {
   passThreshold: number
   llmThreshold: number
   muteDurationMinutes: number
+  /** 原始值：由 {@link validateWhitelist} 做类型/范围校验与去重。 */
+  whitelist: unknown
   rules: Array<{
     id?: string | undefined
     kind: string
@@ -474,10 +485,11 @@ interface ConfigData {
   }>
 }
 
-/** 语义校验结果：`details` 非空即拒绝；成功时 `rules` 是补齐 id 后的规则集。 */
+/** 语义校验结果：`details` 非空即拒绝；成功时 `rules` 是补齐 id 后的规则集、`whitelist` 已去重。 */
 interface ConfigValidation {
   details: string[]
   rules: Rule[]
+  whitelist: UserId[]
 }
 
 /**
@@ -494,6 +506,7 @@ interface ConfigValidation {
 function validateConfigData(data: ConfigData): ConfigValidation {
   const details: string[] = []
   const { passThreshold, llmThreshold, muteDurationMinutes, rules } = data
+  const whitelist = validateWhitelist(data.whitelist, details)
 
   if (!(Number.isFinite(passThreshold) && Number.isFinite(llmThreshold) && 0 <= passThreshold && passThreshold <= llmThreshold && llmThreshold <= 1)) {
     details.push('阈值：需要满足 0 ≤ passThreshold ≤ llmThreshold ≤ 1')
@@ -532,7 +545,7 @@ function validateConfigData(data: ConfigData): ConfigValidation {
     }
   }
 
-  if (details.length > 0) return { details, rules: [] }
+  if (details.length > 0) return { details, rules: [], whitelist: [] }
 
   // 第二遍：分配缺省 id 并落成领域类型（kind/actionHint 已在上面的集合里校验过）。
   const assigned = rules.map((rule) => {
@@ -548,7 +561,42 @@ function validateConfigData(data: ConfigData): ConfigValidation {
     }
   })
 
-  return { details, rules: assigned }
+  return { details, rules: assigned, whitelist }
+}
+
+/**
+ * 校验并归一化信任名单。
+ *
+ * 与规则校验同一口径：类型/范围错误逐条进 `details`（指出第几个元素），
+ * 重复项直接去重、不报错——面板保存的是「一份名单」，重复输入不构成错误；
+ * 上限按去重后的实际落库条数计算，去重后仍超过 50 才拒绝。
+ *
+ * @param value 原始值（字段缺失时为 `undefined`）。
+ * @param details 错误清单（会被就地追加）。
+ * @returns 去重后的白名单；`details` 非空时调用方应丢弃该值。
+ */
+function validateWhitelist(value: unknown, details: string[]): UserId[] {
+  if (!Array.isArray(value)) {
+    details.push('whitelist：需要数组')
+    return []
+  }
+
+  const seen = new Set<number>()
+  const result: UserId[] = []
+  for (const [index, item] of value.entries()) {
+    if (typeof item !== 'number' || !Number.isSafeInteger(item) || item <= 0) {
+      details.push(`whitelist[${index}]：需要正整数用户 ID`)
+      continue
+    }
+    if (seen.has(item)) continue
+    seen.add(item)
+    result.push(asUserId(item))
+  }
+
+  if (result.length > MAX_WHITELIST) {
+    details.push(`whitelist：最多 ${MAX_WHITELIST} 个账号`)
+  }
+  return result
 }
 
 /** 按引擎的方式编译规则正则（`u` 标志）。坏正则在引擎里是静默不命中，保存边界必须显式拒绝。 */

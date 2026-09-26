@@ -81,6 +81,7 @@ function createChatRepo(db: Db): ChatRepo {
             linkedChatId: config.linkedChatId,
             language: config.language,
             rules: config.rules,
+            whitelist: config.whitelist,
             passThreshold: config.passThreshold,
             llmThreshold: config.llmThreshold,
             muteDurationMinutes: config.muteDurationMinutes,
@@ -108,11 +109,12 @@ function createChatRepo(db: Db): ChatRepo {
     },
 
     async updateRulesConfig(chatId, patch): Promise<void> {
-      // 面板 PUT 专用：只写规则与阈值，绝不触碰 title / chat_type / linked_chat_id / language。
+      // 面板 PUT 专用：只写规则、白名单与阈值，绝不触碰 title / chat_type / linked_chat_id / language。
       await db
         .update(chats)
         .set({
           rules: patch.rules,
+          whitelist: patch.whitelist,
           passThreshold: patch.passThreshold,
           llmThreshold: patch.llmThreshold,
           muteDurationMinutes: patch.muteDurationMinutes,
@@ -156,6 +158,7 @@ function chatConfigValues(config: ChatConfig): {
   linkedChatId: string | null
   language: ChatConfig['language']
   rules: ChatConfig['rules']
+  whitelist: ChatConfig['whitelist']
   passThreshold: number
   llmThreshold: number
   muteDurationMinutes: number
@@ -167,6 +170,7 @@ function chatConfigValues(config: ChatConfig): {
     linkedChatId: config.linkedChatId,
     language: config.language,
     rules: config.rules,
+    whitelist: config.whitelist,
     passThreshold: config.passThreshold,
     llmThreshold: config.llmThreshold,
     muteDurationMinutes: config.muteDurationMinutes,

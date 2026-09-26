@@ -25,6 +25,7 @@ function configWith(overrides: Partial<ChatConfig> = {}): ChatConfig {
     linkedChatId: null,
     language: 'zh',
     rules: [ruleWith({ id: 'r1', score: 0.5, actionHint: 'delete' })],
+    whitelist: [],
     passThreshold: 0.4,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,

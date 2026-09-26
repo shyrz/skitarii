@@ -309,14 +309,17 @@ export interface PanelConfigDto {
   llmThreshold: number
   muteDurationMinutes: number
   rules: PanelRuleDto[]
+  /** 信任名单：名单内账号的消息直接放行；服务端只返回已去重的正整数数组。 */
+  whitelist: number[]
 }
 
-/** PUT 请求体的 config：阈值与规则全量替换；chatId/title/language 由服务端保留，不在 body 里。 */
+/** PUT 请求体的 config：阈值、规则与信任名单全量替换；chatId/title/language 由服务端保留，不在 body 里。 */
 export interface PanelConfigInput {
   passThreshold: number
   llmThreshold: number
   muteDurationMinutes: number
   rules: PanelRuleDto[]
+  whitelist: number[]
 }
 
 export async function fetchPanelConfig(chatId: string, initData: string): Promise<PanelConfigDto> {

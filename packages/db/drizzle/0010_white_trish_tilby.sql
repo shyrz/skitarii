@@ -1,0 +1,1 @@
+ALTER TABLE "chats" ADD COLUMN "whitelist" jsonb DEFAULT '[]'::jsonb NOT NULL;

@@ -97,6 +97,7 @@ function chatConfigFor(id: ChatId, title: string): ChatConfig {
     linkedChatId: null,
     language: 'zh',
     rules: [],
+    whitelist: [],
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,
@@ -175,6 +176,7 @@ function configPayload(overrides: Record<string, unknown> = {}): Record<string, 
     passThreshold: 0.3,
     llmThreshold: 0.8,
     muteDurationMinutes: 60,
+    whitelist: [],
     rules: [{ id: 'rule-1', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true }],
     ...overrides,
   }
@@ -682,9 +684,9 @@ describe('面板结案', () => {
 })
 
 describe('面板规则配置', () => {
-  test('读取：返回与 ChatConfig 同形的字段', async () => {
+  test('读取：返回与 ChatConfig 同形的字段（含白名单）', async () => {
     const { deps, store } = setup()
-    const seeded = chatConfigFor(chatId, '甲群')
+    const seeded = { ...chatConfigFor(chatId, '甲群'), whitelist: [asUserId(7_000_000_001)] }
     await store.repos.chats.upsert(seeded)
 
     const result = await getPanelChatConfig(deps, { chatId, initData: ownerInitData() })
@@ -1007,5 +1009,98 @@ describe('面板规则配置', () => {
     })
     expect(wrongType.status).toBe(400)
     expect((wrongType.body as { details: string[] }).details.some((detail) => detail.startsWith('config.rules'))).toBe(true)
+  })
+
+  test('保存：whitelist 随规则一起写入并回读（服务端去重）', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({
+          whitelist: [7_000_000_001, 7_000_000_002, 7_000_000_001],
+        }),
+      },
+    })
+
+    expect(result.status).toBe(200)
+    const config = (result.body as { config: ChatConfig }).config
+    // 重复项被服务端去重、不报错；响应、落库与 GET 三处一致。
+    expect(config.whitelist).toEqual([7_000_000_001, 7_000_000_002])
+    expect((await store.repos.chats.findByChatId(chatId))?.whitelist).toEqual([7_000_000_001, 7_000_000_002])
+    const get = await getPanelChatConfig(deps, { chatId, initData: ownerInitData() })
+    expect((get.body as ChatConfig).whitelist).toEqual([7_000_000_001, 7_000_000_002])
+  })
+
+  test('保存：whitelist 去重后计算上限，恰好 50 通过、51 拒绝', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+    const fifty = Array.from({ length: 50 }, (_, index) => 1_000_000 + index)
+
+    const atLimit = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({ whitelist: [...fifty, fifty[0]] }),
+      },
+    })
+    expect(atLimit.status).toBe(200)
+    expect((atLimit.body as { config: ChatConfig }).config.whitelist).toHaveLength(50)
+
+    const overLimit = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({ whitelist: [...fifty, 2_000_000] }),
+      },
+    })
+    expect(overLimit).toEqual({
+      status: 400,
+      body: { error: 'invalid_request', details: ['whitelist：最多 50 个账号'] },
+    })
+  })
+
+  test('保存：whitelist 逐条指位（小数/负数/非数字/缺字段）', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const invalidElement = await putPanelChatConfig(deps, {
+      chatId,
+      body: {
+        initData: ownerInitData(),
+        config: configPayload({ whitelist: [42, 1.5, -3, '某用户'] }),
+      },
+    })
+    expect(invalidElement).toEqual({
+      status: 400,
+      body: {
+        error: 'invalid_request',
+        details: [
+          'whitelist[1]：需要正整数用户 ID',
+          'whitelist[2]：需要正整数用户 ID',
+          'whitelist[3]：需要正整数用户 ID',
+        ],
+      },
+    })
+
+    const notArray = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload({ whitelist: '不是数组' }) },
+    })
+    expect(notArray).toEqual({
+      status: 400,
+      body: { error: 'invalid_request', details: ['whitelist：需要数组'] },
+    })
+
+    const missing = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: { ...configPayload(), whitelist: undefined } },
+    })
+    expect(missing).toEqual({
+      status: 400,
+      body: { error: 'invalid_request', details: ['whitelist：需要数组'] },
+    })
   })
 })

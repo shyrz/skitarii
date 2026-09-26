@@ -45,11 +45,13 @@ export interface ChatMetadataPatch {
 }
 
 /**
- * 面板 PUT 用的规则/阈值补丁。
- * 只能改规则与阈值：标题、类型、linked 关系与语言由登记/刷新路径维护，不能被面板写回旧值。
+ * 面板 PUT 用的规则/阈值/信任名单补丁。
+ * 只能改规则、阈值与信任名单：标题、类型、linked 关系与语言由登记/刷新路径维护，不能被面板写回旧值。
  */
 export interface ChatRulesPatch {
   rules: Rule[]
+  /** 信任名单：名单内账号的消息直接放行（面板校验、去重与上限见 `apps/server/src/panel.ts`）。 */
+  whitelist: UserId[]
   passThreshold: number
   llmThreshold: number
   muteDurationMinutes: number
@@ -78,7 +80,7 @@ export interface ChatRepo {
    */
   updateMetadata(chatId: ChatId, patch: ChatMetadataPatch): Promise<void>
   /**
-   * 只更新规则与阈值（面板 PUT 专用），不改 title / chatType / linkedChatId / language。
+   * 只更新规则、阈值与信任名单（面板 PUT 专用），不改 title / chatType / linkedChatId / language。
    *
    * 面板保存与 bot 的元数据刷新可能并发：面板读到的行可能已带旧元数据，若走全量写会把并发刷新
    * 回退。规则侧走这条单列 UPDATE 后，两条写路径互不覆盖（各写各的列）。
