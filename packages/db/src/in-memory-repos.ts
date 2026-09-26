@@ -7,9 +7,11 @@ import type {
   MessageEvent,
   ModerationDecision,
   Subscription,
+  SubscriptionLink,
+  SubscriptionMember,
   UserId,
 } from '@skitarii/core'
-import type { DailyCounts, Repos } from './repos.js'
+import type { CheckClaim, ClaimResult, DailyCounts, MemberEventObservation, Repos, ReserveCreateOutcome } from './repos.js'
 import { truncateSampleText } from './mapping.js'
 import type { LlmCacheEntry, LlmCacheInsert } from './schema.js'
 
@@ -52,22 +54,69 @@ export function createInMemoryRepos(): InMemoryRepos {
   /** 处置通知的落点（decisionId → 目标 + 消息 id）。PG 里是 `moderation_decisions.notice_*` 列，这里旁存。 */
   const noticeRefs = new Map<string, { chatId: string; messageId: number }>()
   const subscriptions = new Map<string, Subscription>()
+  const subscriptionLinks = new Map<string, SubscriptionLink>()
+  const subscriptionMembers = new Map<string, SubscriptionMember>()
   const aggregates = new Map<string, DailyAggregate>()
   const cache = new Map<string, LlmCacheEntry>()
 
   /** 聚合键：群 + 日期。 */
   const aggregateKey = (chatId: string, date: string): string => `${chatId}|${date}`
 
+  /** 成员台账键：群 + 用户。 */
+  const memberKey = (chatId: string, userId: number): string => `${chatId}|${userId}`
+
+  /** 按幂等键读链接；`reserveCreate` 与仓储方法共用同一实现。 */
+  const findLinkByRequestId = (ownerUserId: UserId, requestId: string): SubscriptionLink | null =>
+    [...subscriptionLinks.values()].find(
+      (link) => link.ownerUserId === ownerUserId && link.requestId === requestId,
+    ) ?? null
+
   const repos: Repos = {
     chats: {
       async upsert(config: ChatConfig): Promise<void> {
         chats.set(config.chatId, config)
       },
+      async register(config: ChatConfig): Promise<void> {
+        // 与 PG 的 `on conflict do nothing` 对齐：已存在时保留库里那份，绝不用默认配置覆盖。
+        if (chats.has(config.chatId)) return
+        chats.set(config.chatId, config)
+      },
       async findByChatId(chatId: ChatId): Promise<ChatConfig | null> {
         return chats.get(chatId) ?? null
       },
+      async updateMetadata(chatId: ChatId, patch): Promise<void> {
+        const stored = chats.get(chatId)
+        if (stored === undefined) return
+        // 与 PG 的单列 UPDATE 对齐：只覆盖 patch 里出现的字段，规则与阈值原样保留。
+        chats.set(chatId, {
+          ...stored,
+          ...(patch.title !== undefined ? { title: patch.title } : {}),
+          ...(patch.chatType !== undefined ? { chatType: patch.chatType } : {}),
+          ...(patch.linkedChatId !== undefined ? { linkedChatId: patch.linkedChatId } : {}),
+        })
+      },
+      async updateRulesConfig(chatId: ChatId, patch): Promise<void> {
+        const stored = chats.get(chatId)
+        if (stored === undefined) return
+        // 与 PG 的单列 UPDATE 对齐：只覆盖规则与阈值，元数据与语言保持库里的值。
+        chats.set(chatId, {
+          ...stored,
+          rules: patch.rules,
+          passThreshold: patch.passThreshold,
+          llmThreshold: patch.llmThreshold,
+          muteDurationMinutes: patch.muteDurationMinutes,
+        })
+      },
       async listAll(): Promise<ChatConfig[]> {
         return [...chats.values()]
+      },
+      async listChannelsPage({ afterChatId, limit }): Promise<ChatConfig[]> {
+        // 与 PG 的 `chat_type = 'channel' AND chat_id > $1 ORDER BY chat_id` 同序。
+        return [...chats.values()]
+          .filter((config) => config.chatType === 'channel')
+          .filter((config) => afterChatId === undefined || config.chatId > afterChatId)
+          .sort((a, b) => (a.chatId < b.chatId ? -1 : a.chatId > b.chatId ? 1 : 0))
+          .slice(0, Math.max(0, Math.trunc(limit)))
       },
     },
 
@@ -278,6 +327,274 @@ export function createInMemoryRepos(): InMemoryRepos {
       },
     },
 
+    subscriptionLinks: {
+      async reserveCreate(input): Promise<ReserveCreateOutcome> {
+        // 与 PG 的 `on conflict (owner_user_id, request_id) do nothing + 返回原行` 对齐。
+        const existing = findLinkByRequestId(input.ownerUserId, input.requestId)
+        if (existing !== null) return { kind: 'existing', link: existing }
+
+        const link: SubscriptionLink = {
+          id: input.id,
+          chatId: input.chatId,
+          ownerUserId: input.ownerUserId,
+          requestId: input.requestId,
+          requestHash: input.requestHash,
+          name: input.name,
+          priceStars: input.priceStars,
+          periodSeconds: input.periodSeconds,
+          inviteLink: null,
+          state: 'creating',
+          createdAt: input.createdAt,
+          updatedAt: input.createdAt,
+          revokedAt: null,
+          version: 0,
+          operationToken: null,
+          operationKind: null,
+          operationStartedAt: null,
+        }
+        subscriptionLinks.set(link.id, link)
+        return { kind: 'reserved', link }
+      },
+      async findByRequestId(ownerUserId: UserId, requestId: string): Promise<SubscriptionLink | null> {
+        return findLinkByRequestId(ownerUserId, requestId)
+      },
+      async finishCreate(id: string, result): Promise<boolean> {
+        const stored = subscriptionLinks.get(id)
+        if (stored === undefined) return false
+        if (stored.state !== 'creating' && stored.state !== 'create_unknown') return false
+        subscriptionLinks.set(id, {
+          ...stored,
+          state: 'active',
+          inviteLink: result.inviteLink,
+          version: stored.version + 1,
+          updatedAt: result.finishedAt,
+        })
+        return true
+      },
+      async markCreateOutcome(id: string, state: 'create_unknown' | 'create_failed', changedAt: Date): Promise<void> {
+        const stored = subscriptionLinks.get(id)
+        // 只从 creating 迁移：已完成的请求不会被迟到的失败结果改写。
+        if (stored === undefined || stored.state !== 'creating') return
+        subscriptionLinks.set(id, { ...stored, state, updatedAt: changedAt })
+      },
+      async findById(chatId: ChatId, id: string): Promise<SubscriptionLink | null> {
+        const stored = subscriptionLinks.get(id)
+        return stored !== undefined && stored.chatId === chatId ? stored : null
+      },
+      async findByInviteLink(chatId: ChatId, fullLink: string): Promise<SubscriptionLink | null> {
+        return (
+          [...subscriptionLinks.values()].find(
+            (link) => link.chatId === chatId && link.inviteLink !== null && link.inviteLink === fullLink,
+          ) ?? null
+        )
+      },
+      async listPage({ chatId, before, limit }): Promise<SubscriptionLink[]> {
+        return [...subscriptionLinks.values()]
+          .filter((link) => link.chatId === chatId)
+          .filter((link) => before === undefined || isBeforeTuple(link.createdAt, link.id, before.createdAt, before.id))
+          .sort((a, b) => compareDesc(a.createdAt, a.id, b.createdAt, b.id))
+          .slice(0, Math.max(0, Math.trunc(limit)))
+      },
+      async claimMutation(chatId, id, expectedVersion, kind, now): Promise<ClaimResult> {
+        const stored = subscriptionLinks.get(id)
+        if (stored === undefined || stored.chatId !== chatId) return { kind: 'missing' }
+        if (stored.state === 'revoked') return { kind: 'revoked' }
+        if (stored.state !== 'active') return { kind: 'conflict', reason: 'version' }
+        if (stored.version !== expectedVersion) return { kind: 'conflict', reason: 'version' }
+        if (
+          stored.operationToken !== null &&
+          stored.operationStartedAt !== null &&
+          now.getTime() - stored.operationStartedAt.getTime() < MUTATION_LEASE_MS
+        ) {
+          return { kind: 'conflict', reason: 'in_progress' }
+        }
+
+        const token = crypto.randomUUID()
+        const next: SubscriptionLink = {
+          ...stored,
+          operationToken: token,
+          operationKind: kind,
+          operationStartedAt: now,
+          version: stored.version + 1,
+          updatedAt: now,
+        }
+        subscriptionLinks.set(id, next)
+        return { kind: 'claimed', token, link: next }
+      },
+      async finishMutation(id, operationToken, result, finishedAt): Promise<boolean> {
+        const stored = subscriptionLinks.get(id)
+        // 终态不可复活：revoked 行不再接受任何提交；token 不匹配的迟到结果同样作废。
+        if (stored === undefined || stored.operationToken !== operationToken || stored.state !== 'active') return false
+
+        const next: SubscriptionLink =
+          result.kind === 'renamed'
+            ? { ...stored, name: result.name }
+            : { ...stored, state: 'revoked', revokedAt: result.revokedAt }
+        subscriptionLinks.set(id, {
+          ...next,
+          operationToken: null,
+          operationKind: null,
+          operationStartedAt: null,
+          version: stored.version + 1,
+          updatedAt: finishedAt,
+        })
+        return true
+      },
+      async releaseMutation(id, operationToken): Promise<void> {
+        const stored = subscriptionLinks.get(id)
+        if (stored === undefined || stored.operationToken !== operationToken) return
+        subscriptionLinks.set(id, { ...stored, operationToken: null, operationKind: null, operationStartedAt: null })
+      },
+    },
+
+    subscriptionMembers: {
+      async find(chatId: ChatId, userId: UserId): Promise<SubscriptionMember | null> {
+        return subscriptionMembers.get(memberKey(chatId, userId)) ?? null
+      },
+      async applyEvent(observation): Promise<'inserted' | 'updated' | 'ignored'> {
+        const key = memberKey(observation.chatId, observation.userId)
+        const stored = subscriptionMembers.get(key)
+
+        if (stored === undefined) {
+          // 无肯定证据的事件不插入新行：资格判定在事件记录器；这里返回 ignored 而不是抛错，
+          // 与 PG 实现（跳过 INSERT、条件 UPDATE 零行）语义一致。
+          if (observation.evidence === null) return 'ignored'
+          const inserted: SubscriptionMember = {
+            id: crypto.randomUUID(),
+            chatId: observation.chatId,
+            userId: observation.userId,
+            linkId: observation.linkId,
+            state: observation.state,
+            expiresAt: observation.expiresAt,
+            evidence: observation.evidence,
+            firstObservedAt: observation.observedAt,
+            observedAt: observation.observedAt,
+            observationSource: 'event',
+            lastEventDate: observation.eventDate,
+            lastEventUpdateId: observation.eventUpdateId,
+            reconciledThrough: null,
+            lastCheckedAt: null,
+            lastCheckSucceededAt: null,
+            lastCheckErrorCode: null,
+            version: 0,
+            checkToken: null,
+            checkLeaseUntil: null,
+          }
+          subscriptionMembers.set(key, inserted)
+          return 'inserted'
+        }
+
+        // 高水位：更旧或相等重复的事件不覆盖事实。
+        if (!isNewerEvent(observation, stored)) return 'ignored'
+
+        // 迟到事件（所在秒不晚于成功对账开始秒）只推进高水位与 version，不改事实。
+        const applyFacts = isNewerThanReconcile(observation.eventDate, stored.reconciledThrough)
+        const next: SubscriptionMember = applyFacts
+          ? {
+              ...stored,
+              state: observation.state,
+              expiresAt: observation.expiresAt,
+              observedAt: observation.observedAt,
+              evidence: observation.evidence ?? stored.evidence,
+              linkId: observation.isJoin
+                ? observation.linkId
+                : (observation.linkId ?? stored.linkId),
+              observationSource: 'event',
+            }
+          : stored
+        subscriptionMembers.set(key, {
+          ...next,
+          lastEventDate: observation.eventDate,
+          lastEventUpdateId: observation.eventUpdateId,
+          version: stored.version + 1,
+        })
+        return 'updated'
+      },
+      async listPage({ chatId, before, limit }): Promise<SubscriptionMember[]> {
+        return [...subscriptionMembers.values()]
+          .filter((member) => member.chatId === chatId)
+          .filter(
+            (member) =>
+              before === undefined ||
+              isBeforeTuple(member.firstObservedAt, member.id, before.firstObservedAt, before.id),
+          )
+          .sort((a, b) => compareDesc(a.firstObservedAt, a.id, b.firstObservedAt, b.id))
+          .slice(0, Math.max(0, Math.trunc(limit)))
+      },
+      async countByState(chatId: ChatId) {
+        const rows = [...subscriptionMembers.values()].filter((member) => member.chatId === chatId)
+        const countOf = (state: SubscriptionMember['state']): number =>
+          rows.filter((member) => member.state === state).length
+        const member = countOf('member')
+        const left = countOf('left')
+        const unknown = countOf('unknown')
+        return { known: member + left + unknown, member, left, unknown }
+      },
+      async claimChecks({ now, limit, leaseMs }): Promise<CheckClaim[]> {
+        const eligible = [...subscriptionMembers.values()]
+          .filter((member) => member.checkLeaseUntil === null || member.checkLeaseUntil.getTime() <= now.getTime())
+          .sort((a, b) => {
+            const aAt = a.lastCheckedAt?.getTime() ?? Number.NEGATIVE_INFINITY
+            const bAt = b.lastCheckedAt?.getTime() ?? Number.NEGATIVE_INFINITY
+            if (aAt !== bAt) return aAt - bAt
+            return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+          })
+          .slice(0, Math.max(0, Math.trunc(limit)))
+
+        return eligible.map((member) => {
+          const token = crypto.randomUUID()
+          const next: SubscriptionMember = {
+            ...member,
+            checkToken: token,
+            checkLeaseUntil: new Date(now.getTime() + leaseMs),
+            lastCheckedAt: now,
+          }
+          subscriptionMembers.set(memberKey(member.chatId, member.userId), next)
+          return {
+            memberId: member.id,
+            chatId: member.chatId,
+            userId: member.userId,
+            token,
+            version: member.version,
+            requestStartedAt: now,
+          }
+        })
+      },
+      async finishCheck(claim, result): Promise<'applied' | 'stale'> {
+        const stored = [...subscriptionMembers.values()].find((member) => member.id === claim.memberId)
+        if (stored === undefined || stored.checkToken !== claim.token || stored.version !== claim.version) {
+          return 'stale'
+        }
+
+        if (result.kind === 'ok') {
+          subscriptionMembers.set(memberKey(stored.chatId, stored.userId), {
+            ...stored,
+            state: result.state,
+            expiresAt: result.expiresAt,
+            // 成功查询以查询开始时刻为观测时刻，并推进对账水位。
+            observedAt: claim.requestStartedAt,
+            observationSource: 'reconcile',
+            reconciledThrough: claim.requestStartedAt,
+            lastCheckSucceededAt: result.returnedAt,
+            lastCheckErrorCode: null,
+            checkToken: null,
+            checkLeaseUntil: null,
+            version: stored.version + 1,
+          })
+          return 'applied'
+        }
+
+        // 失败不改成员事实：只记错误码并释放租约（尝试时刻在 claim 时已推进）。
+        subscriptionMembers.set(memberKey(stored.chatId, stored.userId), {
+          ...stored,
+          lastCheckErrorCode: result.errorCode,
+          checkToken: null,
+          checkLeaseUntil: null,
+        })
+        return 'applied'
+      },
+    },
+
     aggregates: {
       async upsert(aggregate: DailyAggregate): Promise<void> {
         aggregates.set(aggregateKey(aggregate.chatId, aggregate.date), aggregate)
@@ -368,4 +685,68 @@ function isBeforeCursor(decision: ModerationDecision, cursor: { decidedAt: Date;
   const byTime = decision.decidedAt.getTime() - cursor.decidedAt.getTime()
   if (byTime !== 0) return byTime < 0
   return decision.id < cursor.id
+}
+
+/** 链接操作占位的租约（毫秒）：超过它未提交的占位可被新 token 替换，与 PG 的 `interval '60 seconds'` 对齐。 */
+const MUTATION_LEASE_MS = 60_000
+
+/**
+ * `(time, id)` 是否严格排在复合游标之前（用于 `(createdAt, id)` / `(firstObservedAt, id)` 倒序分页）。
+ *
+ * @param time 记录时间。
+ * @param id 记录 id。
+ * @param beforeTime 游标时间。
+ * @param beforeId 游标 id。
+ * @returns 时间更早，或时间相同但 id 更小时为 `true`。
+ */
+function isBeforeTuple(time: Date, id: string, beforeTime: Date, beforeId: string): boolean {
+  const byTime = time.getTime() - beforeTime.getTime()
+  if (byTime !== 0) return byTime < 0
+  return id < beforeId
+}
+
+/**
+ * 与 SQL 的 `ORDER BY time DESC, id DESC` 同序。
+ *
+ * @param aTime 左记录时间。
+ * @param aId 左记录 id。
+ * @param bTime 右记录时间。
+ * @param bId 右记录 id。
+ * @returns 排序比较值。
+ */
+function compareDesc(aTime: Date, aId: string, bTime: Date, bId: string): number {
+  const byTime = bTime.getTime() - aTime.getTime()
+  if (byTime !== 0) return byTime
+  if (aId === bId) return 0
+  return aId > bId ? -1 : 1
+}
+
+/**
+ * 事件高水位比较：`(eventDate, eventUpdateId)` 字典序是否严格新于已记录的事件。
+ * 已有行没有事件高水位（来自对账插入）时任何事件都算新。
+ *
+ * @param observation 本次事件。
+ * @param member 已存成员。
+ * @returns 严格更新时为 `true`。
+ */
+function isNewerEvent(
+  observation: MemberEventObservation,
+  member: SubscriptionMember,
+): boolean {
+  if (member.lastEventDate === null || member.lastEventUpdateId === null) return true
+  if (observation.eventDate !== member.lastEventDate) return observation.eventDate > member.lastEventDate
+  return observation.eventUpdateId > member.lastEventUpdateId
+}
+
+/**
+ * 事件是否携带可覆盖成功对账的事实：事件所在秒**晚于**对账开始所在秒才算新。
+ * 同秒缺少精度，保守以成功查询为准（只推进高水位，不改事实）。
+ *
+ * @param eventDateSeconds Telegram 事件时间（秒）。
+ * @param reconciledThrough 成功对账覆盖到的事实时刻；从未对账为 `null`。
+ * @returns 可以应用事实时为 `true`。
+ */
+function isNewerThanReconcile(eventDateSeconds: number, reconciledThrough: Date | null): boolean {
+  if (reconciledThrough === null) return true
+  return eventDateSeconds > Math.floor(reconciledThrough.getTime() / 1_000)
 }

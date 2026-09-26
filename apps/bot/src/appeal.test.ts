@@ -35,6 +35,8 @@ async function seedAppeal(store: InMemoryRepos, action: ModerationDecision['acti
   await store.repos.chats.upsert({
     chatId,
     title: '测试群',
+    chatType: 'supergroup',
+    linkedChatId: null,
     language: 'zh',
     rules: [],
     passThreshold: 0.3,

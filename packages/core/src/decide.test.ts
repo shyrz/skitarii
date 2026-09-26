@@ -21,6 +21,8 @@ function configWith(overrides: Partial<ChatConfig> = {}): ChatConfig {
   return {
     chatId: asChatId('-1001234567890'),
     title: '测试群',
+    chatType: 'supergroup',
+    linkedChatId: null,
     language: 'zh',
     rules: [ruleWith({ id: 'r1', score: 0.5, actionHint: 'delete' })],
     passThreshold: 0.4,

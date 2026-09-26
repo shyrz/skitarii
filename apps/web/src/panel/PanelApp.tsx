@@ -6,20 +6,22 @@ import { AppealsTab } from './AppealsTab.js'
 import { DecisionsTab } from './DecisionsTab.js'
 import { OverviewTab } from './OverviewTab.js'
 import { RulesTab } from './RulesTab.js'
+import { SubscriptionsTab } from './SubscriptionsTab.js'
 
 /**
  * owner 管理台入口。首屏拉取概览，那次请求同时承担鉴权：
  * 401 → auth 屏，403 → forbidden 屏，网络/5xx → 可重试的失败屏。
- * 四个页签懒挂载、挂载后不卸载（display 切换），保住筛选条件与已加载数据。
+ * 页签懒挂载、挂载后不卸载（display 切换），保住筛选条件与已加载数据。
  */
 
-type TabKey = 'overview' | 'decisions' | 'appeals' | 'rules'
+type TabKey = 'overview' | 'decisions' | 'appeals' | 'rules' | 'subscriptions'
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
   { key: 'decisions', label: '处置' },
   { key: 'appeals', label: '申诉' },
   { key: 'rules', label: '规则' },
+  { key: 'subscriptions', label: '订阅' },
 ]
 
 type PanelScreen =
@@ -117,6 +119,11 @@ export function PanelApp() {
       {mounted.has('rules') && (
         <div hidden={tab !== 'rules'}>
           <RulesTab initData={initData} chats={screen.overview.chats} onFatal={onFatal} />
+        </div>
+      )}
+      {mounted.has('subscriptions') && (
+        <div hidden={tab !== 'subscriptions'}>
+          <SubscriptionsTab initData={initData} onFatal={onFatal} />
         </div>
       )}
     </main>

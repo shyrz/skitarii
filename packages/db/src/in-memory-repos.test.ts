@@ -187,3 +187,102 @@ describe('内存实现：误伤样本', () => {
     expect((await store.repos.appeals.listOverturnedSamples(chatId, since, 1.9)).map((sample) => sample.contentHash)).toEqual(['h-1'])
   })
 })
+
+describe('内存实现：群登记与元数据刷新', () => {
+  /** 一条带自定义规则的群配置。 */
+  const config = {
+    chatId,
+    title: '测试群',
+    chatType: 'supergroup' as const,
+    linkedChatId: asChatId('-1009999999999'),
+    language: 'zh' as const,
+    rules: [{ id: 'r-owner', kind: 'keyword' as const, pattern: '广告', score: 0.4, actionHint: 'delete' as const, enabled: true }],
+    passThreshold: 0.3,
+    llmThreshold: 0.8,
+    muteDurationMinutes: 60,
+  }
+
+  test('register 对已存在的行是 no-op：owner 保存的规则不被默认配置覆盖', async () => {
+    const store = createInMemoryRepos()
+    await store.repos.chats.upsert(config)
+
+    await store.repos.chats.register({
+      ...config,
+      title: '默认标题',
+      chatType: 'group',
+      linkedChatId: null,
+      rules: [],
+      passThreshold: 0.9,
+    })
+
+    expect(await store.repos.chats.findByChatId(chatId)).toEqual(config)
+  })
+
+  test('updateMetadata 只改指定字段，规则与阈值原样保留', async () => {
+    const store = createInMemoryRepos()
+    await store.repos.chats.upsert(config)
+
+    await store.repos.chats.updateMetadata(chatId, { title: '新标题', chatType: 'channel' })
+
+    const stored = await store.repos.chats.findByChatId(chatId)
+    expect(stored?.title).toBe('新标题')
+    expect(stored?.chatType).toBe('channel')
+    expect(stored?.linkedChatId).toEqual(config.linkedChatId)
+    expect(stored?.rules).toEqual(config.rules)
+    expect(stored?.passThreshold).toBe(config.passThreshold)
+  })
+
+  test('linkedChatId 可显式清空（链接解除），未列出的字段不动', async () => {
+    const store = createInMemoryRepos()
+    await store.repos.chats.upsert(config)
+
+    await store.repos.chats.updateMetadata(chatId, { linkedChatId: null })
+
+    const stored = await store.repos.chats.findByChatId(chatId)
+    expect(stored?.linkedChatId).toBeNull()
+    expect(stored?.title).toBe(config.title)
+    expect(stored?.rules).toEqual(config.rules)
+  })
+
+  test('updateMetadata 对不存在的行静默无操作（登记由 register 负责）', async () => {
+    const store = createInMemoryRepos()
+
+    await store.repos.chats.updateMetadata(chatId, { title: '不存在的群' })
+
+    expect(await store.repos.chats.findByChatId(chatId)).toBeNull()
+  })
+
+  test('updateRulesConfig 只改规则与阈值，元数据与语言原样保留', async () => {
+    const store = createInMemoryRepos()
+    await store.repos.chats.upsert(config)
+
+    await store.repos.chats.updateRulesConfig(chatId, {
+      rules: [],
+      passThreshold: 0.5,
+      llmThreshold: 0.9,
+      muteDurationMinutes: 120,
+    })
+
+    const stored = await store.repos.chats.findByChatId(chatId)
+    expect(stored?.rules).toEqual([])
+    expect(stored?.passThreshold).toBe(0.5)
+    expect(stored?.llmThreshold).toBe(0.9)
+    expect(stored?.muteDurationMinutes).toBe(120)
+    expect(stored?.title).toBe(config.title)
+    expect(stored?.chatType).toBe(config.chatType)
+    expect(stored?.linkedChatId).toEqual(config.linkedChatId)
+    expect(stored?.language).toBe(config.language)
+  })
+
+  test('listChannelsPage 只列 channel，按 chatId 升序且 afterChatId 为严格下界', async () => {
+    const store = createInMemoryRepos()
+    await store.repos.chats.upsert({ ...config, chatId: asChatId('-1000000000003'), chatType: 'channel' })
+    await store.repos.chats.upsert({ ...config, chatId: asChatId('-1000000000001'), chatType: 'channel' })
+    await store.repos.chats.upsert({ ...config, chatId: asChatId('-1000000000002'), chatType: 'supergroup' })
+
+    const all = await store.repos.chats.listChannelsPage({ limit: 10 })
+    expect(all.map((chat) => chat.chatId)).toEqual(['-1000000000001', '-1000000000003'])
+    const after = await store.repos.chats.listChannelsPage({ afterChatId: asChatId('-1000000000001'), limit: 10 })
+    expect(after.map((chat) => chat.chatId)).toEqual(['-1000000000003'])
+  })
+})

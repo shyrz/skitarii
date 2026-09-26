@@ -96,15 +96,25 @@ const DEFAULT_MUTE_DURATION_MINUTES = 60
 /**
  * 构造未登记群的默认配置。
  *
- * @param chatId 群标识。
+ * @param chatId 群/频道标识。
  * @param title 群标题（Telegram update 里的当前标题）。
  * @param language 群语言，决定复核提示词与理由语种。
- * @returns 可直接 `upsert` 的配置。
+ * @param chatType 聊天类型，来自 update 的 `chat.type`（不从发送者推断）。
+ * @param linkedChatId Telegram 的 linked chat（频道 ↔ 讨论组）；未探测到时为 `null`。
+ * @returns 可直接 `register` / `upsert` 的配置。
  */
-export function defaultChatConfig(chatId: ChatId, title: string, language: ChatConfig['language']): ChatConfig {
+export function defaultChatConfig(
+  chatId: ChatId,
+  title: string,
+  language: ChatConfig['language'],
+  chatType: ChatConfig['chatType'],
+  linkedChatId: ChatId | null = null,
+): ChatConfig {
   return {
     chatId,
     title,
+    chatType,
+    linkedChatId,
     language,
     // 复制一份：默认规则是模块级常量，不随调用方的改动漂移。
     rules: DEFAULT_RULES.map((rule) => ({ ...rule })),

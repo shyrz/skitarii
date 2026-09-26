@@ -25,6 +25,8 @@ async function seedChat(store: InMemoryRepos, chatId: ChatId, title: string): Pr
   await store.repos.chats.upsert({
     chatId,
     title,
+    chatType: 'supergroup',
+    linkedChatId: null,
     language: 'zh',
     rules: [],
     passThreshold: 0.3,

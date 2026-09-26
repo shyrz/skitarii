@@ -157,6 +157,9 @@ export async function getPanelOverview(
       return {
         chatId: chat.chatId,
         title: chat.title,
+        // 只读元数据：面板下一批再消费，本批先把「这是群还是频道、评论挂在哪里」暴露出来。
+        chatType: chat.chatType,
+        linkedChatId: chat.linkedChatId,
         today: dailyCountsOf(byDate.get(today)),
         last7d: sumDailyCounts(range.map(dailyCountsOf)),
         openAppeals: openByChat.get(chat.chatId) ?? 0,
@@ -403,10 +406,11 @@ const chatConfigBodySchema = z.object({
 })
 
 /**
- * 保存某群的审核配置：全量替换规则与阈值，保留 `title` / `language`。
+ * 保存某群的审核配置：全量替换规则与阈值，保留 `title` / `chatType` / `linkedChatId` / `language`。
  *
  * 为什么全量替换：面板持有整份配置，逐条 diff 需要版本号与并发协调；单 owner 场景下
  * 「最后写入胜」更简单，也让「保存后立即生效」的语义没有中间态（管线每条消息读配置）。
+ * 元数据列（来自 `existing`）随全量写入一起回填，因此面板保存不会把登记的群类型或 linked 关系冲掉。
  *
  * 校验分两层：结构（类型、必需字段）由 zod 挡；语义与规则内容由 {@link validateConfigData}
  * 逐条给 details（指出第几条规则的哪个字段），与 README「规则编译失败在保存接口暴露」的口径一致。
@@ -435,7 +439,7 @@ export async function putPanelChatConfig(
   const validation = validateConfigData(parsed.data.config)
   if (validation.details.length > 0) return invalidRequest(validation.details)
 
-  // 保留面板不管理的字段：群标题与语言（语言切换不在本批范围内）。
+  // 保留面板不管理的字段：群标题、类型、linked 关系与语言（语言切换不在本批范围内）。
   const next: ChatConfig = {
     ...existing,
     rules: validation.rules,
@@ -443,7 +447,14 @@ export async function putPanelChatConfig(
     llmThreshold: parsed.data.config.llmThreshold,
     muteDurationMinutes: parsed.data.config.muteDurationMinutes,
   }
-  await deps.repos.chats.upsert(next)
+  // 只写规则与阈值列：元数据（title / chatType / linkedChatId）由 bot 的登记/刷新路径维护，
+  // 面板内存里的旧值不能随保存回写，否则会覆盖并发的元数据刷新。
+  await deps.repos.chats.updateRulesConfig(next.chatId, {
+    rules: next.rules,
+    passThreshold: next.passThreshold,
+    llmThreshold: next.llmThreshold,
+    muteDurationMinutes: next.muteDurationMinutes,
+  })
 
   return { status: 200, body: { config: next } }
 }

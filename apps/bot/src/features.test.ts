@@ -89,7 +89,7 @@ describe('表情总数计数', () => {
     expect(features.customEmojiCount).toBe(3)
     expect(features.emojiCount).toBe(3)
 
-    const flood = defaultChatConfig(asChatId('-1001234567890'), '测试群', 'zh').rules.filter(
+    const flood = defaultChatConfig(asChatId('-1001234567890'), '测试群', 'zh', 'supergroup').rules.filter(
       (rule) => rule.id === 'default-emoji-flood',
     )
     expect(flood).toHaveLength(1)

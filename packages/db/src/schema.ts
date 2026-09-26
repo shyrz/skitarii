@@ -4,6 +4,7 @@ import {
   boolean,
   check,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -39,6 +40,9 @@ import {
 /** 群配置语言。与 `ChatConfig['language']` 一致。 */
 export const chatLanguage = pgEnum('chat_language', ['zh', 'en'])
 
+/** 聊天类型。与 `ChatType` 一致；私聊不建配置行，刻意不在取值集合里。 */
+export const chatType = pgEnum('chat_type', ['group', 'supergroup', 'channel'])
+
 /** 消息媒体类型。与 `MessageFeatures['mediaType']` 一致。 */
 export const mediaType = pgEnum('media_type', ['text', 'photo', 'video', 'sticker', 'other'])
 
@@ -57,12 +61,20 @@ export const subscriptionState = pgEnum('subscription_state', ['active', 'expire
 /**
  * 群配置。`rules` 与阈值拆开存：阈值是查询条件（筛出待审群、做报表），规则集是整块读取的 JSONB。
  * 阈值顺序与时长由 CHECK 约束保证，写入方不必重复校验业务不变量。
+ *
+ * `chat_type` 带 `supergroup` 兼容默认值：迁移前的历史行拿不到真实类型，先按最常见的形态落库，
+ * 由 bot 的登记/刷新路径（消息、`my_chat_member`、`channel_post`）在后续更新中修正（见 README）。
+ * `linked_chat_id` 是 Telegram 的 linked chat（频道 ↔ 讨论组），只登记事实，不参与审核路由。
  */
 export const chats = pgTable(
   'chats',
   {
     chatId: text('chat_id').primaryKey(),
     title: text('title').notNull(),
+    /** 历史行为兼容默认值 `supergroup`，真实类型由后续登记/刷新路径修正。 */
+    chatType: chatType('chat_type').notNull().default('supergroup'),
+    /** 频道指向讨论组、讨论组指向频道；未链接或尚未探测到时为 null。 */
+    linkedChatId: text('linked_chat_id'),
     language: chatLanguage('language').notNull(),
     /** `Rule[]` 的 JSONB 形态；读取时按 `unknown` 处理，由仓储解析成领域类型。 */
     rules: jsonb('rules').notNull(),
@@ -237,6 +249,142 @@ export const subscriptions = pgTable(
 )
 
 /**
+ * 新订阅链接台账（Phase 3b）。与旧 `subscriptions` 表并存：旧行保留、不迁移、不删除。
+ *
+ * 两条写路径的幂等核心：
+ * - `(owner_user_id, request_id)` 唯一：同一创建请求只有一个持久占位；
+ * - `invite_link` 部分唯一（仅非空）：官方链接不会落到两行。
+ *
+ * `state`、价格/周期/名称长度与操作占位三列的同空性都有 CHECK 兜底；引用行不做硬删除。
+ * 邀请链接本身可能出现在唯一索引冲突的数据库错误里，因此错误日志只记受控码与 id，不打印异常对象。
+ */
+export const subscriptionLinks = pgTable(
+  'subscription_links',
+  {
+    id: uuid('id').primaryKey(),
+    chatId: text('chat_id')
+      .notNull()
+      .references(() => chats.chatId, { onDelete: 'cascade' }),
+    /** 创建者（本部署 owner）。 */
+    ownerUserId: bigint('owner_user_id', { mode: 'number' }).notNull(),
+    /** 客户端生成的请求幂等键。 */
+    requestId: uuid('request_id').notNull(),
+    /** 原始创建请求的规范化 JSON 摘要；改名不更新它。 */
+    requestHash: text('request_hash').notNull(),
+    name: text('name').notNull(),
+    priceStars: integer('price_stars').notNull(),
+    periodSeconds: integer('period_seconds').notNull(),
+    inviteLink: text('invite_link'),
+    /** `creating | active | revoked | create_unknown | create_failed`。 */
+    state: text('state').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    /** 乐观并发版本；claim/finish 每次条件写递增。 */
+    version: integer('version').notNull().default(0),
+    /** 进行中操作的占位：token + 种类 + 开始时刻，三列同空或同非空。 */
+    operationToken: uuid('operation_token'),
+    operationKind: text('operation_kind'),
+    operationStartedAt: timestamp('operation_started_at', { withTimezone: true }),
+  },
+  (table) => [
+    check('subscription_links_price_range', sql`${table.priceStars} >= 1 and ${table.priceStars} <= 10000`),
+    check('subscription_links_name_length', sql`char_length(${table.name}) <= 32`),
+    check('subscription_links_period_fixed', sql`${table.periodSeconds} = 2592000`),
+    check(
+      'subscription_links_state_valid',
+      sql`${table.state} in ('creating', 'active', 'revoked', 'create_unknown', 'create_failed')`,
+    ),
+    // active/revoked 必须有完整链接；其他状态允许为空（create_unknown 时本地可能还没拿到链接）。
+    check(
+      'subscription_links_link_complete',
+      sql`${table.inviteLink} is not null or ${table.state} not in ('active', 'revoked')`,
+    ),
+    check('subscription_links_revoked_at', sql`(${table.state} = 'revoked') = (${table.revokedAt} is not null)`),
+    check(
+      'subscription_links_operation_fields',
+      sql`((${table.operationToken} is null) = (${table.operationKind} is null)) and ((${table.operationKind} is null) = (${table.operationStartedAt} is null)) and (${table.operationKind} is null or ${table.operationKind} in ('rename', 'revoke'))`,
+    ),
+    uniqueIndex('subscription_links_owner_request_key').on(table.ownerUserId, table.requestId),
+    // 部分唯一：非空链接不重复，空值不互斥。
+    uniqueIndex('subscription_links_invite_link_key')
+      .on(table.inviteLink)
+      .where(sql`${table.inviteLink} is not null`),
+    // 复合外键目标：成员的 linkId 必须属于同一 chatId。
+    uniqueIndex('subscription_links_chat_id_id_key').on(table.chatId, table.id),
+    // 链接分页按 (createdAt, id) 倒序。
+    index('subscription_links_chat_created_idx').on(table.chatId, table.createdAt, table.id),
+  ],
+)
+
+/**
+ * 订阅成员台账。只收录「有订阅证据」的已知成员：
+ * - `(chat_id, user_id)` 唯一；`link_id` 通过复合外键保证与行属于同一频道（`link_id` 为空时不校验）；
+ * - `last_event_*` 两列同空/同非空；`evidence` / `state` / `observation_source` 的取值由 CHECK 约束；
+ * - 失败对账只写 `last_check_error_code`（不在本表约束范围），不触碰 `state` / `expires_at` / `observed_at`。
+ *
+ * `link_id` 指向新表 `subscription_links`，与旧 `subscriptions` 表无关；旧行不参与新台账。
+ */
+export const subscriptionMembers = pgTable(
+  'subscription_members',
+  {
+    id: uuid('id').primaryKey(),
+    chatId: text('chat_id')
+      .notNull()
+      .references(() => chats.chatId, { onDelete: 'cascade' }),
+    userId: bigint('user_id', { mode: 'number' }).notNull(),
+    /** 最近可关联的加入来源链接；无法匹配时为 null。 */
+    linkId: uuid('link_id'),
+    /** `member | left | unknown`。`left` 只表示观测到离开，不用 `expired` 表述。 */
+    state: text('state').notNull(),
+    /** 最新成功快照观测到的订阅到期时间；缺失不代表无限期或付款失效。 */
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    /** `until_date | owned_link`：纳入台账的最近肯定证据。 */
+    evidence: text('evidence').notNull(),
+    /** 首次纳入时刻，不可变。 */
+    firstObservedAt: timestamp('first_observed_at', { withTimezone: true }).notNull(),
+    /** 最后一次成功事实采样时刻。 */
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    /** `event | reconcile`。 */
+    observationSource: text('observation_source').notNull(),
+    /** 事件高水位（Telegram 秒 + update id），同空或同非空。 */
+    lastEventDate: bigint('last_event_date', { mode: 'number' }),
+    lastEventUpdateId: bigint('last_event_update_id', { mode: 'number' }),
+    /** 成功对账覆盖到的事实时刻，用于丢弃同秒及更旧的迟到事件。 */
+    reconciledThrough: timestamp('reconciled_through', { withTimezone: true }),
+    /** 最后一次对账尝试时刻（失败也推进，保证公平轮转）。 */
+    lastCheckedAt: timestamp('last_checked_at', { withTimezone: true }),
+    lastCheckSucceededAt: timestamp('last_check_succeeded_at', { withTimezone: true }),
+    lastCheckErrorCode: text('last_check_error_code'),
+    /** 事实版本：每次事实写入递增；对账 claim 不动它，用 CAS 丢弃在途过期结果。 */
+    version: integer('version').notNull().default(0),
+    /** 对账租约 token 与到期时刻；claim 只写这两列与 `last_checked_at`。 */
+    checkToken: uuid('check_token'),
+    checkLeaseUntil: timestamp('check_lease_until', { withTimezone: true }),
+  },
+  (table) => [
+    check('subscription_members_state_valid', sql`${table.state} in ('member', 'left', 'unknown')`),
+    check('subscription_members_evidence_valid', sql`${table.evidence} in ('until_date', 'owned_link')`),
+    check('subscription_members_source_valid', sql`${table.observationSource} in ('event', 'reconcile')`),
+    check(
+      'subscription_members_event_high_water',
+      sql`(${table.lastEventDate} is null) = (${table.lastEventUpdateId} is null)`,
+    ),
+    uniqueIndex('subscription_members_chat_user_key').on(table.chatId, table.userId),
+    // 成员分页按不可变首发时间倒序，带上 id 给同毫秒并列提供全序。
+    index('subscription_members_chat_first_idx').on(table.chatId, table.firstObservedAt, table.id),
+    // 对账扫描：公平推进 last_checked_at（NULL FIRST），同刻按 id。
+    index('subscription_members_scan_idx').on(table.lastCheckedAt.asc().nullsFirst(), table.id.asc()),
+    // linkId 必须属于同一 chatId：复合外键（linkId 为空时 PG 默认不校验）。
+    foreignKey({
+      name: 'subscription_members_link_fk',
+      columns: [table.chatId, table.linkId],
+      foreignColumns: [subscriptionLinks.chatId, subscriptionLinks.id],
+    }),
+  ],
+)
+
+/**
  * 日聚合。报表唯一数据源，配合 `(chat_id, date)` 主键天然幂等：重算某天直接 upsert。
  * 外键指向 `chats`，聚合行只对已登记的群存在。
  */
@@ -287,6 +435,10 @@ export type ModerationDecisionRow = typeof moderationDecisions.$inferSelect
 export type AppealRow = typeof appeals.$inferSelect
 /** `subscriptions` 行的读取形状。 */
 export type SubscriptionRow = typeof subscriptions.$inferSelect
+/** `subscription_links` 行的读取形状。 */
+export type SubscriptionLinkRow = typeof subscriptionLinks.$inferSelect
+/** `subscription_members` 行的读取形状。 */
+export type SubscriptionMemberRow = typeof subscriptionMembers.$inferSelect
 /** `daily_aggregates` 行的读取形状。 */
 export type DailyAggregateRow = typeof dailyAggregates.$inferSelect
 /** `llm_cache` 行的读取形状。 */

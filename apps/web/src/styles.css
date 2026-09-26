@@ -391,10 +391,12 @@ body {
 
 /* ---- 管理台：页签 ---- */
 
-/* 分段控件： secondary 底托 + 选中项浮起，跟随 Telegram 组内分割的视觉习惯 */
+/* 分段控件： secondary 底托 + 选中项浮起，跟随 Telegram 组内分割的视觉习惯。
+   auto-flow 列布局让 4 个或 5 个页签都等宽，不写死列数。 */
 .tabs {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 2px;
   padding: 3px;
   margin-bottom: 20px;
@@ -404,6 +406,7 @@ body {
 
 .tab {
   min-height: 36px;
+  padding: 0 2px;
   border: 0;
   border-radius: 9px;
   background: transparent;
@@ -411,6 +414,7 @@ body {
   font: inherit;
   font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -867,4 +871,87 @@ section > .section-title {
 
 .save-errors {
   margin-bottom: 4px;
+}
+
+/* ---- 管理台：订阅页签 ---- */
+
+/* 频道选择列表：整行可点，选中项用按钮色描边；不用下拉框承载分页 */
+.channel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.channel-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--divider);
+  border-radius: 14px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.channel-item.active {
+  border-color: var(--button);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--button) 25%, transparent);
+}
+
+.channel-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.channel-meta {
+  font-size: 13px;
+  color: var(--hint);
+  word-break: break-all;
+}
+
+/* 邀请链接展示块：等宽、可选中，复制失败时用户能手动选择文本 */
+.link-url {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: text;
+}
+
+.inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+/* 常驻提示横幅：观测口径、公开频道警告等，色调由 --tone 注入 */
+.notice-banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--tone) 12%, transparent);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.notice-banner .notice-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--tone);
 }

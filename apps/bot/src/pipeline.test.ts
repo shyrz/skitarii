@@ -7,7 +7,7 @@ import { defaultChatConfig } from './defaults.js'
 import { contentHashOf } from './features.js'
 import { deriveDecisionId, deriveEventId } from './ids.js'
 import { createIdempotencyRegistry } from './idempotency.js'
-import { createInMemoryRepos, type InMemoryRepos } from '@skitarii/db'
+import { createInMemoryRepos, type ChatMetadataPatch, type InMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
 import { handleIncomingMessage, type CommentThread, type DecisionObservation } from './pipeline.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
@@ -23,6 +23,8 @@ const fixedNow = () => new Date('2026-09-23T10:00:00Z')
 const chatConfig: ChatConfig = {
   chatId,
   title: '测试群',
+  chatType: 'supergroup',
+  linkedChatId: null,
   language: 'zh',
   // pattern 必须是归一化后的形态：原文「加v」经 normalize 会变成「加微信」。
   rules: [
@@ -227,7 +229,7 @@ describe('消息管线', () => {
     const { store, judgeStub, executor, judge } = setup({ cacheJudge: true })
     await store.repos.chats.upsert(chatConfig)
     // 第二个群用默认规则：同一条正文命中的 ruleId 与分数不同，送审材料不同，不该复用结论。
-    await store.repos.chats.upsert(defaultChatConfig(asChatId('-1009999999999'), '另一个群', 'zh'))
+    await store.repos.chats.upsert(defaultChatConfig(asChatId('-1009999999999'), '另一个群', 'zh', 'supergroup'))
 
     await handleIncomingMessage(
       { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
@@ -253,6 +255,60 @@ describe('消息管线', () => {
     expect(registered).not.toBeNull()
     expect(registered?.language).toBe('zh')
     expect(registered?.rules.length).toBeGreaterThan(0)
+  })
+
+  test('首次登记记录 update 里的聊天类型（basic group 不落成 supergroup 默认值）', async () => {
+    const { store, executor, judge } = setup()
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '这个键盘手感不错', messageId: 143, chatId: asChatId('-1007777777777'), chatType: 'group' }),
+    )
+
+    const registered = await store.repos.chats.findByChatId(asChatId('-1007777777777'))
+    expect(registered?.chatType).toBe('group')
+    expect(registered?.linkedChatId).toBeNull()
+  })
+
+  test('历史行类型与 update 不一致时只清单列刷新类型与标题，规则原样保留', async () => {
+    const { store, executor, judge } = setup()
+    // 模拟迁移兼容值：库里是 supergroup，实际消息来自 basic group。
+    await store.repos.chats.upsert({ ...chatConfig, chatType: 'supergroup', title: '旧标题' })
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '这个键盘手感不错', messageId: 144, chatType: 'group' }),
+    )
+
+    const refreshed = await store.repos.chats.findByChatId(chatId)
+    expect(refreshed?.chatType).toBe('group')
+    expect(refreshed?.title).toBe('测试群')
+    // 规则与阈值是 owner 的领域，元数据刷新不许碰它们。
+    expect(refreshed?.rules).toEqual(chatConfig.rules)
+    expect(refreshed?.passThreshold).toBe(chatConfig.passThreshold)
+  })
+
+  test('已登记且类型/标题一致时不发元数据更新', async () => {
+    const { store, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    let updates = 0
+    const repos = {
+      ...store.repos,
+      chats: {
+        ...store.repos.chats,
+        updateMetadata: async (targetChatId: ReturnType<typeof asChatId>, patch: ChatMetadataPatch) => {
+          updates += 1
+          await store.repos.chats.updateMetadata(targetChatId, patch)
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '这个键盘手感不错', messageId: 145 }),
+    )
+
+    expect(updates).toBe(0)
   })
 
   test('重投递时按库里那条决策决定是否补摘录：库内是放行则不写正文', async () => {
@@ -965,6 +1021,7 @@ function incoming(overrides: {
   text: string
   messageId: number
   chatId?: ReturnType<typeof asChatId>
+  chatType?: ChatConfig['chatType']
   editDate?: number
   senderIdentity?: string
   hasLink?: boolean
@@ -977,6 +1034,7 @@ function incoming(overrides: {
   return {
     chatId: overrides.chatId ?? chatId,
     chatTitle: '测试群',
+    chatType: overrides.chatType ?? ('supergroup' as const),
     messageId: overrides.messageId,
     userId,
     text,

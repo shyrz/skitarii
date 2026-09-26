@@ -11,9 +11,11 @@ import {
   type RuleAction,
   type Signal,
   type Subscription,
+  type SubscriptionLink,
+  type SubscriptionMember,
 } from '@skitarii/core'
 import { z } from 'zod'
-import { SAMPLE_TEXT_MAX_LENGTH, type AppealRow, type ChatRow, type DailyAggregateRow, type MessageEventRow, type ModerationDecisionRow, type SubscriptionRow } from './schema.js'
+import { SAMPLE_TEXT_MAX_LENGTH, type AppealRow, type ChatRow, type DailyAggregateRow, type MessageEventRow, type ModerationDecisionRow, type SubscriptionLinkRow, type SubscriptionMemberRow, type SubscriptionRow } from './schema.js'
 
 /**
  * 数据库行 ↔ 领域对象的映射边界。
@@ -68,6 +70,8 @@ export function toChatConfig(row: ChatRow): ChatConfig {
   return {
     chatId: asChatId(row.chatId),
     title: row.title,
+    chatType: row.chatType,
+    linkedChatId: row.linkedChatId === null ? null : asChatId(row.linkedChatId),
     language: row.language,
     rules: parseChatRules(row.rules),
     passThreshold: row.passThreshold,
@@ -187,6 +191,72 @@ export function toSubscription(row: SubscriptionRow): Subscription {
     inviteLink: row.inviteLink,
     expiresAt: row.expiresAt,
     state: row.state,
+  }
+}
+
+/**
+ * `subscription_links` 行 → 领域链接。
+ *
+ * 状态、操作占位与日期列直接透传：DDL 的 CHECK 已保证取值合法与三字段同空性，
+ * 这里不做二次默认（脏数据应当编译期/运行期可见，而不是被静默改写）。
+ *
+ * @param row 数据库行。
+ * @returns 领域链接。
+ */
+export function toSubscriptionLink(row: SubscriptionLinkRow): SubscriptionLink {
+  return {
+    id: row.id,
+    chatId: asChatId(row.chatId),
+    ownerUserId: asUserId(row.ownerUserId),
+    requestId: row.requestId,
+    requestHash: row.requestHash,
+    name: row.name,
+    priceStars: row.priceStars,
+    periodSeconds: row.periodSeconds,
+    inviteLink: row.inviteLink,
+    // 文本列受 DDL 的 CHECK 约束；这里按领域联合类型收窄（取值集合两侧必须一致）。
+    state: row.state as SubscriptionLink['state'],
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    revokedAt: row.revokedAt,
+    version: row.version,
+    operationToken: row.operationToken,
+    operationKind: row.operationKind as SubscriptionLink['operationKind'],
+    operationStartedAt: row.operationStartedAt,
+  }
+}
+
+/**
+ * `subscription_members` 行 → 领域成员。
+ *
+ * `linkId` 是 uuid 列，这里保持字符串形态（领域里它不是 `ChatId` 品牌）；
+ * `lastEventDate` / `lastEventUpdateId` 由 CHECK 保证同空性。
+ *
+ * @param row 数据库行。
+ * @returns 领域成员。
+ */
+export function toSubscriptionMember(row: SubscriptionMemberRow): SubscriptionMember {
+  return {
+    id: row.id,
+    chatId: asChatId(row.chatId),
+    userId: asUserId(row.userId),
+    linkId: row.linkId,
+    // 三个文本列都受 DDL CHECK 约束，按领域联合类型收窄。
+    state: row.state as SubscriptionMember['state'],
+    expiresAt: row.expiresAt,
+    evidence: row.evidence as SubscriptionMember['evidence'],
+    firstObservedAt: row.firstObservedAt,
+    observedAt: row.observedAt,
+    observationSource: row.observationSource as SubscriptionMember['observationSource'],
+    lastEventDate: row.lastEventDate,
+    lastEventUpdateId: row.lastEventUpdateId,
+    reconciledThrough: row.reconciledThrough,
+    lastCheckedAt: row.lastCheckedAt,
+    lastCheckSucceededAt: row.lastCheckSucceededAt,
+    lastCheckErrorCode: row.lastCheckErrorCode,
+    version: row.version,
+    checkToken: row.checkToken,
+    checkLeaseUntil: row.checkLeaseUntil,
   }
 }
 

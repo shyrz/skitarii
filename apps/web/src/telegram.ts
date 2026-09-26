@@ -6,6 +6,8 @@
 
 export interface WebAppUnsafe {
   start_param?: string
+  /** Telegram 提供、本端未验签的用户信息；仅可用于 UI 侧隔离，不能作为权限依据。 */
+  user?: { id?: number }
 }
 
 export interface TelegramWebApp {

@@ -6,6 +6,7 @@ import { describe, expect, test } from 'vitest'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import type { Db } from './client.js'
 import { createPgRepos } from './pg-repos.js'
+import type { MemberEventObservation } from './repos.js'
 import * as schema from './schema.js'
 import { SAMPLE_TEXT_MAX_LENGTH } from './schema.js'
 
@@ -37,17 +38,19 @@ interface RecordingDb {
  * 构造记录型假驱动。
  *
  * @param rows 查询返回的行。读路径按原样返回；带字段映射的读路径（`returning`）只用到行数。
+ * @param rowsPerCall 逐次查询的返回行；提供时优先于 `rows`（用于区分 insert/update 两条语句的返回）。
  * @returns drizzle 实例与已记录的语句列表。
  */
-function createRecordingDb(rows: unknown[] = []): RecordingDb {
+function createRecordingDb(rows: unknown[] = [], rowsPerCall?: unknown[][]): RecordingDb {
   const recorded: RecordedQuery[] = []
   const client = {
     options: { parsers: {} as Record<string, unknown>, serializers: {} as Record<string, unknown> },
     unsafe(query: string, params: unknown[]) {
       recorded.push({ query, params })
+      const callRows = rowsPerCall?.[recorded.length - 1] ?? rows
       // postgres.js 的 PendingQuery 是 thenable，同时提供 .values()（数组行模式）。
-      const pending = Promise.resolve(rows) as Promise<unknown> & { values: () => Promise<unknown> }
-      pending.values = () => Promise.resolve(rows)
+      const pending = Promise.resolve(callRows) as Promise<unknown> & { values: () => Promise<unknown> }
+      pending.values = () => Promise.resolve(callRows)
       return pending
     },
   }
@@ -58,6 +61,8 @@ function createRecordingDb(rows: unknown[] = []): RecordingDb {
 const chatConfigFixture: ChatConfig = {
   chatId: asChatId('-1001234567890'),
   title: '测试群',
+  chatType: 'supergroup',
+  linkedChatId: asChatId('-1009999999999'),
   language: 'zh',
   rules: [{ id: 'rule-1', kind: 'keyword', pattern: '广告', score: 0.4, actionHint: 'delete', enabled: true }],
   passThreshold: 0.35,
@@ -215,21 +220,79 @@ describe('写入语句的形状与参数化', () => {
     expect(statement?.query).toContain('on conflict ("decision_id") do nothing')
   })
 
-  test('群配置覆盖写入按 chat_id 冲突更新', async () => {
+  test('群配置覆盖写入按 chat_id 冲突更新，元数据列一并刷新', async () => {
     const { repos, recorded } = createPgReposRecording()
     await repos.chats.upsert(chatConfigFixture)
 
     const [statement] = recorded
     expect(statement?.query).toContain('insert into "chats"')
     expect(statement?.query).toContain('on conflict ("chat_id") do update set')
-    // jsonb 列在驱动层序列化成 JSON 字符串后作为单个参数传入。
+    // 列顺序：chat_id / title / chat_type / linked_chat_id / language / rules / 三个数值列。
     const params = statement?.params ?? []
-    expect(params.slice(0, 3)).toEqual(['-1001234567890', '测试群', 'zh'])
-    expect(JSON.parse(String(params[3]))).toEqual(chatConfigFixture.rules)
-    expect(params.slice(4, 7)).toEqual([0.35, 0.8, 60])
+    expect(params.slice(0, 5)).toEqual(['-1001234567890', '测试群', 'supergroup', '-1009999999999', 'zh'])
+    // jsonb 列在驱动层序列化成 JSON 字符串后作为单个参数传入。
+    expect(JSON.parse(String(params[5]))).toEqual(chatConfigFixture.rules)
+    expect(params.slice(6, 9)).toEqual([0.35, 0.8, 60])
     // 冲突更新分支重复一遍配置字段，最后一项是刷新过的 updated_at。
-    expect(params.slice(7, 14)).toEqual(['测试群', 'zh', params[3], 0.35, 0.8, 60, params[13]])
-    expect(String(params[13])).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(params.slice(9, 18)).toEqual([
+      '测试群',
+      'supergroup',
+      '-1009999999999',
+      'zh',
+      params[5],
+      0.35,
+      0.8,
+      60,
+      params[17],
+    ])
+    expect(String(params[17])).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+  })
+
+  test('首次登记用 on conflict do nothing：已存在的行绝不被默认配置覆盖', async () => {
+    const { repos, recorded } = createPgReposRecording()
+    await repos.chats.register(chatConfigFixture)
+
+    const [statement] = recorded
+    expect(statement?.query).toContain('insert into "chats"')
+    expect(statement?.query).toContain('on conflict ("chat_id") do nothing')
+    // 没有任何 update 分支：登记不会触碰已有行的规则。
+    expect(statement?.query).not.toContain('do update')
+  })
+
+  test('元数据刷新只清单列 UPDATE，规则与阈值不出现在语句里', async () => {
+    const { repos, recorded } = createPgReposRecording()
+    await repos.chats.updateMetadata(chatConfigFixture.chatId, {
+      title: '新标题',
+      chatType: 'channel',
+      linkedChatId: null,
+    })
+
+    const [statement] = recorded
+    expect(statement?.query).toContain('update "chats"')
+    expect(statement?.query).toContain('"title" = $1')
+    expect(statement?.query).toContain('"chat_type" = $2')
+    expect(statement?.query).toContain('"linked_chat_id" = $3')
+    // 末尾固定刷新 updated_at，chat_id 只出现在 WHERE。
+    expect(statement?.query).toContain('"updated_at" = $4')
+    expect(statement?.query).toContain('where "chats"."chat_id" = $5')
+    // 规则、阈值、语言都不在 SET 列表里（这是「不覆盖 owner 规则」的数据库层保证）。
+    expect(statement?.query).not.toContain('"rules"')
+    expect(statement?.query).not.toContain('"pass_threshold"')
+    expect(statement?.query).not.toContain('"llm_threshold"')
+    expect(statement?.query).not.toContain('"language"')
+    expect(statement?.params?.slice(0, 3)).toEqual(['新标题', 'channel', null])
+    expect(statement?.params?.[4]).toBe('-1001234567890')
+  })
+
+  test('元数据刷新未指定的字段不进 SET（避免无变化也写列）', async () => {
+    const { repos, recorded } = createPgReposRecording()
+    await repos.chats.updateMetadata(chatConfigFixture.chatId, { title: '只改标题' })
+
+    const [statement] = recorded
+    expect(statement?.query).toContain('"title" = $1')
+    expect(statement?.query).toContain('"updated_at" = $2')
+    expect(statement?.query).not.toContain('"chat_type" =')
+    expect(statement?.query).not.toContain('"linked_chat_id" =')
   })
 
   test('保留期清理按时间条件参数化删除', async () => {
@@ -255,6 +318,8 @@ describe('读语句', () => {
       [
         '-1001234567890',
         '测试群',
+        'supergroup',
+        '-1009999999999',
         'zh',
         chatConfigFixture.rules,
         0.35,
@@ -458,6 +523,355 @@ describe('读语句', () => {
   })
 })
 
+describe('订阅链接与成员仓储的 SQL 形状', () => {
+  /** `subscription_links` 完整行（select 列顺序）。 */
+  const linkRow = [
+    '11111111-1111-4111-8111-111111111111',
+    '-1001234567890',
+    1_000_000_001,
+    '22222222-2222-4222-8222-222222222222',
+    'hash-1',
+    '月度',
+    500,
+    2_592_000,
+    'https://t.me/+abcdefghijklmnop',
+    'active',
+    new Date('2026-09-26T10:00:00Z'),
+    new Date('2026-09-26T10:00:00Z'),
+    null,
+    2,
+    null,
+    null,
+    null,
+  ]
+
+  /** `subscription_members` 完整行（select 列顺序）。 */
+  const memberRow = [
+    '33333333-3333-4333-8333-333333333333',
+    '-1001234567890',
+    7_000_000_002,
+    '11111111-1111-4111-8111-111111111111',
+    'member',
+    new Date('2026-10-26T10:00:00Z'),
+    'until_date',
+    new Date('2026-09-26T09:00:00Z'),
+    new Date('2026-09-26T10:00:00Z'),
+    'event',
+    1_758_000_000,
+    42,
+    null,
+    null,
+    null,
+    null,
+    3,
+    null,
+    null,
+  ]
+
+  const reserveInput = {
+    id: '11111111-1111-4111-8111-111111111111',
+    chatId: asChatId('-1001234567890'),
+    ownerUserId: asUserId(1_000_000_001),
+    requestId: '22222222-2222-4222-8222-222222222222',
+    requestHash: 'hash-1',
+    name: '月度',
+    priceStars: 500,
+    periodSeconds: 2_592_000,
+    createdAt: new Date('2026-09-26T10:00:00Z'),
+  }
+
+  const observation: MemberEventObservation = {
+    chatId: asChatId('-1001234567890'),
+    userId: asUserId(7_000_000_002),
+    state: 'member',
+    expiresAt: new Date('2026-10-26T10:00:00Z'),
+    evidence: 'until_date',
+    linkId: null,
+    isJoin: true,
+    eventDate: 1_758_000_000,
+    eventUpdateId: 42,
+    observedAt: new Date('2026-09-26T10:00:00Z'),
+  }
+
+  test('创建占位按 (owner, request) 冲突即放弃，冲突时返回原行', async () => {
+    const { repos, recorded } = createPgReposRecording([], [[], [linkRow]])
+    const outcome = await repos.subscriptionLinks.reserveCreate(reserveInput)
+
+    expect(outcome.kind).toBe('existing')
+    expect(outcome.link.id).toBe(linkRow[0])
+    expect(recorded[0]?.query).toContain('insert into "subscription_links"')
+    expect(recorded[0]?.query).toContain('on conflict ("owner_user_id","request_id") do nothing')
+    expect(recorded).toHaveLength(2)
+  })
+
+  test('finishCreate 只从 creating/create_unknown 迁移到 active', async () => {
+    const { repos, recorded } = createPgReposRecording([[linkRow[0]]])
+    const finished = await repos.subscriptionLinks.finishCreate(linkRow[0] as string, {
+      inviteLink: 'https://t.me/+abcdefghijklmnop',
+      finishedAt: new Date('2026-09-26T10:00:01Z'),
+    })
+
+    expect(finished).toBe(true)
+    const [statement] = recorded
+    // SET 的参数顺序按列定义（invite_link 在 state 前），不是对象字面量顺序。
+    expect(statement?.query).toContain('"invite_link" = $1')
+    expect(statement?.query).toContain('"state" = $2')
+    expect(statement?.query).toContain('"state" in ($5, $6)')
+    expect(statement?.params.slice(0, 2)).toEqual(['https://t.me/+abcdefghijklmnop', 'active'])
+    expect(statement?.params.slice(4, 6)).toEqual(['creating', 'create_unknown'])
+  })
+
+  test('操作 claim 带 state/version/占位租约条件，并区分版本与活跃占位冲突', async () => {
+    const claimed = createPgReposRecording([linkRow])
+    const result = await claimed.repos.subscriptionLinks.claimMutation(
+      asChatId('-1001234567890'),
+      linkRow[0] as string,
+      2,
+      'rename',
+      new Date('2026-09-26T10:05:00Z'),
+    )
+    expect(result.kind).toBe('claimed')
+    const [statement] = claimed.recorded
+    expect(statement?.query).toContain('update "subscription_links"')
+    expect(statement?.query).toContain('"state" = $7')
+    expect(statement?.query).toContain('"version" = $8')
+    expect(statement?.query).toContain('"operation_started_at" < $9::timestamptz - interval \'60 seconds\'')
+    expect(statement?.query).toContain('"operation_token" is null')
+
+    // 版本不匹配：UPDATE 无返回，读回仍是旧行（version 2），expectedVersion 3 → conflict(version)。
+    const conflicted = createPgReposRecording([], [[], [linkRow]])
+    const conflict = await conflicted.repos.subscriptionLinks.claimMutation(
+      asChatId('-1001234567890'),
+      linkRow[0] as string,
+      3,
+      'revoke',
+      new Date('2026-09-26T10:05:00Z'),
+    )
+    expect(conflict).toEqual({ kind: 'conflict', reason: 'version' })
+
+    // 已撤销行：revoked。
+    const revokedRow = [...linkRow]
+    revokedRow[9] = 'revoked'
+    revokedRow[12] = new Date('2026-09-26T10:00:00Z')
+    const revoked = createPgReposRecording([], [[], [revokedRow]])
+    expect(
+      await revoked.repos.subscriptionLinks.claimMutation(
+        asChatId('-1001234567890'),
+        linkRow[0] as string,
+        2,
+        'rename',
+        new Date('2026-09-26T10:05:00Z'),
+      ),
+    ).toEqual({ kind: 'revoked' })
+  })
+
+  test('finishMutation 要求同 token 且仍为 active（终态不复活）', async () => {
+    const { repos, recorded } = createPgReposRecording([[linkRow[0]]])
+    const ok = await repos.subscriptionLinks.finishMutation(
+      linkRow[0] as string,
+      '44444444-4444-4444-8444-444444444444',
+      { kind: 'revoked', revokedAt: new Date('2026-09-26T10:06:00Z') },
+      new Date('2026-09-26T10:06:00Z'),
+    )
+    expect(ok).toBe(true)
+    const [statement] = recorded
+    // SET 里清空三列占位 + WHERE 里匹配 token，因此 operation_token 出现两次。
+    expect(statement?.query).toContain('"revoked_at" = $3')
+    expect(statement?.query.match(/"operation_token" = \$\d+/g)).toHaveLength(2)
+    expect(statement?.query).toContain('"state" = $')
+  })
+
+  test('成员 applyEvent：插入走 on conflict do nothing，更新走高水位条件与对账水位 CASE', async () => {
+    const inserted = createPgReposRecording([[memberRow[0]]])
+    expect(await inserted.repos.subscriptionMembers.applyEvent(observation)).toBe('inserted')
+    expect(inserted.recorded[0]?.query).toContain('on conflict ("chat_id","user_id") do nothing')
+
+    const updated = createPgReposRecording([], [[], [[memberRow[0]]]])
+    expect(await updated.repos.subscriptionMembers.applyEvent(observation)).toBe('updated')
+    const statement = updated.recorded[1]
+    expect(statement?.query).toContain('update "subscription_members"')
+    expect(statement?.query).toContain('case when')
+    expect(statement?.query).toContain('reconciled_through')
+    expect(statement?.query).toContain('coalesce')
+    expect(statement?.query).toContain('> ("subscription_members"."last_event_date", "subscription_members"."last_event_update_id")')
+
+    const ignored = createPgReposRecording([], [[], []])
+    expect(await ignored.repos.subscriptionMembers.applyEvent(observation)).toBe('ignored')
+  })
+
+  test('成员 applyEvent（无证据）：跳过 INSERT 直接条件 UPDATE；无行返回 ignored 且不抛错', async () => {
+    const noEvidence: MemberEventObservation = { ...observation, evidence: null, isJoin: false }
+
+    // 已有行：保留历史 evidence 的 coalesce 仍在，事件仍可推进状态（例如离开/升管理员）。
+    const updated = createPgReposRecording([], [[[memberRow[0]]]])
+    expect(await updated.repos.subscriptionMembers.applyEvent(noEvidence)).toBe('updated')
+    expect(updated.recorded).toHaveLength(1)
+    expect(updated.recorded[0]?.query).toContain('update "subscription_members"')
+    expect(updated.recorded[0]?.query).toContain('coalesce')
+    expect(updated.recorded[0]?.query).not.toContain('insert into')
+
+    // 不存在行：条件 UPDATE 零行 → ignored，不插入、不抛错。
+    const missing = createPgReposRecording([], [[]])
+    expect(await missing.repos.subscriptionMembers.applyEvent(noEvidence)).toBe('ignored')
+    expect(missing.recorded).toHaveLength(1)
+    expect(missing.recorded[0]?.query).toContain('update "subscription_members"')
+  })
+
+  test('对账 claim 用单条 UPDATE + 子查询 FOR UPDATE SKIP LOCKED，租约/尝试时刻取数据库 now()', async () => {
+    // 返回行是 UPDATE 之后的值：last_checked_at / check_token 已按数据库 now() 写入。
+    const claimedRow = [...memberRow]
+    claimedRow[13] = new Date('2026-09-26T11:00:00Z')
+    claimedRow[17] = '55555555-5555-4555-8555-555555555555'
+    const { repos, recorded } = createPgReposRecording([claimedRow])
+    const claims = await repos.subscriptionMembers.claimChecks({
+      // 进程时钟刻意与数据库时刻不同：claim 的租约与查询开始时刻不得采用它。
+      now: new Date('2026-09-26T10:00:00Z'),
+      limit: 50,
+      leaseMs: 60_000,
+    })
+
+    expect(claims).toHaveLength(1)
+    expect(claims[0]).toMatchObject({
+      memberId: memberRow[0],
+      version: memberRow[16],
+      token: '55555555-5555-4555-8555-555555555555',
+      requestStartedAt: new Date('2026-09-26T11:00:00Z'),
+    })
+    const [statement] = recorded
+    expect(statement?.query).toContain('update "subscription_members"')
+    expect(statement?.query).toContain('gen_random_uuid()')
+    expect(statement?.query).toContain('for update skip locked')
+    expect(statement?.query).toContain('nulls first')
+    expect(statement?.query).toContain('"check_lease_until" <= now()')
+    expect(statement?.query).toContain('"last_checked_at" = now()')
+    expect(statement?.query).toContain('"check_lease_until" = now() + (')
+    expect(statement?.params).toEqual([60_000, 50])
+  })
+
+  test('finishCheck：成功走 token+version 的 CAS 并推进水位；失败只写错误码', async () => {
+    const claim = {
+      memberId: memberRow[0] as string,
+      chatId: asChatId('-1001234567890'),
+      userId: asUserId(7_000_000_002),
+      token: '55555555-5555-4555-8555-555555555555',
+      version: 3,
+      requestStartedAt: new Date('2026-09-26T11:00:00Z'),
+    }
+
+    const ok = createPgReposRecording([[memberRow[0]]])
+    expect(
+      await ok.repos.subscriptionMembers.finishCheck(claim, {
+        kind: 'ok',
+        state: 'left',
+        expiresAt: null,
+        returnedAt: new Date('2026-09-26T11:00:01Z'),
+      }),
+    ).toBe('applied')
+    const [okStatement] = ok.recorded
+    expect(okStatement?.query).toContain('"state" = $1')
+    expect(okStatement?.query).toContain('"observation_source" = $')
+    expect(okStatement?.query).toContain('"reconciled_through" = $')
+    expect(okStatement?.query).toContain('"check_token" = $')
+    expect(okStatement?.query).toContain('"version" = $')
+
+    const failed = createPgReposRecording([[memberRow[0]]])
+    expect(
+      await failed.repos.subscriptionMembers.finishCheck(claim, {
+        kind: 'failed',
+        errorCode: 'rate_limited',
+        checkedAt: new Date('2026-09-26T11:00:01Z'),
+      }),
+    ).toBe('applied')
+    const [failedStatement] = failed.recorded
+    expect(failedStatement?.query).toContain('"last_check_error_code" = $1')
+    // 失败不写事实列。
+    expect(failedStatement?.query).not.toContain('"state" =')
+    expect(failedStatement?.query).not.toContain('"expires_at" =')
+
+    const stale = createPgReposRecording([], [[], []])
+    expect(
+      await stale.repos.subscriptionMembers.finishCheck(claim, {
+        kind: 'failed',
+        errorCode: 'telegram_failed',
+        checkedAt: new Date('2026-09-26T11:00:01Z'),
+      }),
+    ).toBe('stale')
+  })
+
+  test('成员 counts 用 SQL GROUP BY，分页用复合游标边界', async () => {
+    const counts = createPgReposRecording([
+      ['member', 3],
+      ['left', 2],
+    ])
+    expect(await counts.repos.subscriptionMembers.countByState(asChatId('-1001234567890'))).toEqual({
+      known: 5,
+      member: 3,
+      left: 2,
+      unknown: 0,
+    })
+    expect(counts.recorded[0]?.query).toContain('group by "subscription_members"."state"')
+
+    const page = createPgReposRecording([])
+    await page.repos.subscriptionMembers.listPage({
+      chatId: asChatId('-1001234567890'),
+      before: { firstObservedAt: new Date('2026-09-26T10:00:00Z'), id: '33333333-3333-4333-8333-333333333333' },
+      limit: 51,
+    })
+    const [statement] = page.recorded
+    expect(statement?.query).toContain('"first_observed_at" < $2')
+    expect(statement?.query).toContain('"first_observed_at" = $3')
+    expect(statement?.query).toContain('"id" < $4')
+    expect(statement?.query).toContain('order by "subscription_members"."first_observed_at" desc')
+    expect(statement?.params).toEqual([
+      '-1001234567890',
+      '2026-09-26T10:00:00.000Z',
+      '2026-09-26T10:00:00.000Z',
+      '33333333-3333-4333-8333-333333333333',
+      51,
+    ])
+
+    const links = createPgReposRecording([])
+    await links.repos.subscriptionLinks.listPage({
+      chatId: asChatId('-1001234567890'),
+      before: { createdAt: new Date('2026-09-26T10:00:00Z'), id: '11111111-1111-4111-8111-111111111111' },
+      limit: 51,
+    })
+    expect(links.recorded[0]?.query).toContain('"created_at" < $2')
+    expect(links.recorded[0]?.query).toContain('order by "subscription_links"."created_at" desc')
+  })
+
+  test('频道分页只取 channel，比较与排序都固定 C 排序规则', async () => {
+    const { repos, recorded } = createPgReposRecording([])
+    await repos.chats.listChannelsPage({ afterChatId: asChatId('-1001234567890'), limit: 11 })
+
+    const [statement] = recorded
+    expect(statement?.query).toContain('"chat_type" = $1')
+    expect(statement?.query).toContain('"chat_id" collate "C" > $2 collate "C"')
+    expect(statement?.query).toContain('order by "chats"."chat_id" collate "C" asc')
+    expect(statement?.params).toEqual(['channel', '-1001234567890', 11])
+  })
+
+  test('规则/阈值更新只写规则列，绝不碰元数据与语言列', async () => {
+    const { repos, recorded } = createPgReposRecording([])
+    await repos.chats.updateRulesConfig(asChatId('-1001234567890'), {
+      rules: chatConfigFixture.rules,
+      passThreshold: 0.2,
+      llmThreshold: 0.7,
+      muteDurationMinutes: 30,
+    })
+
+    const [statement] = recorded
+    expect(statement?.query).toContain('"rules" = $1')
+    expect(statement?.query).toContain('"pass_threshold" = $2')
+    expect(statement?.query).toContain('"llm_threshold" = $3')
+    expect(statement?.query).toContain('"mute_duration_minutes" = $4')
+    expect(statement?.query).not.toContain('"title" =')
+    expect(statement?.query).not.toContain('"chat_type" =')
+    expect(statement?.query).not.toContain('"linked_chat_id" =')
+    expect(statement?.query).not.toContain('"language" =')
+  })
+})
+
 describe('迁移产物', () => {
   test('迁移链里包含各阶段新增的列、约束与索引', () => {
     const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
@@ -475,6 +889,21 @@ describe('迁移产物', () => {
     expect(sql).toContain('ADD COLUMN "rollback_pending" boolean DEFAULT false NOT NULL;')
     expect(sql).toContain('ADD COLUMN "notice_chat_id" text;')
     expect(sql).toContain('ADD COLUMN "notice_message_id" integer;')
+    // 频道登记批次：聊天类型与 linked discussion 关系。历史行按 supergroup 兼容（DEFAULT 非空）。
+    expect(sql).toContain('CREATE TYPE "public"."chat_type" AS ENUM(\'group\', \'supergroup\', \'channel\');')
+    expect(sql).toContain('ADD COLUMN "chat_type" "chat_type" DEFAULT \'supergroup\' NOT NULL;')
+    expect(sql).toContain('ADD COLUMN "linked_chat_id" text;')
+    // 订阅批次：两张新表 + 幂等/分页/扫描索引 + 复合外键；旧 subscriptions 表不 drop。
+    expect(sql).toContain('CREATE TABLE "subscription_links"')
+    expect(sql).toContain('CREATE TABLE "subscription_members"')
+    expect(sql).toContain('CREATE UNIQUE INDEX "subscription_links_owner_request_key"')
+    expect(sql).toContain('CREATE UNIQUE INDEX "subscription_links_invite_link_key" ON "subscription_links" USING btree ("invite_link") WHERE "subscription_links"."invite_link" is not null;')
+    expect(sql).toContain('CREATE UNIQUE INDEX "subscription_members_chat_user_key"')
+    expect(sql).toContain('CREATE INDEX "subscription_members_scan_idx" ON "subscription_members" USING btree ("last_checked_at" NULLS FIRST,"id");')
+    expect(sql).toContain('FOREIGN KEY ("chat_id","link_id") REFERENCES "public"."subscription_links"("chat_id","id")')
+    expect(sql).toContain('CONSTRAINT "subscription_links_link_complete" CHECK')
+    expect(sql).toContain('CONSTRAINT "subscription_members_event_high_water" CHECK')
+    expect(sql).not.toContain('DROP TABLE "subscriptions"')
     // 跨群处置流的分页游标是 (decided_at, id)，索引必须带上 id 才能覆盖同毫秒并列的全序。
     expect(sql).toContain(
       'CREATE INDEX "moderation_decisions_decided_idx" ON "moderation_decisions" USING btree ("decided_at","id");',
@@ -496,22 +925,87 @@ describe('迁移产物', () => {
     }
   })
 
-  test('0007 snapshot 记录表情总数与 via-bot 列，journal 末尾指向它', () => {
+  test('0009 snapshot 记录订阅链接/成员表，journal 末尾指向它且保留 0008', () => {
     const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
     const journal = JSON.parse(readFileSync(join(migrationsDir, 'meta', '_journal.json'), 'utf8')) as {
       entries: Array<{ idx: number; tag: string }>
     }
     const last = journal.entries.at(-1)
-    expect(last).toEqual({ idx: 7, tag: '0007_bitter_william_stryker', version: '7', when: expect.any(Number), breakpoints: true })
+    expect(last).toEqual({ idx: 9, tag: '0009_petite_trauma', version: '7', when: expect.any(Number), breakpoints: true })
+    // 3a 的 0008 不被覆盖。
+    expect(journal.entries[8]).toEqual({
+      idx: 8,
+      tag: '0008_medical_tiger_shark',
+      version: '7',
+      when: expect.any(Number),
+      breakpoints: true,
+    })
 
     const snapshot = JSON.parse(
-      readFileSync(join(migrationsDir, 'meta', '0007_snapshot.json'), 'utf8'),
+      readFileSync(join(migrationsDir, 'meta', '0009_snapshot.json'), 'utf8'),
     ) as {
       tables: Record<string, { columns: Record<string, { name: string; type: string; notNull: boolean; default?: unknown }> }>
     }
-    const columns = snapshot.tables['public.message_events']?.columns
-    expect(columns?.emoji_count).toEqual({ name: 'emoji_count', type: 'integer', primaryKey: false, notNull: true, default: 0 })
-    expect(columns?.via_bot).toEqual({ name: 'via_bot', type: 'boolean', primaryKey: false, notNull: true, default: false })
+    const linkColumns = snapshot.tables['public.subscription_links']?.columns
+    expect(linkColumns?.owner_user_id?.notNull).toBe(true)
+    expect(linkColumns?.request_id?.type).toBe('uuid')
+    expect(linkColumns?.period_seconds?.type).toBe('integer')
+    expect(linkColumns?.version?.default).toBe(0)
+    expect(linkColumns?.invite_link?.notNull).toBe(false)
+
+    const memberColumns = snapshot.tables['public.subscription_members']?.columns
+    expect(memberColumns?.chat_id?.notNull).toBe(true)
+    expect(memberColumns?.user_id?.type).toBe('bigint')
+    expect(memberColumns?.last_event_date?.type).toBe('bigint')
+    expect(memberColumns?.check_token?.type).toBe('uuid')
+    // 旧订阅表仍在快照里（不 drop、不 rename）。
+    expect(snapshot.tables['public.subscriptions']).toBeDefined()
+  })
+
+  test('0009 迁移只建新表：不 drop/alter 旧 subscriptions，且没有跨 HTTP 的 DB 事务用法', () => {
+    const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
+    const sql0009 = readFileSync(join(migrationsDir, '0009_petite_trauma.sql'), 'utf8')
+    // 旧表名（带引号的精确串）不出现；没有 DROP/ALTER。
+    expect(sql0009).not.toContain('"subscriptions"')
+    expect(sql0009).not.toContain('DROP')
+    expect(sql0009).not.toContain('ALTER TABLE "subscriptions"')
+    expect(sql0009).not.toContain('ALTER TABLE "chats"')
+
+    // 仓储实现不使用事务 API：claim/finish 都是单条语句，语句结束即提交，不跨 HTTP 持事务。
+    const reposSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'pg-repos.ts'), 'utf8')
+    expect(reposSource).not.toContain('.transaction(')
+  })
+
+  test('0009 复合外键引用的唯一索引先于外键建立（真实 PG 的 FK 只认已存在的唯一索引）', () => {
+    const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
+    const sql0009 = readFileSync(join(migrationsDir, '0009_petite_trauma.sql'), 'utf8')
+    const uniqueIndexAt = sql0009.indexOf('CREATE UNIQUE INDEX "subscription_links_chat_id_id_key"')
+    const foreignKeyAt = sql0009.indexOf('CONSTRAINT "subscription_members_link_fk"')
+
+    expect(uniqueIndexAt).toBeGreaterThanOrEqual(0)
+    expect(foreignKeyAt).toBeGreaterThanOrEqual(0)
+    expect(uniqueIndexAt).toBeLessThan(foreignKeyAt)
+  })
+
+  test('0008 snapshot 记录聊天类型与 linked_chat_id 列', () => {
+    const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drizzle')
+    const snapshot = JSON.parse(
+      readFileSync(join(migrationsDir, 'meta', '0008_snapshot.json'), 'utf8'),
+    ) as {
+      tables: Record<string, { columns: Record<string, { name: string; type: string; notNull: boolean; default?: unknown }> }>
+      enums: Record<string, { name: string; values: string[] }>
+    }
+    const columns = snapshot.tables['public.chats']?.columns
+    expect(columns?.chat_type).toEqual({
+      name: 'chat_type',
+      type: 'chat_type',
+      typeSchema: 'public',
+      primaryKey: false,
+      notNull: true,
+      default: "'supergroup'",
+    })
+    expect(columns?.linked_chat_id).toEqual({ name: 'linked_chat_id', type: 'text', primaryKey: false, notNull: false })
+    expect(snapshot.enums['public.chat_type']?.values).toEqual(['group', 'supergroup', 'channel'])
   })
 })
 
@@ -519,9 +1013,13 @@ describe('迁移产物', () => {
  * 建立带记录能力的仓储聚合。
  *
  * @param rows 假驱动返回的行。
+ * @param rowsPerCall 逐次查询的返回行（区分 insert/update 两条语句的返回）。
  * @returns 仓储、已记录语句与假驱动。
  */
-function createPgReposRecording(rows: unknown[] = []): RecordingDb & { repos: ReturnType<typeof createPgRepos> } {
-  const recording = createRecordingDb(rows)
+function createPgReposRecording(
+  rows: unknown[] = [],
+  rowsPerCall?: unknown[][],
+): RecordingDb & { repos: ReturnType<typeof createPgRepos> } {
+  const recording = createRecordingDb(rows, rowsPerCall)
   return { ...recording, repos: createPgRepos(recording.db) }
 }

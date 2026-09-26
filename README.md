@@ -2,7 +2,7 @@
 
 自用 Telegram 群组/频道消息审核工具。规则层先筛，低置信样本才送云端 LLM 复核，动作执行结果与申诉闭环都留痕。
 
-当前进度：Phase 1 后端闭环已完成。审核管线、动作执行（幂等 + 限流退避）、Mini App 申诉 API、owner 处理流程、日聚合与保留期清理调度都在跑，调度器里还带两条兜底扫描：未执行决策的补偿执行与未送达 owner 通知的补发；Mini App 界面与频道/订阅能力归后续阶段。
+当前进度：Phase 1 后端闭环、Phase 2 面板与 Phase 3a（频道登记 + linked discussion 评论关系）已完成；Phase 3b 后端（订阅链接台账 + 成员观测台账 + 60 秒对账 + owner 订阅端点）已就位，对应的 Mini App 订阅页签由 web lane 提供、对接见「HTTP 接口」。审核管线、动作执行（幂等 + 限流退避）、Mini App 申诉与面板 API、日聚合与保留期清理调度都在跑，调度器里带三条兜底扫描：未执行决策的补偿执行、未送达 owner 通知的补发与撤销结案后的权限回滚补偿。
 
 ## 结构
 
@@ -86,13 +86,13 @@ pnpm dev:web              # Mini App 开发服务器，5173
 DATABASE_URL=postgres://user:pass@localhost:5432/skitarii pnpm db:migrate
 ```
 
-webhook 注册：设置了 `PUBLIC_URL` 时由服务启动阶段自动完成，无需手工操作（见「部署（容器 / Zeabur）」）；没设 `PUBLIC_URL` 时手工注册一次，可顺带用 `allowed_updates` 收窄更新类型：
+webhook 注册：设置了 `PUBLIC_URL` 时由服务启动阶段自动完成，无需手工操作（见「部署（容器 / Zeabur）」）；没设 `PUBLIC_URL` 时手工注册一次。注册时会带上与长轮询共用同一份名单的 `allowed_updates`（`message`、`edited_message`、`callback_query`、`channel_post`、`my_chat_member`、`chat_member`），手工注册照抄这份名单即可：
 
 ```bash
 curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
   -d "url=https://your-host/telegram/webhook" \
   -d "secret_token=${WEBHOOK_SECRET}" \
-  -d "allowed_updates=[\"message\",\"callback_query\"]"
+  -d "allowed_updates=[\"message\",\"edited_message\",\"callback_query\",\"channel_post\",\"my_chat_member\",\"chat_member\"]"
 ```
 
 ## 部署（容器 / Zeabur）
@@ -106,7 +106,7 @@ curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
 3. 容器启动 `deploy/entrypoint.sh`：先 `pnpm db:migrate`，失败即以非 0 退出，不会带着旧 schema 起服务；成功后 `exec node --import tsx src/index.ts`
 4. 进程监听 `PORT`（平台注入，缺省 3000）；`PUBLIC_URL` 非空时启动阶段调用 `setWebhook(${PUBLIC_URL}/telegram/webhook, { secret_token })`，幂等（每次启动重注册），失败只记日志、不阻断启动，Telegram 侧保留旧地址
 
-迁移按单实例、低流量假设执行：每个实例启动都会跑一遍 `pnpm db:migrate`，多实例同时启动会并发执行迁移；0004 的 `CREATE INDEX` 会短暂持有表级 SHARE 锁（阻塞写入、允许读取），0006 的两次 `ADD COLUMN`（可空、无默认值）会短暂持有 ACCESS EXCLUSIVE 锁，自用规模下几乎无感。实例数或写入量上来后，应把迁移拆成独立的发布步骤，或改用手工执行的 `CREATE INDEX CONCURRENTLY`。
+迁移按单实例、低流量假设执行：每个实例启动都会跑一遍 `pnpm db:migrate`，多实例同时启动会并发执行迁移；0004 的 `CREATE INDEX` 会短暂持有表级 SHARE 锁（阻塞写入、允许读取），0006/0008/0009 的 `ADD COLUMN` 与 `CREATE TABLE`（0008 还有枚举类型 `chat_type` 的创建）会短暂持有 ACCESS EXCLUSIVE 锁，自用规模下几乎无感。0009 只新建 `subscription_links` / `subscription_members` 两张空表与索引，不 drop、不 rename、不改写旧 `subscriptions` 数据。实例数或写入量上来后，应把迁移拆成独立的发布步骤，或改用手工执行的 `CREATE INDEX CONCURRENTLY`。
 
 ```bash
 docker build -t skitarii .
@@ -135,7 +135,7 @@ docker run --rm --env-file .env -p 3000:3000 skitarii
 | `LLM_TIMEOUT_MS` | 否 | 复核请求超时（毫秒），缺省 30000。三个 `LLM_*` 缺任意一项即视为「未配置复核」，灰色地带按待复核处理。 |
 | `MAINTENANCE_INTERVAL_MS` | 否 | 维护任务（日聚合重算 + 保留期清理）间隔（毫秒），缺省 3600000。 |
 
-自动注册只提交 `secret_token`，不限制 `allowed_updates`：没有处理器的更新类型到达后不会产生动作，只是多几跳流量；要收窄就按上面手工注册的 curl 覆盖一次。
+自动注册提交 `secret_token` 与显式的 `allowed_updates`（`message`、`edited_message`、`callback_query`、`channel_post`、`my_chat_member`、`chat_member`）：名单只在 `apps/bot` 维护一份，webhook 注册与长轮询共用，避免两个入口漂移导致漏收更新。`chat_member` 是 Phase 3b 订阅成员台账的事实来源，接收它需要 bot 在频道是管理员；不订阅没有处理器的其他类型，只会多几跳流量。切换部署形态（webhook ↔ 长轮询）时会用启动时的名单重新注册，无需手工覆盖。
 
 ### BotFather 前置步骤
 
@@ -144,6 +144,7 @@ docker run --rm --env-file .env -p 3000:3000 skitarii
 - [ ] 在 @BotFather 新建 bot，记下 `BOT_TOKEN`
 - [ ] `/setprivacy` 选中该 bot，设为 `Disable`（否则读不到全群消息，审核管线收不到非命令消息）
 - [ ] 把 bot 拉进目标群，并授予管理员权限（删除消息 / 禁言 / 封禁都需要）
+- [ ] 频道场景：把 bot 设为频道管理员（`channel_post` 只在管理员身份下投递；频道帖只登记元数据、不审核）。若频道已绑定讨论组，把 bot 一并加入讨论组并授予删除消息权限——评论在讨论组里按讨论组自身的规则审核
 - [ ] 注册 Mini App URL：Mini App 由本服务托管在 `${PUBLIC_URL}/app/`，按 BotFather 的 Mini App 流程把地址指过去
 - [ ] 生成 `WEBHOOK_SECRET`：`openssl rand -hex 32`
 
@@ -189,7 +190,7 @@ Mini App 的申诉与面板接口是冻结契约，界面按这里实现。所�
 
 ### `POST /telegram/webhook`
 
-Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于 `WEBHOOK_SECRET`，校验由 grammY 的 `webhookCallback` 完成（常数时间比较），不匹配返回 401，`allowed_updates` 只需 `message` 与 `callback_query`。
+Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于 `WEBHOOK_SECRET`，校验由 grammY 的 `webhookCallback` 完成（常数时间比较），不匹配返回 401。`allowed_updates` 由服务注册时显式写死为 `message`、`edited_message`、`callback_query`、`channel_post`、`my_chat_member`、`chat_member`（与长轮询入口同源，见「BotFather 前置步骤」上一节的手工注册命令）。
 
 ### `GET /api/appeals/:decisionId?initData=...`
 
@@ -262,6 +263,8 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
     {
       "chatId": "-1001234567890",
       "title": "测试群",
+      "chatType": "supergroup",
+      "linkedChatId": null,
       "today": { "messageCount": 12, "actionCount": 3, "appealCount": 1, "overturnedCount": 0 },
       "last7d": { "messageCount": 80, "actionCount": 11, "appealCount": 4, "overturnedCount": 1 },
       "openAppeals": 2
@@ -271,7 +274,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 }
 ```
 
-`chats` 按近 7 日 `actionCount` 降序，同分按 `chatId` 升序；`today` 与 `last7d` 按 UTC 切日，近 7 日含今天。`openAppeals` 是各群待处理申诉数。
+`chats` 按近 7 日 `actionCount` 降序，同分按 `chatId` 升序；`today` 与 `last7d` 按 UTC 切日，近 7 日含今天。`openAppeals` 是各群待处理申诉数。`chatType`（`group | supergroup | channel`）与 `linkedChatId` 是只读登记事实：频道行指向讨论组、讨论组行指向频道，未链接或尚未探测到时为 `null`；本批只暴露，界面消费留到下一批。
 
 #### `GET /api/panel/chats/:chatId/series?days=30&initData=...`
 
@@ -287,6 +290,8 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 {
   "chatId": "-1001234567890",
   "title": "测试群",
+  "chatType": "supergroup",
+  "linkedChatId": null,
   "language": "zh",
   "passThreshold": 0.3,
   "llmThreshold": 0.8,
@@ -297,7 +302,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 }
 ```
 
-响应就是 `ChatConfig` 本体。`language` 目前只读（切换不在本批范围）。未知群 `404 {"error":"chat_not_found"}`。
+响应就是 `ChatConfig` 本体。`language` 目前只读（切换不在本批范围）；`chatType` / `linkedChatId` 同样是只读登记事实，本批只暴露不改。未知群 `404 {"error":"chat_not_found"}`。
 
 #### `PUT /api/panel/chats/:chatId/config`
 
@@ -313,7 +318,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 }
 ```
 
-全量替换规则与阈值，保留 `title` / `language`；保存后管线立即读到新配置。`rules` 里的 `id` 可省略或为空串，服务端分配 `custom-<8位十六进制>` 并随响应返回。
+全量替换规则与阈值，保留 `title` / `chatType` / `linkedChatId` / `language`；保存后管线立即读到新配置。`rules` 里的 `id` 可省略或为空串，服务端分配 `custom-<8位十六进制>` 并随响应返回。面板保存与 bot 的元数据刷新走不同语句（前者全量、后者只清单列），并发时不会互相覆盖：元数据刷新永远不写规则列。
 
 响应包装：GET 直接返回配置本体，PUT 把同一形状包在 `config` 键下，前端解析时不要混用。判定顺序是结构 → 鉴权 → 群存在 → 语义校验：未知群即使配置非法也先返回 `404 chat_not_found`。`details` 最多 50 条，超出时截断并以 `…等 N 条其他错误` 汇总。
 
@@ -394,6 +399,24 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 
 结案与 Telegram 回调按钮共用同一实现（`resolveAppeal`），撤销会回滚权限（mute 解禁、ban 解封；管理员/群主不可罚目标跳过），并把申诉置为 `overturned` 或 `upheld`。结案与回滚是两步：撤销时先写入 `appeals.rollback_pending` 标记再回滚，中途崩溃留下的标记由调度器的补偿扫描补跑（解禁/解封幂等）。
 
+### 面板订阅接口（owner 专属，Phase 3b）
+
+前缀 `/api/panel/subscriptions`，全部 owner-only。**凭据只从 `X-Telegram-Init-Data` header 读取**（URL 与 body 不携带；body 里出现 `initData` 字段会被严格校验拒绝），所有响应带 `Cache-Control: no-store`。日期是 UTC ISO-8601 或 `null`；`userId` 是安全整数 number，`linkId`/`requestId` 是 UUID。路径参数 `chatId` 必须是合法十进制字符串，未登记返回 404 `channel_not_found`，已登记但不是频道返回 400 `channel_required`。
+
+| 方法与路径 | 输入 | 成功响应 |
+| --- | --- | --- |
+| `GET /channels` | `limit`（默认 50，1..100）、`cursor` | `200 {items:[ChannelDto],nextCursor,serverTime}`，只列已登记频道 |
+| `GET /channels/:chatId` | — | `200 ChannelDetailsDto`（`visibility`/`canManageLinks`/`capabilityErrorCode`/`counts`/`serverTime`） |
+| `GET /channels/:chatId/links` | `limit`、`cursor` | `200 {items:[LinkDto],nextCursor,serverTime}`，含占位/失败行 |
+| `POST /channels/:chatId/links` | `{requestId,name,priceStars}` | `201 {link,replayed:false}`；同 requestId 已完成请求 `200 {link,replayed:true}` |
+| `PATCH /channels/:chatId/links/:linkId` | `{name,expectedVersion}` | `200 {link}`（只改名，价格/周期不可编辑） |
+| `POST /channels/:chatId/links/:linkId/revoke` | `{expectedVersion}` | `200 {link}`（含已撤销的重放） |
+| `GET /channels/:chatId/members` | `limit`、`cursor` | `200 {items:[MemberDto],nextCursor,serverTime}` |
+
+`name` 可空串、按 Unicode code point 至多 32、保留原文不 trim；`priceStars` 是 1..10000 的整数；周期由服务端固定 `2592000`，客户端不传；POST/PATCH 严格拒绝额外字段。分页游标是不透明 base64url JSON（>1024 字符、跨资源、跨频道、坏字段一律 400 `invalid_cursor`），links 按 `(createdAt,id)` 倒序、members 按不可变 `(firstObservedAt,id)` 倒序；counts 用 SQL 聚合，不受分页影响。频道详情与变更前会用 `getChat` + `getChatMember(bot)` 校验可见性与权限（获取失败为 `unknown` 且 `canManageLinks=false`，不把未知当私有），变更权限不足 403 `bot_permission_required`。
+
+错误统一为 `{error,message,retryable,requestId?}`：400 `invalid_request|invalid_cursor|channel_required`；401 `init_data_invalid`；403 `forbidden|bot_permission_required`；404 `channel_not_found|link_not_found`；409 `request_conflict|operation_in_progress|create_outcome_unknown|link_revoked|version_conflict|create_failed`；502 `telegram_failed|telegram_outcome_unknown|persistence_after_telegram_failed`；其他故障 500 `internal_error`。`retryable` 只表示同一请求可安全重查/重试，不表示可以换 requestId 再建。路由层只按精确方法匹配：非 GET/POST/PUT/PATCH 的请求不会回退成 GET。
+
 ### `GET /app/*`
 
 Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有扩展名时回退到 `index.html`，路径解析后必须在产物目录内（`..` 与百分号编码逃逸一律 404）。跑 `pnpm build:web` 之前访问会得到 404。
@@ -412,7 +435,7 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **规则与阈值可在面板里编辑。** 规则集、双阈值与禁言时长在 Mini App 面板的「规则」页签编辑，保存后立即生效（管线每条消息读配置）。保存边界会挡住坏数据（阈值乱序、坏正则、非法枚举、超量规则等）并逐条指出第几条规则的哪个字段，与 README 既有口径「规则编译失败在保存接口暴露」一致。
 
-**默认配置只在群首次登记时写入。** 新群拿到 15 条默认规则（含 `default-emoji-flood`：表情总数 ≥6；`default-inline-bot`：经内联机器人发送，pattern 不使用），此后配置以数据库为准；已登记的群不会自动追加新默认规则，需要时在面板手动添加。表情总数把普通 Unicode 表情也计入（`custom-emoji` 只覆盖付费自定义表情），按用户感知每个表情恰计一次（ZWJ 序列如家庭表情计 1，不再按码位拆开）；两者叠加后有意的语义收紧：≥6 个自定义表情会同时命中 `default-emoji-burst` 与 `default-emoji-flood`（0.8 直接处置）。
+**默认配置只在群/频道首次登记时写入。** 新对话拿到 15 条默认规则（含 `default-emoji-flood`：表情总数 ≥6；`default-inline-bot`：经内联机器人发送，pattern 不使用），此后配置以数据库为准；已登记的群不会自动追加新默认规则，需要时在面板手动添加。频道与讨论组各自登记、各自成套配置，互不套用（详见「频道与讨论组（Phase 3a）」）。表情总数把普通 Unicode 表情也计入（`custom-emoji` 只覆盖付费自定义表情），按用户感知每个表情恰计一次（ZWJ 序列如家庭表情计 1，不再按码位拆开）；两者叠加后有意的语义收紧：≥6 个自定义表情会同时命中 `default-emoji-burst` 与 `default-emoji-flood`（0.8 直接处置）。
 
 **重复投递不重复处置。** 事件 id 由 `(chatId, messageId)` 派生（编辑消息附加 `edit:${edit_date}:${内容哈希前 16 位}` 判别符：同一秒内不同内容的编辑各自成事件，编辑回退到早前内容时复用当时的事件 id、不再重审），决策 id 由事件 id 派生，落库用 `on conflict do nothing`；执行侧再叠一层 `eventId + action` 的进程内幂等闸门与 `moderation_decisions.executed` 回填。Telegram 重投递同一 update 的效果是「什么都不再发生」。
 
@@ -422,10 +445,42 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **依赖冻结。** 依赖在脚手架阶段一次性装齐，后续 lane 不新增外部依赖。需要新库时先改根 `package.json` 与各包 `package.json`，再重跑 `pnpm install`。
 
+## 频道与讨论组（Phase 3a）
+
+**登记与刷新。** bot 把所在的群/频道写进 `chats`：新群第一条消息、`my_chat_member`（bot 被加入或升为管理员）、`channel_post` 三条入口都会登记，登记只走 `ChatRepo.register`——`chatId` 已存在时什么都不做，绝不用默认配置覆盖 owner 已保存的规则。已登记行的元数据（标题、类型、linked 关系）走独立的 `ChatRepo.updateMetadata` 单列 UPDATE，同样不碰规则与阈值。
+
+**管理员权限。** 删除/禁言/封禁都要 bot 在目标群是管理员；频道场景还要把 bot 设为频道管理员才会收到 `channel_post`。评论在讨论组里审核，因此讨论组里也要给 bot 删除消息的权限。
+
+**频道帖只登记、不审核。** `channel_post` 不产生 `message_events`、不落帖子内容、不执行动作，只登记频道元数据（类型、标题、linked 讨论组）。
+
+**评论归属讨论组。** 频道绑定的讨论组里的评论就是讨论组的普通消息：发送者是评论用户，按该讨论组自己的配置判定与处置（讨论组首次收到消息时登记，拿自己的默认规则）。频道配置不会应用到讨论组，反之亦然——判定只看消息所在聊天的 `chatId`。频道自动转发到讨论组的根帖（`is_automatic_forward`）不是用户发言，一律跳过，不产生事件与处置；普通用户评论不受影响。私聊评论深链的新格式（`t.me/<channel>/<post>?comment=<id>`）不在本批范围，既有链接回退（`t.me/c/...` 深链）保持不变。
+
+**linked discussion 关系。** 频道 ↔ 讨论组是 Telegram 的 linked chat：频道行 `linkedChatId` 指向讨论组，讨论组行指向频道。更新里不带这个字段（只有 `getChat` 的完整聊天信息有），因此只在关系缺失时探测一次，并按聊天记录冷却窗口（内存表，6 小时），已有值绝不重复请求——不会出现「每条频道帖都打一次 getChat」。`getChat` 失败按可恢复降级处理：保留已知信息、只记一条不含 token 的脱敏日志，之后（冷却期外）由新的频道帖、成员变更或评论触发再试。已知边界：链接**被解除**时不会主动清空已记录的值（没有对应的更新事件，当前也没有消费方），需要时手工改库。
+
+**历史类型待刷新。** `chats.chat_type` 是迁移新列，历史行按兼容默认值 `supergroup` 落库；真实类型由后续的登记/刷新路径修正（新消息、`my_chat_member`、`channel_post` 任一入口都会带来权威的 `chat.type`）。看到历史群 `chatType` 不准时，等下一次消息或成员变更即可，不需要手工改库。这些刷新都依赖实际收到的更新，**不承诺实时或最终一致**：bot 不在场、链接被解除、群被改名等没有对应更新时，记录会保持旧值，需要准确值以 Telegram 侧为准。
+
+**旧订阅门禁表仍保留、不再发展。** Phase 1 的 `subscriptions` 表（用户 + 链接 + 非空到期日捆绑）与旧类型、旧数据都不删不改、不自动迁移；Phase 3b 的新台账是独立的 `subscription_links` + `subscription_members`（见「频道订阅（Phase 3b）」）。旧表有数据是合法状态，新台账不把它当既有成员依据。
+
+## 频道订阅（Phase 3b）
+
+服务端能力：Bot 自建**付费频道**邀请链接的创建、改名、撤销；由 `chat_member` 事件与定期对账维护的**成员观测台账**；owner 面板通过 HTTP 契约（见「面板订阅接口」）消费。**Telegram 原生管理订阅访问**：本地任何到期时间、撤链、查询失败都不会触发 ban/kick/restrict，本服务的相关代码只读成员快照、不调用任何权限处置接口。
+
+**数据模型。** 新表 `subscription_links`（幂等创建占位 + 完整邀请链接 + 操作占位）与 `subscription_members`（已知成员的状态、到期观测值、纳入证据、事件高水位、对账控制字段）。旧 `subscriptions` 表保留但不参与新台账。邀请链接只保存在数据库与 owner 面板响应里，绝不进日志、异常对象或监控标签。
+
+**创建（不套自动重试）。** 客户端带 `requestId` 提交；服务端先落持久化占位（`creating`），只有拿到占位的调用者才会向 Telegram 发一次创建。同一 `requestId` 同载荷重试直接重放已保存结果；不同载荷返回 409；占位 60 秒仍未确认即视为 `create_unknown` 且**绝不自动重发**。Telegram 明确拒绝记 `create_failed`；网络超时/进程崩溃等不确定结果返回 502 并提示「可能已创建，先去频道邀请链接人工核查」——不提供虚假的 exactly-once 承诺，也不自动生成新 requestId 重试。
+
+**改名与撤销。** 只操作本服务保存且属于路径频道的完整链接（不接受客户端提交任意 inviteLink）。改名只发送 name；撤销先由 Telegram 确认「原链接 is_revoked=true」再落本地状态。改名/撤销走数据库条件写（expectedVersion + 操作占位），冲突返回 409；**撤销是终态**，迟到的改名结果不能让已撤销链接复活。DB 提交失败不返回成功。
+
+**成员纳入与语义。** 只处理频道成员事件，身份取 `new_chat_member.user.id`（`from` 是操作人）。新行必须有订阅证据：有效的 `ChatMemberMember.until_date`，或加入时的 `invite_link` 与本 Bot 新台账中的付费链接完整匹配（外部管理员创建的链接会被掩码，无法关联——这是 Telegram 的限制）；无证据的新免费成员不纳入。`expiresAt` 是「最新成功快照观测到的到期时间」，缺失只表示这次没观测到，不代表无限期或付款失效；`left` 只表示观测到离开，不用 `expired` 表述；`member` 计数是「最后一次观测仍在频道」的已知成员，不是付费会员总数、不是到账或收入。公开频道的付费链接不阻止任何人免费直接加入。
+
+**定期对账。** server 进程每 60 秒跑一轮 single-flight 对账（独立生命周期，shutdown 时停止）：每轮最多 claim 50 行、最多 4 个并发、单次 `getChatMember` 10 秒超时、租约 60 秒；按 `lastCheckedAt ASC NULLS FIRST, id ASC` 公平轮转，失败也推进尝试时刻；成功结果用 CAS（token + version）落库，查询期间有事件写入就丢弃结果；429 停止本轮新派发并释放未派发的租约。对账只读 `getChatMember`，不调用权限处置接口。Telegram 不提供精确的服务器快照时间，短暂观测不一致由下一轮修正，不宣称强一致。
+
+**已知边界。** 不枚举历史全量订户、不保证所有续订即时入账、不提供财务证明、不自动恢复失去响应的创建结果（需 owner 到 Telegram 核查孤儿链接）、撤销对既有订阅的影响以 Telegram 为准、不用本地时间过期做任何权限维护。真机（真实 PG 迁移与真实 Telegram 调用）尚未验证，见「Phase 1 的已知边界」。
+
 ## Phase 1 的已知边界
 
 - 误伤样本回写：复核缓存的判定指纹在 Phase 2c 升到 v2（把样例纳入键），旧指纹的缓存不再命中，等 30 天保留期清理自然消失；内容白名单的自动放行窗口固定 30 天、样本回看窗口 90 天，都不随群配置调整。
-- 频道消息（`channel_post`）与 linked discussion 评论、订阅门禁（`subscriptions` 表已就位）按计划留到 Phase 3。
+- 频道与讨论组：频道帖只登记元数据（`channel_post` 不审核、不落内容），评论按讨论组自身规则审；订阅链接与成员观测见「频道订阅（Phase 3b）」。旧 `subscriptions` 表保留、未迁移。
 - 日聚合按 UTC 切日：`ChatConfig` 里没有时区字段，跨时区部署的看板边界会有一天偏差，比值类指标不受影响。
 - 规则集、阈值与禁言时长可以在面板里编辑，也可以直接改数据库或走 `ChatRepo.upsert`：两处没有版本协调（单 owner 最后写入胜），并发编辑面板与数据库不会互相提示。
 - 单进程假设：幂等闸门与令牌桶都在进程内，多实例部署前需要把它们挪到共享存储。

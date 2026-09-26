@@ -90,7 +90,17 @@ function setup(resolveResult: AppealResolution = { kind: 'resolved', rollbackFai
 
 /** 群配置构造器。 */
 function chatConfigFor(id: ChatId, title: string): ChatConfig {
-  return { chatId: id, title, language: 'zh', rules: [], passThreshold: 0.3, llmThreshold: 0.8, muteDurationMinutes: 60 }
+  return {
+    chatId: id,
+    title,
+    chatType: 'supergroup',
+    linkedChatId: null,
+    language: 'zh',
+    rules: [],
+    passThreshold: 0.3,
+    llmThreshold: 0.8,
+    muteDurationMinutes: 60,
+  }
 }
 
 /** 预置一条日聚合。 */
@@ -266,6 +276,8 @@ describe('面板概览', () => {
         {
           chatId,
           title: '甲群',
+          chatType: 'supergroup',
+          linkedChatId: null,
           today: { messageCount: 10, actionCount: 3, appealCount: 1, overturnedCount: 0 },
           last7d: { messageCount: 15, actionCount: 4, appealCount: 1, overturnedCount: 0 },
           openAppeals: 0,
@@ -273,12 +285,29 @@ describe('面板概览', () => {
         {
           chatId: otherChatId,
           title: '乙群',
+          chatType: 'supergroup',
+          linkedChatId: null,
           today: { messageCount: 4, actionCount: 1, appealCount: 0, overturnedCount: 2 },
           last7d: { messageCount: 4, actionCount: 1, appealCount: 0, overturnedCount: 2 },
           openAppeals: 2,
         },
       ],
       serverTime: now,
+    })
+  })
+
+  test('概览带只读的 chatType / linkedChatId（频道行原样透出登记事实）', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert({
+      ...chatConfigFor(chatId, '示例频道'),
+      chatType: 'channel',
+      linkedChatId: asChatId('-1009999999999'),
+    })
+
+    const result = await getPanelOverview(deps, { initData: ownerInitData() })
+
+    expect(result.body).toMatchObject({
+      chats: [{ chatId, chatType: 'channel', linkedChatId: '-1009999999999' }],
     })
   })
 
@@ -726,6 +755,76 @@ describe('面板规则配置', () => {
     expect(config.rules[1]?.id).not.toBe(config.rules[2]?.id)
     // 落库的就是返回的那份：管线每条消息读它，「保存后立即生效」由此成立。
     expect(await store.repos.chats.findByChatId(chatId)).toEqual(config)
+  })
+
+  test('保存：保留 chatType / linkedChatId 等面板不管理的元数据', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert({
+      ...chatConfigFor(chatId, '示例频道'),
+      chatType: 'channel',
+      linkedChatId: asChatId('-1009999999999'),
+    })
+
+    const result = await putPanelChatConfig(deps, {
+      chatId,
+      body: { initData: ownerInitData(), config: configPayload({ passThreshold: 0.2, llmThreshold: 0.7 }) },
+    })
+
+    expect(result.status).toBe(200)
+    const config = (result.body as { config: ChatConfig }).config
+    expect(config.chatType).toBe('channel')
+    expect(config.linkedChatId).toBe('-1009999999999')
+    // 落库也保留：全量保存不能把登记的类型/linked 关系冲成默认值。
+    const stored = await store.repos.chats.findByChatId(chatId)
+    expect(stored?.chatType).toBe('channel')
+    expect(stored?.linkedChatId).toBe('-1009999999999')
+  })
+
+  test('保存只写规则/阈值：不走 upsert，且不覆盖写之前的并发元数据刷新', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert({
+      ...chatConfigFor(chatId, '旧标题'),
+      chatType: 'supergroup',
+      linkedChatId: null,
+    })
+
+    let upsertCalls = 0
+    let rulesWrites = 0
+    const repos = {
+      ...store.repos,
+      chats: {
+        ...store.repos.chats,
+        upsert: async () => {
+          upsertCalls += 1
+        },
+        updateRulesConfig: async (targetChatId: ReturnType<typeof asChatId>, patch: Parameters<typeof store.repos.chats.updateRulesConfig>[1]) => {
+          rulesWrites += 1
+          // 模拟 bot 的元数据刷新发生在面板读取之后、落库之前。
+          await store.repos.chats.updateMetadata(targetChatId, {
+            title: '并发刷新后的标题',
+            chatType: 'channel',
+            linkedChatId: asChatId('-1009999999999'),
+          })
+          await store.repos.chats.updateRulesConfig(targetChatId, patch)
+        },
+      },
+    }
+
+    const result = await putPanelChatConfig(
+      { ...deps, repos },
+      { chatId, body: { initData: ownerInitData(), config: configPayload({ passThreshold: 0.2, llmThreshold: 0.7 }) } },
+    )
+
+    expect(result.status).toBe(200)
+    expect(upsertCalls).toBe(0)
+    expect(rulesWrites).toBe(1)
+    const stored = await store.repos.chats.findByChatId(chatId)
+    // 元数据保住并发刷新的结果；规则用本次保存的值。
+    expect(stored?.title).toBe('并发刷新后的标题')
+    expect(stored?.chatType).toBe('channel')
+    expect(stored?.linkedChatId).toBe('-1009999999999')
+    expect(stored?.rules).toEqual((result.body as { config: ChatConfig }).config.rules)
+    expect(stored?.passThreshold).toBe(0.2)
   })
 
   test('保存：emoji-count 与 via-bot 合法；via-bot 允许空 pattern', async () => {

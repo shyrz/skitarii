@@ -6,6 +6,7 @@ import {
   type Action,
   type ChatConfig,
   type ChatId,
+  type ChatType,
   type MessageFeatures,
   type Signal,
   type UserId,
@@ -95,6 +96,11 @@ export interface CommentThread {
 export interface IncomingMessage {
   chatId: ChatId
   chatTitle: string
+  /**
+   * 聊天类型，来自 update 的 `chat.type`。登记新群与刷新历史行类型只认这个值，
+   * 不从发送者（可能缺失 `from`）推断。
+   */
+  chatType: ChatType
   messageId: number
   userId: UserId
   /** 原文（正文或 caption）。是内容哈希与摘录的唯一来源。 */
@@ -158,8 +164,10 @@ export interface DecisionObservation {
  *
  * @param deps 仓储、复核器、执行器与日志。
  * @param message 入站消息。
+ * @returns 本条消息使用的群配置（读回或登记后的权威版本）。
+ *   调用方（bot 层）可以据此决定是否需要补充 linked discussion 关系，而不必再查一次库。
  */
-export async function handleIncomingMessage(deps: PipelineDeps, message: IncomingMessage): Promise<void> {
+export async function handleIncomingMessage(deps: PipelineDeps, message: IncomingMessage): Promise<ChatConfig> {
   const now = deps.now ?? (() => new Date())
   const contentHash = contentHashOf(message.text)
   const eventId = deriveEventId(
@@ -263,6 +271,8 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
   }
 
   await deps.executor.execute(stored, { messageId: message.messageId })
+
+  return config
 }
 
 /**
@@ -319,7 +329,14 @@ function isWhitelisted(
 }
 
 /**
- * 读取群配置；未登记时写入默认配置并返回。
+ * 读取群配置；未登记时登记默认配置并返回权威版本。
+ *
+ * 首次登记用 `register`（冲突即放弃）而不是 `upsert`：新群第一条消息可能与 owner 在面板里的保存并发，
+ * 全量覆盖会把刚保存的规则冲掉。登记后重读一次，以库里的行为准（并发下可能由别处先写入）。
+ *
+ * 已登记的群在类型/标题与 update 不一致时补一次元数据刷新：历史行迁移时统一按 `supergroup` 兼容，
+ * 真实类型由这里（以及 `my_chat_member` / `channel_post`）修正，且只走 `updateMetadata` 单列更新，
+ * 不碰规则。
  *
  * @param deps 管线依赖。
  * @param message 入站消息。
@@ -327,12 +344,20 @@ function isWhitelisted(
  */
 async function loadConfig(deps: PipelineDeps, message: IncomingMessage): Promise<ChatConfig> {
   const existing = await deps.repos.chats.findByChatId(message.chatId)
-  if (existing !== null) return existing
+  if (existing !== null) {
+    if (existing.chatType === message.chatType && existing.title === message.chatTitle) return existing
+
+    await deps.repos.chats.updateMetadata(message.chatId, {
+      chatType: message.chatType,
+      title: message.chatTitle,
+    })
+    return { ...existing, chatType: message.chatType, title: message.chatTitle }
+  }
 
   deps.logger.info(`首次见到未登记的群，写入默认配置 chatId=${message.chatId}`)
-  const config = defaultChatConfig(message.chatId, message.chatTitle, 'zh')
-  await deps.repos.chats.upsert(config)
-  return config
+  const config = defaultChatConfig(message.chatId, message.chatTitle, 'zh', message.chatType, null)
+  await deps.repos.chats.register(config)
+  return (await deps.repos.chats.findByChatId(message.chatId)) ?? config
 }
 
 /**

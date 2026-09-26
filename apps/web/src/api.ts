@@ -352,3 +352,269 @@ export async function savePanelConfig(
   const body = (await res.json()) as { config: PanelConfigDto }
   return body.config
 }
+
+/* ---- 订阅管理（phase3b-spec §5；凭据只走 X-Telegram-Init-Data header） ---- */
+
+export type SubscriptionLinkState =
+  | 'creating'
+  | 'active'
+  | 'revoked'
+  | 'create_unknown'
+  | 'create_failed'
+
+export interface SubscriptionChannelDto {
+  chatId: string
+  title: string
+  chatType: 'channel'
+  /** 关联讨论组 ID，仅作信息展示；本页不对它做任何权限操作。 */
+  linkedChatId: string | null
+}
+
+export type ChannelVisibility = 'public' | 'private' | 'unknown'
+
+export interface SubscriptionMemberCountsDto {
+  known: number
+  member: number
+  left: number
+  unknown: number
+}
+
+export interface SubscriptionChannelDetailsDto extends SubscriptionChannelDto {
+  visibility: ChannelVisibility
+  canManageLinks: boolean
+  capabilityCheckedAt: string
+  capabilityErrorCode: string | null
+  counts: SubscriptionMemberCountsDto
+  serverTime: string
+}
+
+export interface SubscriptionLinkDto {
+  id: string
+  chatId: string
+  requestId: string
+  name: string
+  priceStars: number
+  periodSeconds: 2592000
+  inviteLink: string | null
+  state: SubscriptionLinkState
+  createdAt: string
+  updatedAt: string
+  revokedAt: string | null
+  version: number
+}
+
+export type SubscriptionMemberState = 'member' | 'left' | 'unknown'
+
+export interface SubscriptionMemberDto {
+  id: string
+  chatId: string
+  userId: number
+  linkId: string | null
+  state: SubscriptionMemberState
+  expiresAt: string | null
+  /** 纳入台账的最近肯定证据；不代表当前付款或当前链路。 */
+  evidence: 'until_date' | 'owned_link'
+  firstObservedAt: string
+  observedAt: string
+  observationSource: 'event' | 'reconcile'
+  lastCheckedAt: string | null
+  lastCheckSucceededAt: string | null
+  lastCheckErrorCode: string | null
+}
+
+export interface SubscriptionPage<T> {
+  items: T[]
+  nextCursor: string | null
+  serverTime: string
+}
+
+export interface SubscriptionPageRequest {
+  limit: number
+  /** 服务端游标，原样回传，不在客户端解析或改写。 */
+  cursor?: string
+}
+
+export interface CreateSubscriptionLinkInput {
+  requestId: string
+  name: string
+  priceStars: number
+}
+
+export interface RenameSubscriptionLinkInput {
+  name: string
+  expectedVersion: number
+}
+
+export interface RevokeSubscriptionLinkInput {
+  expectedVersion: number
+}
+
+/**
+ * 订阅端点错误：按响应体 `error` code 分类，区别于旧面板接口的通用错误类型。
+ * 401 仍映射 `AuthError`、403 的 `forbidden`（owner 鉴权失败）仍映射 `ForbiddenError`，
+ * 让 `onFatal` 能统一上升为整屏；403 `bot_permission_required` 保持本类型，只在当前频道内提示。
+ */
+export class SubscriptionApiError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly retryable: boolean
+  readonly requestId: string | null
+
+  constructor(input: {
+    status: number
+    code: string
+    message: string
+    retryable: boolean
+    requestId: string | null
+  }) {
+    super(input.message)
+    this.name = 'SubscriptionApiError'
+    this.status = input.status
+    this.code = input.code
+    this.retryable = input.retryable
+    this.requestId = input.requestId
+  }
+}
+
+/** 分页查询串：limit 必带，cursor 只在有时携带并保持原值。 */
+function subscriptionQuery(query: SubscriptionPageRequest | undefined): string {
+  if (query === undefined) return ''
+  const params = new URLSearchParams()
+  params.set('limit', String(query.limit))
+  if (query.cursor !== undefined) params.set('cursor', query.cursor)
+  return `?${params.toString()}`
+}
+
+function subscriptionChannelPath(chatId: string): string {
+  return `/channels/${encodeURIComponent(chatId)}`
+}
+
+/** 非 2xx 响应 → 按 error code 分派的错误；响应体不合法时退回通用错误。 */
+async function toSubscriptionError(res: Response): Promise<Error> {
+  if (res.status === 401) return new AuthError()
+  const body = (await res.json().catch(() => null)) as {
+    error?: unknown
+    message?: unknown
+    retryable?: unknown
+    requestId?: unknown
+  } | null
+  const code = typeof body?.error === 'string' ? body.error : ''
+  // 403 只有 bot_permission_required 是频道级问题，其余（含代理产生的无 body 403）按 owner 鉴权处理。
+  if (res.status === 403 && code !== 'bot_permission_required') return new ForbiddenError()
+  const message =
+    typeof body?.message === 'string' && body.message !== ''
+      ? body.message
+      : `请求失败（HTTP ${res.status}）`
+  return new SubscriptionApiError({
+    status: res.status,
+    code,
+    message,
+    retryable: body?.retryable === true,
+    requestId: typeof body?.requestId === 'string' ? body.requestId : null,
+  })
+}
+
+/**
+ * 订阅端点的统一请求：凭据只放 `X-Telegram-Init-Data` header，
+ * URL 与 body 都不携带 initData；body 严格只含调用方传入的业务字段。
+ */
+async function subscriptionFetch<T>(
+  path: string,
+  initData: string,
+  init?: { method: 'POST' | 'PATCH'; body: unknown },
+): Promise<T> {
+  const headers: Record<string, string> = { 'X-Telegram-Init-Data': initData }
+  if (init !== undefined) headers['Content-Type'] = 'application/json'
+  const res = await fetch(`/api/panel/subscriptions${path}`, {
+    method: init?.method ?? 'GET',
+    headers,
+    ...(init === undefined ? {} : { body: JSON.stringify(init.body) }),
+  })
+  if (!res.ok) throw await toSubscriptionError(res)
+  return (await res.json()) as T
+}
+
+/** 订阅页面用的客户端接口；测试与模型层注入替身即可，不必打真实后端。 */
+export interface SubscriptionsApi {
+  fetchChannels(
+    initData: string,
+    query?: SubscriptionPageRequest,
+  ): Promise<SubscriptionPage<SubscriptionChannelDto>>
+  fetchChannelDetails(chatId: string, initData: string): Promise<SubscriptionChannelDetailsDto>
+  fetchLinks(
+    chatId: string,
+    initData: string,
+    query?: SubscriptionPageRequest,
+  ): Promise<SubscriptionPage<SubscriptionLinkDto>>
+  fetchMembers(
+    chatId: string,
+    initData: string,
+    query?: SubscriptionPageRequest,
+  ): Promise<SubscriptionPage<SubscriptionMemberDto>>
+  createLink(
+    chatId: string,
+    initData: string,
+    input: CreateSubscriptionLinkInput,
+  ): Promise<{ link: SubscriptionLinkDto; replayed: boolean }>
+  renameLink(
+    chatId: string,
+    linkId: string,
+    initData: string,
+    input: RenameSubscriptionLinkInput,
+  ): Promise<SubscriptionLinkDto>
+  revokeLink(
+    chatId: string,
+    linkId: string,
+    initData: string,
+    input: RevokeSubscriptionLinkInput,
+  ): Promise<SubscriptionLinkDto>
+}
+
+export const subscriptionsApi: SubscriptionsApi = {
+  async fetchChannels(initData, query) {
+    return subscriptionFetch(`/channels${subscriptionQuery(query)}`, initData)
+  },
+
+  async fetchChannelDetails(chatId, initData) {
+    return subscriptionFetch(subscriptionChannelPath(chatId), initData)
+  },
+
+  async fetchLinks(chatId, initData, query) {
+    return subscriptionFetch(
+      `${subscriptionChannelPath(chatId)}/links${subscriptionQuery(query)}`,
+      initData,
+    )
+  },
+
+  async fetchMembers(chatId, initData, query) {
+    return subscriptionFetch(
+      `${subscriptionChannelPath(chatId)}/members${subscriptionQuery(query)}`,
+      initData,
+    )
+  },
+
+  async createLink(chatId, initData, input) {
+    return subscriptionFetch(`${subscriptionChannelPath(chatId)}/links`, initData, {
+      method: 'POST',
+      body: input,
+    })
+  },
+
+  async renameLink(chatId, linkId, initData, input) {
+    const body = await subscriptionFetch<{ link: SubscriptionLinkDto }>(
+      `${subscriptionChannelPath(chatId)}/links/${encodeURIComponent(linkId)}`,
+      initData,
+      { method: 'PATCH', body: input },
+    )
+    return body.link
+  },
+
+  async revokeLink(chatId, linkId, initData, input) {
+    const body = await subscriptionFetch<{ link: SubscriptionLinkDto }>(
+      `${subscriptionChannelPath(chatId)}/links/${encodeURIComponent(linkId)}/revoke`,
+      initData,
+      { method: 'POST', body: input },
+    )
+    return body.link
+  },
+}

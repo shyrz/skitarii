@@ -1,7 +1,7 @@
 import { asUserId } from '@skitarii/core'
 import { createDb, createPgRepos } from '@skitarii/db'
 import type { LlmConfig } from '@skitarii/llm'
-import { createBot } from './bot.js'
+import { createBot, pollingStartOptions } from './bot.js'
 import { parseBotEnv } from './env.js'
 import { createLogger } from './logger.js'
 
@@ -52,9 +52,12 @@ process.once('SIGINT', () => void shutdown('SIGINT'))
 process.once('SIGTERM', () => void shutdown('SIGTERM'))
 
 // 启动失败是最常见的运维问题（token 抄错、出口网络不通、数据库连不上），因此在这里给出可执行的排查方向并以退出码 1 结束，
-// 让 systemd / 容器编排能按失败重启，而不是留一个静默存活的进程。
+// 让 systemd / 容器编排能按失败重启，而不是留一个静默存在的进程。
+// allowed_updates 与 webhook 注册共用 bot 包里的同一份常量（含 message / edited_message / callback_query /
+// channel_post / my_chat_member），两个入口不允许各写一份名单。
 try {
   await bot.start({
+    ...pollingStartOptions(),
     onStart: (info) => logger.info(`@${info.username} 已启动（长轮询）`),
   })
 } catch (error) {

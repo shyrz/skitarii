@@ -1,8 +1,8 @@
 import { asChatId, asUserId, type UserId } from '@skitarii/core'
 import type { Repos } from '@skitarii/db'
 import { createCachedJudge, createOpenAiJudge, type LlmConfig } from '@skitarii/llm'
-import { Bot, type Context } from 'grammy'
-import type { Message } from 'grammy/types'
+import { Bot, type Context, type PollingOptions } from 'grammy'
+import type { Message, Update } from 'grammy/types'
 import {
   APPEAL_CALLBACK_PATTERN,
   createAppealCallbackHandler,
@@ -12,6 +12,7 @@ import {
   type AppealNotificationService,
   type AppealRollbackService,
 } from './appeal.js'
+import { createChatMetadataService } from './chat-metadata.js'
 import { createDecisionRetryService, type DecisionRetryService } from './decision-retry.js'
 import { createActionExecutor } from './executor.js'
 import { contentHashOf, extractFeatures, extractSenderIdentity } from './features.js'
@@ -19,6 +20,7 @@ import { createIdempotencyRegistry } from './idempotency.js'
 import { createLogger, type Logger } from './logger.js'
 import { createOwnerFailureNotifier, createOwnerFeed } from './owner-feed.js'
 import { handleIncomingMessage, type PipelineDeps } from './pipeline.js'
+import { createSubscriptionMemberRecorder } from './subscription-members.js'
 import { createTokenBucket } from './token-bucket.js'
 
 /**
@@ -61,6 +63,36 @@ export type {
 } from './appeal.js'
 export { createDecisionRetryService, DECISION_RETRY_SCAN_LIMIT, STALE_DECISION_AGE_MS } from './decision-retry.js'
 export type { DecisionRetryResult, DecisionRetryService } from './decision-retry.js'
+
+/** 允许的更新类型名。与 Telegram `Update` 的键一致，`update_id` 不是可订阅的更新类型。 */
+export type AllowedUpdate = Exclude<keyof Update, 'update_id'>
+
+/**
+ * 允许的更新类型。webhook 注册（`setWebhook`）与长轮询（`bot.start`）共用这一份，
+ * 两个入口不允许各写一份名单，否则会悄悄漏收某种更新。
+ *
+ * 只列确有处理器的类型：`message` / `edited_message` 走审核管线，`callback_query` 走申诉回调，
+ * `channel_post` 登记频道元数据，`my_chat_member` 跟踪 bot 自己加入/升管理员，
+ * `chat_member` 驱动订阅成员台账（只读事实，不做权限处置）。
+ * 不处理也不订阅 `edited_channel_post` 等其他类型，它们没有处理器，只会多几跳流量。
+ */
+export const TELEGRAM_ALLOWED_UPDATES: readonly AllowedUpdate[] = [
+  'message',
+  'edited_message',
+  'callback_query',
+  'channel_post',
+  'my_chat_member',
+  'chat_member',
+] as const
+
+/**
+ * 长轮询启动选项。抽成函数是为了让「与 webhook 同源」可被测试直接断言，而不是只写在入口文件里。
+ *
+ * @returns 传给 `bot.start` 的选项片段（`onStart` 等由调用方补全）。
+ */
+export function pollingStartOptions(): Pick<PollingOptions, 'allowed_updates'> {
+  return { allowed_updates: TELEGRAM_ALLOWED_UPDATES }
+}
 
 /** `createBot` 的入参。 */
 export interface CreateBotOptions {
@@ -151,6 +183,19 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
         : createOwnerFeed({ api: bot.api, ownerUserId: options.ownerUserId, logger, now: options.now }),
   }
 
+  const chatMetadata = createChatMetadataService({
+    api: bot.api,
+    repos: options.repos,
+    logger,
+    now: options.now,
+  })
+
+  const subscriptionMembers = createSubscriptionMemberRecorder({
+    repos: options.repos,
+    logger,
+    now: options.now,
+  })
+
   bot.command('start', async (ctx) => {
     await ctx.reply(
       [
@@ -166,7 +211,11 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
    *
    * 只审群与超级群：私聊是命令与申诉通知的通道，频道消息（`channel_post`）不属于本节。
    * 其他 bot 的消息不审：既避免 bot 互相触发，也避免把审核结果反馈给自动化流程。
-   * Telegram 服务账号（777000）的消息不审：那是频道自动转发到讨论组的形态，审核它没有意义。
+   * 频道自动转发到讨论组的根帖（`is_automatic_forward`）不审：它是频道帖子的镜像，
+   * 处置它删不掉原帖，且发送者可能是真实管理员，按普通发言审会误伤（见下）。
+   * Telegram 服务账号（777000）的消息不审：那是历史形态的自动转发，与之并列过滤。
+   * 没有可审发送者（匿名管理员、以聊天身份发言等 `from` 缺失的消息）不审，但仍登记群元数据：
+   * 登记只依赖 `chat`，不能被 `from` 的空缺挡住。
    *
    * @param ctx 更新上下文。
    * @param message 待审消息（新消息或编辑后的消息）。
@@ -174,13 +223,26 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
    */
   async function moderateMessage(ctx: Context, message: Message, editDate: number | null): Promise<void> {
     const chat = ctx.chat
-    const from = ctx.from
     if (chat === undefined) return
     if (chat.type !== 'group' && chat.type !== 'supergroup') return
-    if (from === undefined || from.is_bot) return
-    // 777000 是 Telegram 自己的服务账号：频道自动转发到讨论组的消息以它作为发送者，
-    // 审核它没有意义（内容来自频道帖子本身，且删不掉原帖）。与 is_bot 并列放在入口过滤。
-    if (from.id === TELEGRAM_SERVICE_ACCOUNT_ID) return
+
+    // 自动转发的根帖必须在发送者判断之前跳过：频道「以管理员身份发言」时 from 是真实用户，
+    // 放过去会把频道帖子当群内发言处置（误伤管理员、也删不到原帖）。
+    if (message.is_automatic_forward === true) return
+
+    const from = ctx.from
+    if (
+      from === undefined ||
+      from.is_bot ||
+      from.id === TELEGRAM_SERVICE_ACCOUNT_ID ||
+      // 以频道/聊天身份发送（sender_chat 存在）的消息不审：匿名管理员会以群身份发言，
+      // 按普通用户处置会误罚管理员；自动转发的根帖已在上方单独跳过。
+      message.sender_chat !== undefined
+    ) {
+      // 无发送者时只做聊天级登记：新群的第一条消息恰好是匿名管理员发言时，群配置不应缺位。
+      await chatMetadata.ensureRegistered(chat)
+      return
+    }
 
     const text = message.text ?? message.caption ?? ''
     // 频道评论：讨论组里的评论通过回复一条「频道帖子转发」挂到原帖下，只有频道用户名 + 帖子 id
@@ -191,9 +253,10 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
         ? { channelUsername: forwardOrigin.chat.username, postId: forwardOrigin.message_id }
         : null
 
-    await handleIncomingMessage(pipelineDeps, {
+    const config = await handleIncomingMessage(pipelineDeps, {
       chatId: asChatId(String(chat.id)),
       chatTitle: chat.title,
+      chatType: chat.type,
       messageId: message.message_id,
       userId: asUserId(from.id),
       text,
@@ -202,6 +265,9 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       senderIdentity: extractSenderIdentity(from),
       commentThread,
     })
+
+    // 讨论组 ↔ 频道的 linked 关系只登记事实：评论仍按讨论组自身的规则审，频道规则不会覆盖讨论组。
+    await chatMetadata.syncLinkedChat(chat, config.linkedChatId)
   }
 
   bot.on('message', async (ctx) => {
@@ -216,6 +282,33 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
     // 同一编辑的重投递仍得到同一事件 id，内容不同的编辑各自成事件。
     const editDate = message.edit_date ?? Number.parseInt(contentHashOf(text).slice(0, 16), 16)
     await moderateMessage(ctx, message, editDate)
+  })
+
+  // 频道帖只登记频道元数据（类型、标题、linked 讨论组）：不审帖子、不落帖子内容。
+  bot.on('channel_post', async (ctx) => {
+    await chatMetadata.handleChannelPost(ctx.channelPost.chat)
+  })
+
+  // bot 自己被加入群/频道或升为管理员时登记/刷新；被移出或降权时保留配置（历史决策与申诉仍要读）。
+  bot.on('my_chat_member', async (ctx) => {
+    const update = ctx.update.my_chat_member
+    if (update === undefined) return
+    await chatMetadata.handleMyChatMember(update)
+  })
+
+  // 频道成员事件 → 订阅成员台账。只用事实：不调用任何权限处置接口，无证据的新免费成员被忽略。
+  bot.on('chat_member', async (ctx) => {
+    const update = ctx.update.chat_member
+    if (update === undefined) return
+    try {
+      await subscriptionMembers.handleChatMember(update, ctx.update.update_id)
+    } catch (error) {
+      // 单条成员事件失败不冒泡到全局 catch：事件可能携带 invite_link、异常也可能回显它，
+      // 日志只留受控异常类型名与 ID（chatId/userId）。
+      logger.warn(
+        `订阅成员事件处理失败 chatId=${String(update.chat.id)} userId=${update.new_chat_member.user.id} code=${error instanceof Error ? error.name : typeof error}`,
+      )
+    }
   })
 
   const appealDeps: AppealDeps = {
@@ -253,8 +346,10 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
  * 建立配置好的 bot 实例。
  *
  * 中间件：
- * - `message`：群与超级群里的每条消息走审核管线。私聊与频道消息不在 Phase 1 范围内。
+ * - `message`：群与超级群里的每条消息走审核管线。私聊不在范围内；频道自动转发的根帖与无发送者消息只登记元数据。
  * - `edited_message`：编辑后的群消息重走同一条管线；每次编辑产生独立事件与决策。
+ * - `channel_post`：只登记频道元数据（类型、标题、linked 讨论组），不审帖子、不落帖子内容。
+ * - `my_chat_member`：bot 被加入/升为管理员时登记或刷新群/频道元数据；被移出/降权时保留配置。
  * - `callbackQuery`：owner 的申诉处理回调。
  * - `command('start')`：介绍语与申诉说明。
  * - `catch`：单条更新失败不退出进程。

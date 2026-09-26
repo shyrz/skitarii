@@ -19,6 +19,18 @@ import {
 } from './panel.js'
 import { createScheduler } from './scheduler.js'
 import { serveStatic } from './static.js'
+import { createSubscriptionReconciler } from './subscription-reconcile.js'
+import { createTelegramSubscriptionPort } from './subscription-telegram.js'
+import {
+  createSubscriptionLink,
+  getSubscriptionChannel,
+  listSubscriptionChannels,
+  listSubscriptionLinks,
+  listSubscriptionMembers,
+  renameSubscriptionLink,
+  revokeSubscriptionLink,
+  type SubscriptionApiDeps,
+} from './subscriptions.js'
 import { registerWebhook } from './webhook.js'
 
 /**
@@ -81,11 +93,32 @@ const panelApi: PanelApiDeps = {
   logger,
 }
 
+// 订阅管理（Phase 3b）：grammY 适配成窄端口后注入；botUserId 用 getter，bot 初始化失败时能力检查按不可确认处理。
+const subscriptionPort = createTelegramSubscriptionPort(bot.api)
+const subscriptionApi: SubscriptionApiDeps = {
+  repos,
+  botToken: env.BOT_TOKEN,
+  ownerUserId,
+  botUserId: () => asUserId(bot.botInfo.id),
+  telegram: subscriptionPort,
+  logger,
+}
+
+// 定期对账：独立 60 秒 single-flight 生命周期，shutdown 时随进程停止；只读 getChatMember，不做权限处置。
+const reconciler = createSubscriptionReconciler({
+  repos,
+  telegram: { getChatMember: (chatId, userId) => subscriptionPort.getChatMember(chatId, userId) },
+  logger,
+})
+
 /** 静态产物的根目录：`apps/web/dist`（本文件在 `apps/server/src/`）。 */
 const WEB_DIST = fileURLToPath(new URL('../../web/dist/', import.meta.url))
 
 /** 静态挂载前缀。产物用相对基址，改前缀不需要重新构建前端。 */
 const STATIC_PREFIX = '/app/'
+
+/** 订阅管理端点前缀（Phase 3b）。凭据只走 `X-Telegram-Init-Data` header。 */
+const SUBSCRIPTION_PREFIX = '/api/panel/subscriptions'
 
 /**
  * 请求体上限（字节）。config 全量提交（至多 100 条规则加阈值）可能超过旧的 16KB，统一放宽到 64KB；
@@ -103,7 +136,7 @@ type Handler = (request: IncomingMessage, response: ServerResponse) => Promise<v
 type RouteTarget = { kind: 'exact'; path: string } | { kind: 'prefix'; path: string }
 
 interface Route {
-  method: 'GET' | 'POST' | 'PUT'
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH'
   target: RouteTarget
   handler: Handler
 }
@@ -133,6 +166,10 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', target: { kind: 'prefix', path: '/api/panel/chats/' }, handler: handlePanelChats },
   { method: 'PUT', target: { kind: 'prefix', path: '/api/panel/chats/' }, handler: handlePanelConfigUpdate },
   { method: 'POST', target: { kind: 'prefix', path: '/api/panel/appeals/' }, handler: handlePanelResolve },
+  // 订阅管理：前缀下按方法与路径段分发（GET 读、POST 创建/撤销、PATCH 只做改名）。
+  { method: 'GET', target: { kind: 'prefix', path: SUBSCRIPTION_PREFIX }, handler: handleSubscriptionsGet },
+  { method: 'POST', target: { kind: 'prefix', path: SUBSCRIPTION_PREFIX }, handler: handleSubscriptionsPost },
+  { method: 'PATCH', target: { kind: 'prefix', path: SUBSCRIPTION_PREFIX }, handler: handleSubscriptionsPatch },
   { method: 'GET', target: { kind: 'exact', path: '/' }, handler: handleStaticAlias },
   { method: 'GET', target: { kind: 'exact', path: '/app' }, handler: handleStaticAlias },
   { method: 'GET', target: { kind: 'prefix', path: STATIC_PREFIX }, handler: handleStatic },
@@ -256,6 +293,166 @@ async function handlePanelResolve(request: IncomingMessage, response: ServerResp
   respondJson(response, result.status, result.body)
 }
 
+/* ---- 订阅管理端点（Phase 3b） ---- */
+
+/** 解析后的订阅路径。形状不符时返回 `null`（按 404 处理）。 */
+type SubscriptionPath =
+  | { kind: 'channels' }
+  | { kind: 'channel'; chatId: string }
+  | { kind: 'links'; chatId: string }
+  | { kind: 'link'; chatId: string; linkId: string }
+  | { kind: 'revoke'; chatId: string; linkId: string }
+  | { kind: 'members'; chatId: string }
+
+/**
+ * 解析 `/api/panel/subscriptions` 下的路径段；段数或形状不符返回 `null`。
+ *
+ * @param pathname 请求路径。
+ * @returns 解析结果。
+ */
+function parseSubscriptionPath(pathname: string): SubscriptionPath | null {
+  if (!pathname.startsWith(`${SUBSCRIPTION_PREFIX}/`)) return null
+  const segments = pathname.slice(SUBSCRIPTION_PREFIX.length + 1).split('/')
+  if (segments[0] !== 'channels') return null
+
+  const chatId = segments[1]
+  if (segments.length === 1) return { kind: 'channels' }
+  if (chatId === undefined || chatId.length === 0) return null
+  if (segments.length === 2) return { kind: 'channel', chatId }
+  if (segments[2] === 'members' && segments.length === 3) return { kind: 'members', chatId }
+  if (segments[2] !== 'links') return null
+  if (segments.length === 3) return { kind: 'links', chatId }
+
+  const linkId = segments[3]
+  if (linkId === undefined || linkId.length === 0) return null
+  if (segments.length === 4) return { kind: 'link', chatId, linkId }
+  if (segments[4] === 'revoke' && segments.length === 5) return { kind: 'revoke', chatId, linkId }
+  return null
+}
+
+/** 从 header 读 initData；数组（重复 header）视为无效凭据，返回 null。 */
+function initDataFromHeader(request: IncomingMessage): string | null {
+  const raw = request.headers['x-telegram-init-data']
+  return typeof raw === 'string' && raw.length > 0 ? raw : null
+}
+
+/** 路径形状不符的 404（与订阅统一错误体形状一致）。 */
+function subscriptionNotFound(response: ServerResponse): void {
+  respondJson(response, 404, { error: 'not_found', message: '接口不存在', retryable: false }, NO_STORE)
+}
+
+/**
+ * 订阅端点统一分发：形状/方法不符 → 404；处理器抛错 → 500 internal_error（只记受控日志）。
+ *
+ * 所有响应都带 `Cache-Control: no-store`；凭据只从 `X-Telegram-Init-Data` header 读取。
+ *
+ * @param request 入站请求。
+ * @param response 出站响应。
+ * @param method 路由表匹配到的方法。
+ */
+async function handleSubscriptions(
+  request: IncomingMessage,
+  response: ServerResponse,
+  method: 'GET' | 'POST' | 'PATCH',
+): Promise<void> {
+  const url = new URL(request.url ?? '/', 'http://localhost')
+  const pathname = url.pathname
+  const parsed = parseSubscriptionPath(pathname)
+  if (parsed === null) {
+    subscriptionNotFound(response)
+    return
+  }
+
+  const initData = initDataFromHeader(request)
+  const limit = url.searchParams.get('limit')
+  const cursor = url.searchParams.get('cursor')
+
+  try {
+    let result
+    switch (method) {
+      case 'GET':
+        if (parsed.kind === 'channels') {
+          result = await listSubscriptionChannels(subscriptionApi, { initData, limit, cursor })
+        } else if (parsed.kind === 'channel') {
+          result = await getSubscriptionChannel(subscriptionApi, { chatId: parsed.chatId, initData })
+        } else if (parsed.kind === 'links') {
+          result = await listSubscriptionLinks(subscriptionApi, { chatId: parsed.chatId, initData, limit, cursor })
+        } else if (parsed.kind === 'members') {
+          result = await listSubscriptionMembers(subscriptionApi, { chatId: parsed.chatId, initData, limit, cursor })
+        } else {
+          subscriptionNotFound(response)
+          return
+        }
+        break
+
+      case 'POST': {
+        const body = await readJsonBody(request)
+        if (parsed.kind === 'links') {
+          result = await createSubscriptionLink(subscriptionApi, { chatId: parsed.chatId, initData, body })
+        } else if (parsed.kind === 'revoke') {
+          result = await revokeSubscriptionLink(subscriptionApi, {
+            chatId: parsed.chatId,
+            linkId: parsed.linkId,
+            initData,
+            body,
+          })
+        } else {
+          subscriptionNotFound(response)
+          return
+        }
+        break
+      }
+
+      case 'PATCH': {
+        // 只接受改名的实际路径：其他形状一律 404，绝不把别的资源映射成 PATCH。
+        if (parsed.kind !== 'link') {
+          subscriptionNotFound(response)
+          return
+        }
+        const body = await readJsonBody(request)
+        result = await renameSubscriptionLink(subscriptionApi, {
+          chatId: parsed.chatId,
+          linkId: parsed.linkId,
+          initData,
+          body,
+        })
+        break
+      }
+    }
+
+    respondJson(response, result.status, result.body, NO_STORE)
+  } catch (error) {
+    // 只记异常类型名：数据库错误可能回显 inviteLink，Telegram 错误对象已在适配层收敛。
+    logger.warn(
+      `订阅请求处理失败 ${method} ${pathname} code=${error instanceof Error ? error.name : typeof error}`,
+    )
+    respondJson(
+      response,
+      500,
+      { error: 'internal_error', message: '服务器内部错误，请稍后重试', retryable: true },
+      NO_STORE,
+    )
+  }
+}
+
+/** 订阅路由的三个方法入口（路由表只做方法匹配，形状分发在处理器内）。 */
+async function handleSubscriptionsGet(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  await handleSubscriptions(request, response, 'GET')
+}
+
+/** POST：创建链接或撤销链接。 */
+async function handleSubscriptionsPost(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  await handleSubscriptions(request, response, 'POST')
+}
+
+/** PATCH：只做改名。 */
+async function handleSubscriptionsPatch(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  await handleSubscriptions(request, response, 'PATCH')
+}
+
+/** 订阅端点统一响应头：凭据与结果都不允许缓存。 */
+const NO_STORE: Record<string, string> = { 'cache-control': 'no-store' }
+
 /**
  * 取「固定前缀 + 固定尾段」路径中间的那一段。
  *
@@ -327,12 +524,19 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
  * @param response 响应对象
  * @param status HTTP 状态码
  * @param body 将被 `JSON.stringify` 的响应体
+ * @param headers 追加响应头（如订阅端点的 `cache-control: no-store`）
  */
-function respondJson(response: ServerResponse, status: number, body: unknown): void {
+function respondJson(
+  response: ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): void {
   const payload = JSON.stringify(body)
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
+    ...headers,
   })
   response.end(payload)
 }
@@ -340,16 +544,31 @@ function respondJson(response: ServerResponse, status: number, body: unknown): v
 /**
  * 按路由表分发请求。
  *
+ * 方法必须与路由表严格匹配：只定义 GET / POST / PUT / PATCH，其余方法（HEAD、DELETE、OPTIONS 等）
+ * 一律 404，绝不回退成 GET——订阅端点有凭据与副作用，把 DELETE 当 GET 会静默泄露或误触发。
+ *
  * @param request 入站请求
  * @param response 出站响应
  */
 async function dispatch(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  // 只认路由表里出现的方法；其余（HEAD、DELETE 等）一律按 GET 参与匹配，匹配不上就是 404。
-  const method = request.method === 'POST' ? 'POST' : request.method === 'PUT' ? 'PUT' : 'GET'
+  const method =
+    request.method === 'POST'
+      ? 'POST'
+      : request.method === 'PUT'
+        ? 'PUT'
+        : request.method === 'PATCH'
+          ? 'PATCH'
+          : request.method === 'GET'
+            ? 'GET'
+            : null
   const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
-  const route = ROUTES.find(
-    (candidate) => candidate.method === method && PATH_MATCHERS[candidate.target.kind](candidate.target.path, pathname),
-  )
+  const route =
+    method === null
+      ? undefined
+      : ROUTES.find(
+          (candidate) =>
+            candidate.method === method && PATH_MATCHERS[candidate.target.kind](candidate.target.path, pathname),
+        )
 
   if (route === undefined) {
     respondJson(response, 404, { error: 'not found' })
@@ -383,13 +602,15 @@ const scheduler = createScheduler({
 })
 
 /**
- * 优雅退出：停调度器、停止接受新连接、关数据库连接，等在途请求收尾后退出。
+ * 优雅退出：停调度器与订阅对账、停止接受新连接、关数据库连接，等在途请求收尾后退出。
  *
  * @param signal 触发退出的信号名，仅用于日志。
  */
 function shutdown(signal: string): void {
   logger.info(`收到 ${signal}，停止监听`)
   scheduler.stop()
+  // 对账有独立生命周期：先停它的定时器，在途一轮会自然收尾（不跨 shutdown 强杀）。
+  reconciler.stop()
   server.close(() => {
     void handle.close().finally(() => process.exit(0))
   })
@@ -414,6 +635,8 @@ if (env.PUBLIC_URL !== undefined) {
 }
 
 scheduler.start()
+// 订阅对账独立启动：60 秒一轮、single-flight；只读 getChatMember，不做任何权限处置。
+reconciler.start()
 
 server.listen(env.PORT, () => {
   logger.info(`监听 http://localhost:${env.PORT}，Mini App 产物目录 ${WEB_DIST}`)

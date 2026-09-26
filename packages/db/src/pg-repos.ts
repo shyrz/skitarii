@@ -1,5 +1,5 @@
 import { and, asc, count, desc, eq, exists, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm'
-import { asUserId, type ChatConfig, type ChatId } from '@skitarii/core'
+import { asChatId, asUserId, type ChatConfig, type ChatId } from '@skitarii/core'
 import type { Db } from './client.js'
 import {
   toAppeal,
@@ -8,9 +8,11 @@ import {
   toMessageEvent,
   toModerationDecision,
   toSubscription,
+  toSubscriptionLink,
+  toSubscriptionMember,
   truncateSampleText,
 } from './mapping.js'
-import type { AggregateRepo, AppealRepo, ChatRepo, DailyCounts, DecisionRepo, LlmCacheRepo, MessageEventRepo, Repos, SubscriptionRepo } from './repos.js'
+import type { AggregateRepo, AppealRepo, ChatRepo, CheckClaim, CheckResult, ClaimResult, DailyCounts, DecisionRepo, LinkMutationResult, LlmCacheRepo, MemberEventObservation, MessageEventRepo, Repos, ReserveCreateOutcome, SubscriptionLinkRepo, SubscriptionMemberRepo, SubscriptionRepo } from './repos.js'
 import {
   appeals,
   chats,
@@ -18,6 +20,8 @@ import {
   llmCache,
   messageEvents,
   moderationDecisions,
+  subscriptionLinks,
+  subscriptionMembers,
   subscriptions,
 } from './schema.js'
 
@@ -45,6 +49,8 @@ export function createPgRepos(db: Db): Repos {
     decisions: createDecisionRepo(db),
     appeals: createAppealRepo(db),
     subscriptions: createSubscriptionRepo(db),
+    subscriptionLinks: createSubscriptionLinkRepo(db),
+    subscriptionMembers: createSubscriptionMemberRepo(db),
     aggregates: createAggregateRepo(db),
     llmCache: createLlmCacheRepo(db),
   }
@@ -52,6 +58,11 @@ export function createPgRepos(db: Db): Repos {
 
 /**
  * `chats` 仓储。
+ *
+ * 三条写路径的职责边界：
+ * - `upsert`：owner 在面板里的显式全量保存，覆盖配置字段并刷新元数据列；
+ * - `register`：首次登记，冲突即放弃（绝不用默认配置覆盖 owner 已保存的规则）；
+ * - `updateMetadata`：只清单列更新 title / chat_type / linked_chat_id，规则与阈值原样保留。
  *
  * @param db drizzle 实例。
  * @returns 群配置读写实现。
@@ -61,19 +72,13 @@ function createChatRepo(db: Db): ChatRepo {
     async upsert(config): Promise<void> {
       await db
         .insert(chats)
-        .values({
-          chatId: config.chatId,
-          title: config.title,
-          language: config.language,
-          rules: config.rules,
-          passThreshold: config.passThreshold,
-          llmThreshold: config.llmThreshold,
-          muteDurationMinutes: config.muteDurationMinutes,
-        })
+        .values(chatConfigValues(config))
         .onConflictDoUpdate({
           target: chats.chatId,
           set: {
             title: config.title,
+            chatType: config.chatType,
+            linkedChatId: config.linkedChatId,
             language: config.language,
             rules: config.rules,
             passThreshold: config.passThreshold,
@@ -84,16 +89,87 @@ function createChatRepo(db: Db): ChatRepo {
         })
     },
 
+    async register(config): Promise<void> {
+      await db.insert(chats).values(chatConfigValues(config)).onConflictDoNothing({ target: chats.chatId })
+    },
+
     async findByChatId(chatId): Promise<ChatConfig | null> {
       const rows = await db.select().from(chats).where(eq(chats.chatId, chatId)).limit(1)
       const row = rows[0]
       return row === undefined ? null : toChatConfig(row)
     },
 
+    async updateMetadata(chatId, patch): Promise<void> {
+      const set: Partial<typeof chats.$inferInsert> = { updatedAt: new Date() }
+      if (patch.title !== undefined) set.title = patch.title
+      if (patch.chatType !== undefined) set.chatType = patch.chatType
+      if (patch.linkedChatId !== undefined) set.linkedChatId = patch.linkedChatId
+      await db.update(chats).set(set).where(eq(chats.chatId, chatId))
+    },
+
+    async updateRulesConfig(chatId, patch): Promise<void> {
+      // 面板 PUT 专用：只写规则与阈值，绝不触碰 title / chat_type / linked_chat_id / language。
+      await db
+        .update(chats)
+        .set({
+          rules: patch.rules,
+          passThreshold: patch.passThreshold,
+          llmThreshold: patch.llmThreshold,
+          muteDurationMinutes: patch.muteDurationMinutes,
+          updatedAt: new Date(),
+        })
+        .where(eq(chats.chatId, chatId))
+    },
+
     async listAll() {
       const rows = await db.select().from(chats).orderBy(asc(chats.chatId))
       return rows.map(toChatConfig)
     },
+
+    async listChannelsPage({ afterChatId, limit }) {
+      const conditions = [eq(chats.chatType, 'channel')]
+      if (afterChatId !== undefined) {
+        // 游标边界与排序都固定 C 排序规则：默认 collation 可能给出与内存实现（UTF-16 码元序）和游标契约不同的顺序。
+        conditions.push(sql`${chats.chatId} collate "C" > ${afterChatId} collate "C"`)
+      }
+      const rows = await db
+        .select()
+        .from(chats)
+        .where(and(...conditions))
+        .orderBy(asc(sql`${chats.chatId} collate "C"`))
+        .limit(limit)
+      return rows.map(toChatConfig)
+    },
+  }
+}
+
+/**
+ * `ChatConfig` → `chats` 行的列值。insert 与 update 共用同一份，避免两条语句的字段清单漂移。
+ *
+ * @param config 领域配置。
+ * @returns 可直接交给 drizzle 的列值对象。
+ */
+function chatConfigValues(config: ChatConfig): {
+  chatId: string
+  title: string
+  chatType: ChatConfig['chatType']
+  linkedChatId: string | null
+  language: ChatConfig['language']
+  rules: ChatConfig['rules']
+  passThreshold: number
+  llmThreshold: number
+  muteDurationMinutes: number
+} {
+  return {
+    chatId: config.chatId,
+    title: config.title,
+    chatType: config.chatType,
+    linkedChatId: config.linkedChatId,
+    language: config.language,
+    rules: config.rules,
+    passThreshold: config.passThreshold,
+    llmThreshold: config.llmThreshold,
+    muteDurationMinutes: config.muteDurationMinutes,
   }
 }
 
@@ -468,6 +544,401 @@ function createSubscriptionRepo(db: Db): SubscriptionRepo {
         .where(and(eq(subscriptions.state, 'active'), lte(subscriptions.expiresAt, instant)))
         .orderBy(asc(subscriptions.expiresAt))
       return rows.map(toSubscription)
+    },
+  }
+}
+
+/** 链接操作占位的租约（与内存实现和 spec 的 60 秒对齐）。 */
+const LINK_MUTATION_LEASE_SQL = sql`interval '60 seconds'`
+
+/**
+ * `subscription_links` 仓储。
+ *
+ * 条件写全部落在单条 UPDATE 上（无进程内互斥）：claim 与 finish 的 CAS 语义由 SQL 的 WHERE 保证，
+ * 唯一键（幂等请求、非空链接）由数据库兜底。
+ * 注意：唯一索引冲突的数据库错误可能回显 invite_link 的值，因此调用方日志只记受控码与 id。
+ *
+ * @param db drizzle 实例。
+ * @returns 链接读写实现。
+ */
+function createSubscriptionLinkRepo(db: Db): SubscriptionLinkRepo {
+  const findRowByRequestId = async (ownerUserId: number, requestId: string) => {
+    const rows = await db
+      .select()
+      .from(subscriptionLinks)
+      .where(and(eq(subscriptionLinks.ownerUserId, ownerUserId), eq(subscriptionLinks.requestId, requestId)))
+      .limit(1)
+    return rows[0] ?? null
+  }
+
+  return {
+    async reserveCreate(input): Promise<ReserveCreateOutcome> {
+      const inserted = await db
+        .insert(subscriptionLinks)
+        .values({
+          id: input.id,
+          chatId: input.chatId,
+          ownerUserId: input.ownerUserId,
+          requestId: input.requestId,
+          requestHash: input.requestHash,
+          name: input.name,
+          priceStars: input.priceStars,
+          periodSeconds: input.periodSeconds,
+          inviteLink: null,
+          state: 'creating',
+          createdAt: input.createdAt,
+          updatedAt: input.createdAt,
+          revokedAt: null,
+          version: 0,
+          operationToken: null,
+          operationKind: null,
+          operationStartedAt: null,
+        })
+        .onConflictDoNothing({ target: [subscriptionLinks.ownerUserId, subscriptionLinks.requestId] })
+        .returning()
+      const row = inserted[0]
+      if (row !== undefined) return { kind: 'reserved', link: toSubscriptionLink(row) }
+
+      // 冲突：返回已存在的那一行（调用方据此走重放/冲突判定）。
+      const existing = await findRowByRequestId(input.ownerUserId, input.requestId)
+      if (existing === null) throw new Error('创建占位冲突但读不到原行')
+      return { kind: 'existing', link: toSubscriptionLink(existing) }
+    },
+
+    async findByRequestId(ownerUserId, requestId) {
+      const row = await findRowByRequestId(ownerUserId, requestId)
+      return row === null ? null : toSubscriptionLink(row)
+    },
+
+    async finishCreate(id, result): Promise<boolean> {
+      const rows = await db
+        .update(subscriptionLinks)
+        .set({
+          state: 'active',
+          inviteLink: result.inviteLink,
+          version: sql`${subscriptionLinks.version} + 1`,
+          updatedAt: result.finishedAt,
+        })
+        .where(and(eq(subscriptionLinks.id, id), inArray(subscriptionLinks.state, ['creating', 'create_unknown'])))
+        .returning({ id: subscriptionLinks.id })
+      return rows.length > 0
+    },
+
+    async markCreateOutcome(id, state, changedAt): Promise<void> {
+      // 只从 creating 迁移；已完成请求不会被迟到的失败结果改写。
+      await db
+        .update(subscriptionLinks)
+        .set({ state, updatedAt: changedAt })
+        .where(and(eq(subscriptionLinks.id, id), eq(subscriptionLinks.state, 'creating')))
+    },
+
+    async findById(chatId, id) {
+      const rows = await db
+        .select()
+        .from(subscriptionLinks)
+        .where(and(eq(subscriptionLinks.chatId, chatId), eq(subscriptionLinks.id, id)))
+        .limit(1)
+      const row = rows[0]
+      return row === undefined ? null : toSubscriptionLink(row)
+    },
+
+    async findByInviteLink(chatId, fullLink) {
+      const rows = await db
+        .select()
+        .from(subscriptionLinks)
+        .where(and(eq(subscriptionLinks.chatId, chatId), eq(subscriptionLinks.inviteLink, fullLink)))
+        .limit(1)
+      const row = rows[0]
+      return row === undefined ? null : toSubscriptionLink(row)
+    },
+
+    async listPage({ chatId, before, limit }) {
+      const conditions = [eq(subscriptionLinks.chatId, chatId)]
+      if (before !== undefined) {
+        // 严格元组上界，与 `ORDER BY created_at DESC, id DESC` 同形（同毫秒不漏不重）。
+        conditions.push(
+          or(
+            lt(subscriptionLinks.createdAt, before.createdAt),
+            and(eq(subscriptionLinks.createdAt, before.createdAt), lt(subscriptionLinks.id, before.id)),
+          )!,
+        )
+      }
+      const rows = await db
+        .select()
+        .from(subscriptionLinks)
+        .where(and(...conditions))
+        .orderBy(desc(subscriptionLinks.createdAt), desc(subscriptionLinks.id))
+        .limit(limit)
+      return rows.map(toSubscriptionLink)
+    },
+
+    async claimMutation(chatId, id, expectedVersion, kind, now): Promise<ClaimResult> {
+      const token = crypto.randomUUID()
+      const rows = await db
+        .update(subscriptionLinks)
+        .set({
+          operationToken: token,
+          operationKind: kind,
+          operationStartedAt: now,
+          version: sql`${subscriptionLinks.version} + 1`,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(subscriptionLinks.chatId, chatId),
+            eq(subscriptionLinks.id, id),
+            eq(subscriptionLinks.state, 'active'),
+            eq(subscriptionLinks.version, expectedVersion),
+            // 无占位，或占位已过期（超过 60 秒可被替换）；NULL 比较为假，需显式 is null 分支。
+            or(
+              isNull(subscriptionLinks.operationToken),
+              lt(sql`${subscriptionLinks.operationStartedAt}`, sql`${now}::timestamptz - ${LINK_MUTATION_LEASE_SQL}`),
+            )!,
+          ),
+        )
+        .returning()
+      const claimedRow = rows[0]
+      if (claimedRow !== undefined) return { kind: 'claimed', token, link: toSubscriptionLink(claimedRow) }
+
+      // 未 claim 成功：读回区分 missing / revoked / 版本冲突 / 活跃占位。
+      const existing = await db
+        .select()
+        .from(subscriptionLinks)
+        .where(and(eq(subscriptionLinks.chatId, chatId), eq(subscriptionLinks.id, id)))
+        .limit(1)
+      const row = existing[0]
+      if (row === undefined) return { kind: 'missing' }
+      if (row.state === 'revoked') return { kind: 'revoked' }
+      if (row.version !== expectedVersion) return { kind: 'conflict', reason: 'version' }
+      return { kind: 'conflict', reason: 'in_progress' }
+    },
+
+    async finishMutation(id, operationToken, result: LinkMutationResult, finishedAt): Promise<boolean> {
+      const rows = await db
+        .update(subscriptionLinks)
+        .set({
+          ...(result.kind === 'renamed'
+            ? { name: result.name }
+            : { state: 'revoked' as const, revokedAt: result.revokedAt }),
+          operationToken: null,
+          operationKind: null,
+          operationStartedAt: null,
+          version: sql`${subscriptionLinks.version} + 1`,
+          updatedAt: finishedAt,
+        })
+        // 终态不可复活：只有仍为 active 且持有同一 token 的提交才生效。
+        .where(
+          and(
+            eq(subscriptionLinks.id, id),
+            eq(subscriptionLinks.operationToken, operationToken),
+            eq(subscriptionLinks.state, 'active'),
+          ),
+        )
+        .returning({ id: subscriptionLinks.id })
+      return rows.length > 0
+    },
+
+    async releaseMutation(id, operationToken): Promise<void> {
+      await db
+        .update(subscriptionLinks)
+        .set({ operationToken: null, operationKind: null, operationStartedAt: null })
+        .where(and(eq(subscriptionLinks.id, id), eq(subscriptionLinks.operationToken, operationToken)))
+    },
+  }
+}
+
+/**
+ * `subscription_members` 仓储。
+ *
+ * 事件写入分两步（insert-on-conflict → 高水位条件 UPDATE），两步都在数据库层原子：
+ * 已有行时只有 `(last_event_date, last_event_update_id)` 严格更新的写入才会生效；
+ * `reconciledThrough` 所在秒及更旧的事件只推进高水位与 version，不改事实，避免覆盖在途对账。
+ *
+ * @param db drizzle 实例。
+ * @returns 成员台账读写实现。
+ */
+function createSubscriptionMemberRepo(db: Db): SubscriptionMemberRepo {
+  return {
+    async find(chatId, userId) {
+      const rows = await db
+        .select()
+        .from(subscriptionMembers)
+        .where(and(eq(subscriptionMembers.chatId, chatId), eq(subscriptionMembers.userId, userId)))
+        .limit(1)
+      const row = rows[0]
+      return row === undefined ? null : toSubscriptionMember(row)
+    },
+
+    async applyEvent(observation: MemberEventObservation): Promise<'inserted' | 'updated' | 'ignored'> {
+      // 只有带肯定证据的事件才尝试插入：无证据（例如已跟踪成员的离开/升级）直接走下面的条件 UPDATE，
+      // 不存在该行时 UPDATE 零行返回 ignored，不抛错（与内存实现一致）。
+      if (observation.evidence !== null) {
+        const inserted = await db
+          .insert(subscriptionMembers)
+          .values({
+            id: crypto.randomUUID(),
+            chatId: observation.chatId,
+            userId: observation.userId,
+            linkId: observation.linkId,
+            state: observation.state,
+            expiresAt: observation.expiresAt,
+            evidence: observation.evidence,
+            firstObservedAt: observation.observedAt,
+            observedAt: observation.observedAt,
+            observationSource: 'event',
+            lastEventDate: observation.eventDate,
+            lastEventUpdateId: observation.eventUpdateId,
+            reconciledThrough: null,
+            lastCheckedAt: null,
+            lastCheckSucceededAt: null,
+            lastCheckErrorCode: null,
+            version: 0,
+            checkToken: null,
+            checkLeaseUntil: null,
+          })
+          .onConflictDoNothing({ target: [subscriptionMembers.chatId, subscriptionMembers.userId] })
+          .returning({ id: subscriptionMembers.id })
+        if (inserted[0] !== undefined) return 'inserted'
+      }
+
+      // 已存在：只有严格更新的事件能改事实；同秒或更旧的事件被忽略。
+      const applyFacts = sql<boolean>`(${subscriptionMembers.reconciledThrough} is null or ${observation.eventDate}::bigint > floor(extract(epoch from ${subscriptionMembers.reconciledThrough})))`
+      const updated = await db
+        .update(subscriptionMembers)
+        .set({
+          state: sql`case when ${applyFacts} then ${observation.state}::text else ${subscriptionMembers.state} end`,
+          expiresAt: sql`case when ${applyFacts} then ${observation.expiresAt}::timestamptz else ${subscriptionMembers.expiresAt} end`,
+          observedAt: sql`case when ${applyFacts} then ${observation.observedAt}::timestamptz else ${subscriptionMembers.observedAt} end`,
+          // 本次没有肯定证据时保留历史证据。
+          evidence: sql`case when ${applyFacts} then coalesce(${observation.evidence}::text, ${subscriptionMembers.evidence}) else ${subscriptionMembers.evidence} end`,
+          // 明确的新一轮加入：无匹配链接时置 null，不把旧来源当作本轮来源；否则保留/补全。
+          linkId: sql`case when ${applyFacts} then (case when ${observation.isJoin} then ${observation.linkId}::uuid else coalesce(${observation.linkId}::uuid, ${subscriptionMembers.linkId}) end) else ${subscriptionMembers.linkId} end`,
+          observationSource: sql`case when ${applyFacts} then 'event' else ${subscriptionMembers.observationSource} end`,
+          lastEventDate: sql`${observation.eventDate}::bigint`,
+          lastEventUpdateId: sql`${observation.eventUpdateId}::bigint`,
+          version: sql`${subscriptionMembers.version} + 1`,
+        })
+        .where(
+          and(
+            eq(subscriptionMembers.chatId, observation.chatId),
+            eq(subscriptionMembers.userId, observation.userId),
+            or(
+              isNull(subscriptionMembers.lastEventDate),
+              sql`(${observation.eventDate}::bigint, ${observation.eventUpdateId}::bigint) > (${subscriptionMembers.lastEventDate}, ${subscriptionMembers.lastEventUpdateId})`,
+            )!,
+          ),
+        )
+        .returning({ id: subscriptionMembers.id })
+      return updated.length > 0 ? 'updated' : 'ignored'
+    },
+
+    async listPage({ chatId, before, limit }) {
+      const conditions = [eq(subscriptionMembers.chatId, chatId)]
+      if (before !== undefined) {
+        conditions.push(
+          or(
+            lt(subscriptionMembers.firstObservedAt, before.firstObservedAt),
+            and(
+              eq(subscriptionMembers.firstObservedAt, before.firstObservedAt),
+              lt(subscriptionMembers.id, before.id),
+            ),
+          )!,
+        )
+      }
+      const rows = await db
+        .select()
+        .from(subscriptionMembers)
+        .where(and(...conditions))
+        .orderBy(desc(subscriptionMembers.firstObservedAt), desc(subscriptionMembers.id))
+        .limit(limit)
+      return rows.map(toSubscriptionMember)
+    },
+
+    async countByState(chatId) {
+      // SQL 侧聚合，不用有界列表长度冒充全量计数。
+      const rows = await db
+        .select({ state: subscriptionMembers.state, total: count() })
+        .from(subscriptionMembers)
+        .where(eq(subscriptionMembers.chatId, chatId))
+        .groupBy(subscriptionMembers.state)
+
+      let member = 0
+      let left = 0
+      let unknown = 0
+      for (const row of rows) {
+        if (row.state === 'member') member = Number(row.total)
+        else if (row.state === 'left') left = Number(row.total)
+        else if (row.state === 'unknown') unknown = Number(row.total)
+      }
+      return { known: member + left + unknown, member, left, unknown }
+    },
+
+    async claimChecks({ now, limit, leaseMs }): Promise<CheckClaim[]> {
+      // 单条 UPDATE：子查询按公平顺序（last_checked_at NULLS FIRST, id）锁定可 claim 的行，
+      // 行级 `gen_random_uuid()` 给每行独立 token；语句结束即提交，不跨后续 HTTP 持事务。
+      // 租约与尝试时刻一律用数据库 `now()`（spec §4.2）：多实例部署时各自的进程时钟不参与裁决。
+      const claimable = sql`
+        select ${subscriptionMembers.id} from ${subscriptionMembers}
+        where (${subscriptionMembers.checkLeaseUntil} is null or ${subscriptionMembers.checkLeaseUntil} <= now())
+        order by ${subscriptionMembers.lastCheckedAt} asc nulls first, ${subscriptionMembers.id} asc
+        limit ${limit}
+        for update skip locked
+      `
+      const rows = await db
+        .update(subscriptionMembers)
+        .set({
+          checkToken: sql`gen_random_uuid()`,
+          checkLeaseUntil: sql`now() + (${leaseMs} * interval '1 millisecond')`,
+          lastCheckedAt: sql`now()`,
+        })
+        .where(sql`${subscriptionMembers.id} in (${claimable})`)
+        .returning()
+      return rows.map((row) => ({
+        memberId: row.id,
+        chatId: asChatId(row.chatId),
+        userId: asUserId(row.userId),
+        token: row.checkToken ?? '',
+        version: row.version,
+        // 查询开始时刻取数据库写入的 last_checked_at；假驱动等返回行缺列时退回调用方时间。
+        requestStartedAt: row.lastCheckedAt ?? now,
+      }))
+    },
+
+    async finishCheck(claim: CheckClaim, result: CheckResult): Promise<'applied' | 'stale'> {
+      const cas = and(
+        eq(subscriptionMembers.id, claim.memberId),
+        eq(subscriptionMembers.checkToken, claim.token),
+        eq(subscriptionMembers.version, claim.version),
+      )
+
+      if (result.kind === 'ok') {
+        const rows = await db
+          .update(subscriptionMembers)
+          .set({
+            state: result.state,
+            expiresAt: result.expiresAt,
+            // 成功查询以查询开始时刻为观测时刻，并推进对账水位。
+            observedAt: claim.requestStartedAt,
+            observationSource: 'reconcile',
+            reconciledThrough: claim.requestStartedAt,
+            lastCheckSucceededAt: result.returnedAt,
+            lastCheckErrorCode: null,
+            checkToken: null,
+            checkLeaseUntil: null,
+            version: sql`${subscriptionMembers.version} + 1`,
+          })
+          .where(cas)
+          .returning({ id: subscriptionMembers.id })
+        return rows.length > 0 ? 'applied' : 'stale'
+      }
+
+      // 失败不改成员事实：只写受控错误码并释放租约（尝试时刻已在 claim 时推进）。
+      const rows = await db
+        .update(subscriptionMembers)
+        .set({ lastCheckErrorCode: result.errorCode, checkToken: null, checkLeaseUntil: null })
+        .where(cas)
+        .returning({ id: subscriptionMembers.id })
+      return rows.length > 0 ? 'applied' : 'stale'
     },
   }
 }

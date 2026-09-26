@@ -27,6 +27,8 @@ const ruleFixture: Rule = {
 const chatRowFixture: ChatRow = {
   chatId: '-1001234567890',
   title: '测试群',
+  chatType: 'supergroup',
+  linkedChatId: '-1009999999999',
   language: 'zh',
   rules: [ruleFixture],
   passThreshold: 0.35,
@@ -114,12 +116,24 @@ describe('JSONB 解析与行映射', () => {
     expect(config).toEqual({
       chatId: '-1001234567890',
       title: '测试群',
+      chatType: 'supergroup',
+      linkedChatId: '-1009999999999',
       language: 'zh',
       rules: [ruleFixture],
       passThreshold: 0.35,
       llmThreshold: 0.8,
       muteDurationMinutes: 60,
     })
+  })
+
+  test('linked_chat_id 为空列映射成 null（不是 undefined 或空串）', () => {
+    const config = toChatConfig({ ...chatRowFixture, linkedChatId: null })
+    expect(config.linkedChatId).toBeNull()
+  })
+
+  test('群类型列的枚举取值直接进入领域类型（channel 行不被降级成默认值）', () => {
+    const config = toChatConfig({ ...chatRowFixture, chatType: 'channel' })
+    expect(config.chatType).toBe('channel')
   })
 
   test('事件行映射出特征对象，且不带出正文摘录', () => {

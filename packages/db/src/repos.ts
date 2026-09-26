@@ -3,11 +3,18 @@ import type {
   AppealState,
   ChatConfig,
   ChatId,
+  ChatType,
   DailyAggregate,
   MessageEvent,
   ModerationDecision,
+  Rule,
   RuleAction,
   Subscription,
+  SubscriptionLink,
+  SubscriptionMember,
+  SubscriptionMemberEvidence,
+  SubscriptionMemberState,
+  SubscriptionOperationKind,
   UserId,
 } from '@skitarii/core'
 import type { LlmCacheEntry, LlmCacheInsert } from './schema.js'
@@ -29,14 +36,61 @@ import type { LlmCacheEntry, LlmCacheInsert } from './schema.js'
  * 这些都不改 `@skitarii/core` 的类型与函数签名。
  */
 
+/** 群配置可单独刷新的元数据。字段缺省表示「保持原值」，只影响本对象里出现的列。 */
+export interface ChatMetadataPatch {
+  title?: string
+  chatType?: ChatType
+  /** `null` 表示明确清空（如链接被解除）；缺省表示不改。 */
+  linkedChatId?: ChatId | null
+}
+
+/**
+ * 面板 PUT 用的规则/阈值补丁。
+ * 只能改规则与阈值：标题、类型、linked 关系与语言由登记/刷新路径维护，不能被面板写回旧值。
+ */
+export interface ChatRulesPatch {
+  rules: Rule[]
+  passThreshold: number
+  llmThreshold: number
+  muteDurationMinutes: number
+}
+
 /** 群配置读写。 */
 export interface ChatRepo {
-  /** 按 `chatId` 覆盖写入配置（新群注册与规则更新共用）。 */
+  /** 按 `chatId` 覆盖写入配置（owner 在面板里的显式全量保存）。 */
   upsert(config: ChatConfig): Promise<void>
+  /**
+   * 首次登记：插入一条新配置；`chatId` 已存在时**什么都不做**。
+   *
+   * 「什么都不做」是硬语义：登记可能发生在 bot 被拉进群、收到频道帖或新群第一条消息时，
+   * 而 owner 可能正在面板里改同一行的规则。不能用一份刚构造的默认配置去覆盖已经保存的规则，
+   * 因此登记路径与 `upsert` 分开，冲突时以库里的行为准（调用方随后重读即可）。
+   */
+  register(config: ChatConfig): Promise<void>
   /** 未登记时返回 `null`，由调用方决定是否用默认配置注册。 */
   findByChatId(chatId: ChatId): Promise<ChatConfig | null>
+  /**
+   * 只更新元数据列（title / chatType / linkedChatId），其余字段（规则、阈值、语言）原样保留。
+   *
+   * 这是 title / type / linkedId 刷新路径的唯一入口：日常的登记刷新可能与 owner 的规则保存并发，
+   * 用全量 `upsert` 会把调用方内存里的旧规则覆盖回去，因此元数据更新必须收敛到这条单列 UPDATE。
+   * 目标行不存在时静默无操作（登记由 `register` 负责）。
+   */
+  updateMetadata(chatId: ChatId, patch: ChatMetadataPatch): Promise<void>
+  /**
+   * 只更新规则与阈值（面板 PUT 专用），不改 title / chatType / linkedChatId / language。
+   *
+   * 面板保存与 bot 的元数据刷新可能并发：面板读到的行可能已带旧元数据，若走全量写会把并发刷新
+   * 回退。规则侧走这条单列 UPDATE 后，两条写路径互不覆盖（各写各的列）。
+   */
+  updateRulesConfig(chatId: ChatId, patch: ChatRulesPatch): Promise<void>
   /** 遍历所有群配置，供调度器与报表使用。 */
   listAll(): Promise<ChatConfig[]>
+  /**
+   * 频道的稳定分页：`chatType = 'channel'`，按 `chat_id` 固定 C 排序 ASC，`afterChatId` 为严格下界。
+   * 订阅页的频道列表用它，不复用 `listAll` 后在应用层切片。
+   */
+  listChannelsPage(input: { afterChatId?: ChatId; limit: number }): Promise<ChatConfig[]>
 }
 
 /** 消息事件写入与保留期清理。 */
@@ -221,6 +275,138 @@ export interface SubscriptionRepo {
   listExpiringBefore(instant: Date): Promise<Subscription[]>
 }
 
+/* ---- Phase 3b：订阅链接与成员台账 ---- */
+
+/** 创建请求的持久占位输入。`requestHash` 是原始创建请求的规范化摘要，改名不改它。 */
+export interface ReserveCreateInput {
+  id: string
+  chatId: ChatId
+  ownerUserId: UserId
+  requestId: string
+  requestHash: string
+  name: string
+  priceStars: number
+  periodSeconds: number
+  createdAt: Date
+}
+
+/** `reserveCreate` 结果：`reserved` 表示本次插入成功（调用者有权发外部创建）；`existing` 返回原行。 */
+export type ReserveCreateOutcome = { kind: 'reserved' | 'existing'; link: SubscriptionLink }
+
+/** `finishCreate` 的成功输入：Telegram 返回的完整链接。 */
+export interface CreateFinishResult {
+  inviteLink: string
+  finishedAt: Date
+}
+
+/** 链接变更 claim 的结果。`conflict` 区分版本不匹配与已有活跃操作。 */
+export type ClaimResult =
+  | { kind: 'claimed'; token: string; link: SubscriptionLink }
+  | { kind: 'missing' }
+  | { kind: 'revoked' }
+  | { kind: 'conflict'; reason: 'version' | 'in_progress' }
+
+/** `finishMutation` 的结果：改名或撤销。 */
+export type LinkMutationResult =
+  | { kind: 'renamed'; name: string }
+  | { kind: 'revoked'; revokedAt: Date }
+
+/** 链接读写。条件写全部落在单条 SQL 上，不靠进程内互斥保证正确性。 */
+export interface SubscriptionLinkRepo {
+  /** 插入创建占位；`(ownerUserId, requestId)` 冲突时返回原行（insert-on-conflict 返回语义）。 */
+  reserveCreate(input: ReserveCreateInput): Promise<ReserveCreateOutcome>
+  /** 按幂等键读取（重放与冲突判定用；不要求仍有 Telegram 权限）。 */
+  findByRequestId(ownerUserId: UserId, requestId: string): Promise<SubscriptionLink | null>
+  /** creating/create_unknown → active；返回是否真的写入。 */
+  finishCreate(id: string, result: CreateFinishResult): Promise<boolean>
+  /** 明确失败或结果不确定时落状态；只从 `creating` 迁移。 */
+  markCreateOutcome(id: string, state: 'create_unknown' | 'create_failed', changedAt: Date): Promise<void>
+  findById(chatId: ChatId, id: string): Promise<SubscriptionLink | null>
+  /** 完整链接精确匹配（成员来源关联用）。 */
+  findByInviteLink(chatId: ChatId, fullLink: string): Promise<SubscriptionLink | null>
+  /**
+   * 分页：`(createdAt, id)` 倒序，`before` 为严格元组上界。
+   * 调用方传 `limit + 1` 以判断是否还有下一页。
+   */
+  listPage(input: { chatId: ChatId; before?: { createdAt: Date; id: string }; limit: number }): Promise<SubscriptionLink[]>
+  /**
+   * 原子占位一次改名/撤销：仅 `state = 'active'`、版本匹配且无未过期占位时可 claim。
+   * 占位超过 60 秒可被新 token 替换；版本不匹配与占位冲突都返回 `conflict`。
+   */
+  claimMutation(
+    chatId: ChatId,
+    id: string,
+    expectedVersion: number,
+    kind: SubscriptionOperationKind,
+    now: Date,
+  ): Promise<ClaimResult>
+  /**
+   * 提交操作结果：必须持有同一 token 且行仍为 `active`。
+   * revoked 是终态：迟到的 rename 结果不能复活它。
+   */
+  finishMutation(id: string, operationToken: string, result: LinkMutationResult, finishedAt: Date): Promise<boolean>
+  /** 释放未提交的占位（外部调用失败/不确定后允许立即重试）。 */
+  releaseMutation(id: string, operationToken: string): Promise<void>
+}
+
+/** 成员事件观测：由 bot 的 `chat_member` 处理器构造。 */
+export interface MemberEventObservation {
+  chatId: ChatId
+  userId: UserId
+  state: SubscriptionMemberState
+  expiresAt: Date | null
+  /** 本次观测到的肯定证据；`null` 表示保留历史证据，且不插入新行（无行时 applyEvent 返回 ignored）。 */
+  evidence: SubscriptionMemberEvidence | null
+  /** 本次可关联的链接；`isJoin` 为真且无匹配时必须写 null（不把旧来源当本轮来源）。 */
+  linkId: string | null
+  /** 是否明确发生新一轮加入（旧状态为 left/kicked，或事件带 invite_link）。 */
+  isJoin: boolean
+  /** Telegram 秒级事件时间与 update id，用于高水位比较。 */
+  eventDate: number
+  eventUpdateId: number
+  observedAt: Date
+}
+
+/** 对账 claim：token + 捕获取时的事实 version + 查询开始时刻。 */
+export interface CheckClaim {
+  memberId: string
+  chatId: ChatId
+  userId: UserId
+  token: string
+  version: number
+  requestStartedAt: Date
+}
+
+/** 对账结果：成功事实或受控错误码。 */
+export type CheckResult =
+  | { kind: 'ok'; state: SubscriptionMemberState; expiresAt: Date | null; returnedAt: Date }
+  | { kind: 'failed'; errorCode: string; checkedAt: Date }
+
+/** 成员台账读写。 */
+export interface SubscriptionMemberRepo {
+  find(chatId: ChatId, userId: UserId): Promise<SubscriptionMember | null>
+  /**
+   * 以 `(eventDate, eventUpdateId)` 高水位条件写事实；更旧/重复事件返回 `ignored`。
+   * 事件所在秒不晚于 `reconciledThrough` 时只推进高水位与 version，不改事实。
+   */
+  applyEvent(observation: MemberEventObservation): Promise<'inserted' | 'updated' | 'ignored'>
+  /** 分页：不可变 `(firstObservedAt, id)` 倒序；调用方传 `limit + 1`。 */
+  listPage(input: {
+    chatId: ChatId
+    before?: { firstObservedAt: Date; id: string }
+    limit: number
+  }): Promise<SubscriptionMember[]>
+  /** SQL 侧聚合的计数；`known` 为三状态之和，独立于分页。 */
+  countByState(chatId: ChatId): Promise<{ known: number; member: number; left: number; unknown: number }>
+  /**
+   * 公平 claim 一批待对账成员：`lastCheckedAt ASC NULLS FIRST, id ASC`，跳过未过期租约，
+   * 原子推进 `lastCheckedAt` 并写入 token（不递增事实 version）。
+   */
+  claimChecks(input: { now: Date; limit: number; leaseMs: number }): Promise<CheckClaim[]>
+  /** 提交对账结果：仅 token 匹配且 version 未变时应用；失败不改成员事实。 */
+  finishCheck(claim: CheckClaim, result: CheckResult): Promise<'applied' | 'stale'>
+}
+
 /** 某群某天四个计数的组合，供调度器拼成 `DailyAggregate`。 */
 export type DailyCounts = Omit<DailyAggregate, 'chatId' | 'date'>
 
@@ -266,6 +452,10 @@ export interface Repos {
   decisions: DecisionRepo
   appeals: AppealRepo
   subscriptions: SubscriptionRepo
+  /** Phase 3b 新台账：订阅链接。 */
+  subscriptionLinks: SubscriptionLinkRepo
+  /** Phase 3b 新台账：成员。 */
+  subscriptionMembers: SubscriptionMemberRepo
   aggregates: AggregateRepo
   llmCache: LlmCacheRepo
 }

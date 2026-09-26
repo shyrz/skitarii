@@ -37,6 +37,12 @@ export type AppealState = 'open' | 'upheld' | 'overturned'
 /** 订阅状态。`expired` 由到期清理任务写入，`revoked` 由人工撤销写入。 */
 export type SubState = 'active' | 'expired' | 'revoked'
 
+/**
+ * 已登记的聊天类型。只登记群、超级群与频道：私聊是命令与通知的通道，不产生配置行。
+ * 与 Telegram 的 `chat.type` 相比刻意不含 `private`，让「不给私聊建配置」成为类型层的事实。
+ */
+export type ChatType = 'group' | 'supergroup' | 'channel'
+
 /** 单条审核规则。规则以数据形式存储，执行路径不含针对单个规则的硬编码分支。 */
 export interface Rule {
   id: string
@@ -62,6 +68,16 @@ export interface Rule {
 export interface ChatConfig {
   chatId: ChatId
   title: string
+  /**
+   * 聊天类型，来自 Telegram 更新里的 `chat.type`（登记时写入）或管理员的 `my_chat_member` 刷新。
+   * 历史行在迁移时按 `supergroup` 兼容，由后续的登记/刷新路径修正（见 README「频道与讨论组」）。
+   */
+  chatType: ChatType
+  /**
+   * Telegram 的 linked chat（频道 ↔ 讨论组，双向）：频道行指向它的讨论组，讨论组行指向它所属的频道。
+   * 未链接或尚未探测到时为 `null`。它只是登记事实，不参与审核：评论按讨论组自身的规则审。
+   */
+  linkedChatId: ChatId | null
   language: 'zh' | 'en'
   rules: Rule[]
   /** 分数低于此值直接放行，不进 LLM。 */
@@ -142,7 +158,12 @@ export interface Appeal {
   resolvedAt: Date | null
 }
 
-/** 订阅门禁记录。`inviteLink` 来自官方 `createChatSubscriptionInviteLink`。 */
+/**
+ * 旧的订阅门禁记录。`inviteLink` 来自官方 `createChatSubscriptionInviteLink`。
+ *
+ * Phase 3b 起新台账拆成 {@link SubscriptionLink} 与 {@link SubscriptionMember}；旧表、旧类型与旧数据保留，
+ * 不做自动迁移，也不作为新台账的「既有记录」参与成员跟踪。
+ */
 export interface Subscription {
   id: string
   chatId: ChatId
@@ -151,6 +172,104 @@ export interface Subscription {
   expiresAt: Date
   state: SubState
 }
+
+/**
+ * 订阅链接状态机。
+ * `creating` 是持久化请求占位；`create_unknown` 表示外部可能成功但本地未确认；
+ * `create_failed` 只在 Telegram 明确拒绝时写入；`active` / `revoked` 必须有完整 `inviteLink`。
+ */
+export type SubscriptionLinkState = 'creating' | 'active' | 'revoked' | 'create_unknown' | 'create_failed'
+
+/** 链接上正在进行的远端操作种类。同一时刻至多一个。 */
+export type SubscriptionOperationKind = 'rename' | 'revoke'
+
+/**
+ * 频道订阅邀请链接（由本 Bot 的 `createChatSubscriptionInviteLink` 创建）。
+ *
+ * 价格与周期不可编辑，`requestHash` 只是原始创建请求的规范化摘要，永远不随改名变化：
+ * 同一个 `requestId` 换成不同参数必须被识别为冲突，而不是「重放」。
+ */
+export interface SubscriptionLink {
+  id: string
+  chatId: ChatId
+  /** 创建者（本部署的 owner，也是唯一的面板使用者）。 */
+  ownerUserId: UserId
+  /** 客户端生成的幂等键。 */
+  requestId: string
+  /** 原始创建请求的规范化 JSON 的 sha256；改名不改它。 */
+  requestHash: string
+  name: string
+  priceStars: number
+  periodSeconds: number
+  /** `active` / `revoked` 必有完整链接，其余状态允许为空。 */
+  inviteLink: string | null
+  state: SubscriptionLinkState
+  createdAt: Date
+  updatedAt: Date
+  revokedAt: Date | null
+  /** 乐观并发版本；每次条件写递增。 */
+  version: number
+  /** 进行中操作的占位 token；同一时刻至多一个操作。 */
+  operationToken: string | null
+  operationKind: SubscriptionOperationKind | null
+  operationStartedAt: Date | null
+}
+
+/** 成员台账状态。`left` 只表示观测到离开频道，不表示订阅到期（禁止用 `expired` 表述）。 */
+export type SubscriptionMemberState = 'member' | 'left' | 'unknown'
+
+/** 纳入台账的最近肯定证据：订阅到期字段，或匹配到自建付费链接。保留历史依据，不代表当前付款或链路。 */
+export type SubscriptionMemberEvidence = 'until_date' | 'owned_link'
+
+/** 事实采样来源：Telegram 成员事件，或定期对账快照。 */
+export type SubscriptionObservationSource = 'event' | 'reconcile'
+
+/**
+ * 订阅成员台账。只收录 Bot 有订阅证据的已知成员（或以 `until_date` 观测到订阅的成员）；
+ * 不枚举历史全量订户，也不把「曾走付费链接」当作当前付款凭证。
+ */
+export interface SubscriptionMember {
+  id: string
+  chatId: ChatId
+  userId: UserId
+  /** 最近可关联的加入来源链接；无法匹配/未关联时为 `null`。 */
+  linkId: string | null
+  state: SubscriptionMemberState
+  /** 最新成功快照观测到的订阅到期时间；缺失表示「本次未观测到」，不代表无限期或付款失效。 */
+  expiresAt: Date | null
+  evidence: SubscriptionMemberEvidence
+  /** 首次纳入时刻，不可变。 */
+  firstObservedAt: Date
+  /** 最后一次成功事实采样时刻。 */
+  observedAt: Date
+  observationSource: SubscriptionObservationSource
+  /** 事件高水位（Telegram 秒 + update id）；无事件来源时为 `null`。 */
+  lastEventDate: number | null
+  lastEventUpdateId: number | null
+  /** 成功对账覆盖到的事实时刻；用于丢弃更旧的事件。 */
+  reconciledThrough: Date | null
+  /** 最后一次对账尝试时刻（失败也推进）。 */
+  lastCheckedAt: Date | null
+  lastCheckSucceededAt: Date | null
+  /** 受控错误码；失败不改成员事实。 */
+  lastCheckErrorCode: string | null
+  version: number
+  /** 对账租约 token 与到期时刻；内部操作字段，HTTP DTO 不暴露。 */
+  checkToken: string | null
+  checkLeaseUntil: Date | null
+}
+
+/** 固定订阅周期（秒），Telegram 当前只接受 2592000。 */
+export const SUBSCRIPTION_PERIOD_SECONDS = 2_592_000
+
+/** 链接名称的最大长度（Unicode code point，Telegram 限制 0..32）。 */
+export const SUBSCRIPTION_NAME_MAX_LENGTH = 32
+
+/** 每周期价格的下限（Stars）。 */
+export const SUBSCRIPTION_PRICE_MIN_STARS = 1
+
+/** 每周期价格的上限（Stars）。 */
+export const SUBSCRIPTION_PRICE_MAX_STARS = 10_000
 
 /** 日聚合。报表只读这张表，不对明细表做范围扫描。 */
 export interface DailyAggregate {
