@@ -103,7 +103,7 @@ curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
 
 1. `pnpm install --frozen-lockfile`（含 devDependencies，见 `Dockerfile` 注释）
 2. `pnpm build:web`，产出 `apps/web/dist`
-3. 容器启动 `deploy/entrypoint.sh`：先 `pnpm db:migrate`，失败即以非 0 退出，不会带着旧 schema 起服务；成功后 `exec node --import tsx src/index.ts`
+3. 容器启动 `deploy/entrypoint.sh`：先 `pnpm db:migrate`，失败即以非 0 退出，不会带着旧 schema 起服务；随后补齐既有群缺失的默认规则（幂等，失败只告警、不阻塞启动）；最后 `exec node --import tsx src/index.ts`
 4. 进程监听 `PORT`（平台注入，缺省 3000）；`PUBLIC_URL` 非空时启动阶段调用 `setWebhook(${PUBLIC_URL}/telegram/webhook, { secret_token })`，幂等（每次启动重注册），失败只记日志、不阻断启动，Telegram 侧保留旧地址
 
 迁移按单实例、低流量假设执行：每个实例启动都会跑一遍 `pnpm db:migrate`，多实例同时启动会并发执行迁移；0004 的 `CREATE INDEX` 会短暂持有表级 SHARE 锁（阻塞写入、允许读取），0006/0008/0009 的 `ADD COLUMN` 与 `CREATE TABLE`（0008 还有枚举类型 `chat_type` 的创建）会短暂持有 ACCESS EXCLUSIVE 锁，自用规模下几乎无感。0009 只新建 `subscription_links` / `subscription_members` 两张空表与索引，不 drop、不 rename、不改写旧 `subscriptions` 数据。实例数或写入量上来后，应把迁移拆成独立的发布步骤，或改用手工执行的 `CREATE INDEX CONCURRENTLY`。
@@ -449,7 +449,7 @@ Mini App 静态产物，对应 `apps/web/dist`。找不到文件且路径没有�
 
 **信任名单直接放行。** 每个群/频道一份手工信任名单（上限 50 个账号、服务端去重）：名单内账号的消息在配置载入后直接落一条 `pass` 决策（score 0、signals 空）并返回，不查误伤样本、不跑规则、不调复核、不施加动作；新消息与编辑消息同样适用，事件与决策照常落库供回看。它与内容白名单（误伤样本）互不影响，二者可以同时存在。名单命中不走审核链路，**也不发 owner 判定 feed**——信任名单的语义就是不逐条打扰。
 
-**默认配置只在群/频道首次登记时写入。** 新对话拿到 15 条默认规则（含 `default-emoji-flood`：表情总数 ≥6；`default-inline-bot`：经内联机器人发送，pattern 不使用），此后配置以数据库为准；已登记的群不会自动追加新默认规则，需要时在面板手动添加。频道与讨论组各自登记、各自成套配置，互不套用（详见「频道与讨论组（Phase 3a）」）。表情总数把普通 Unicode 表情也计入（`custom-emoji` 只覆盖付费自定义表情），按用户感知每个表情恰计一次（ZWJ 序列如家庭表情计 1，不再按码位拆开）；两者叠加后有意的语义收紧：≥6 个自定义表情会同时命中 `default-emoji-burst` 与 `default-emoji-flood`（0.8 直接处置）。
+**默认配置在群/频道首次登记时写入，缺失的默认规则由部署入口自动补齐。** 新对话拿到 15 条默认规则（含 `default-emoji-flood`：表情总数 ≥6；`default-inline-bot`：经内联机器人发送，pattern 不使用），此后配置以数据库为准；部署入口每次启动都会按 `id` 给既有群补齐缺失的默认规则（幂等：只补缺失，不覆盖手改、不删除）。要屏蔽某条默认规则请在面板「停用」它，不要删除——删除会在下次部署被重新补上。频道与讨论组各自登记、各自成套配置，互不套用（详见「频道与讨论组（Phase 3a）」）。表情总数把普通 Unicode 表情也计入（`custom-emoji` 只覆盖付费自定义表情），按用户感知每个表情恰计一次（ZWJ 序列如家庭表情计 1，不再按码位拆开）；两者叠加后有意的语义收紧：≥6 个自定义表情会同时命中 `default-emoji-burst` 与 `default-emoji-flood`（0.8 直接处置）。
 
 **重复投递不重复处置。** 事件 id 由 `(chatId, messageId)` 派生（编辑消息附加 `edit:${edit_date}:${内容哈希前 16 位}` 判别符：同一秒内不同内容的编辑各自成事件，编辑回退到早前内容时复用当时的事件 id、不再重审），决策 id 由事件 id 派生，落库用 `on conflict do nothing`；执行侧再叠一层 `eventId + action` 的进程内幂等闸门与 `moderation_decisions.executed` 回填。Telegram 重投递同一 update 的效果是「什么都不再发生」。
 

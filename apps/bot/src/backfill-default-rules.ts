@@ -1,16 +1,23 @@
 /**
- * 一次性回填脚本：给既有的群/频道配置补齐 `DEFAULT_RULES` 中缺失的默认规则。
+ * 回填脚本：给既有的群/频道配置补齐 `DEFAULT_RULES` 中缺失的默认规则。
  *
  * 为什么需要它：默认规则只在群首次登记时由 `defaultChatConfig` 写入，之后新增的默认规则不会
- * 出现在既有配置里（用户群因此漏判）。本脚本可重复运行：按 `id` 判断缺失，已存在的规则（包括
- * owner 手改过的同名规则）与顺序原样保留，缺失项按 `DEFAULT_RULES` 的顺序追加到尾部。
+ * 出现在既有配置里（用户群因此漏判）。现在通常由部署入口 `deploy/entrypoint.sh` 在每次启动前
+ * 自动以 `--apply` 执行（幂等），新增默认规则随下次部署生效，无需手动运行；本脚本也可手动执行。
+ *
+ * 幂等且只补不删：按 `id` 判断缺失，已存在的规则（包括 owner 手改过的同名规则）与顺序原样保留，
+ * 缺失项按 `DEFAULT_RULES` 的顺序追加到尾部；删掉的默认规则会在下次部署被重新补上，要屏蔽某条
+ * 规则请在面板「停用」。
  *
  * 默认 dry-run：只打印每群将追加的规则 id 与汇总，不写库；加 `--apply` 才写入。写入只经
  * `updateRulesConfig` 更新 `rules`，白名单、阈值与元数据以现值原样回传，不会被改动。
- * 单群失败只记录并继续，最后按是否存在失败决定退出码（有失败为 1）。
+ * 单群失败只记录并继续，最后按是否存在失败决定退出码（有失败为 1）；部署入口容忍非 0，
+ * 补齐失败只告警、不阻塞服务启动。
  *
  * 运行方式（在仓库根目录；需要环境变量 DATABASE_URL，连接串不会出现在日志里）：
  *   pnpm --filter @skitarii/bot exec tsx src/backfill-default-rules.ts [--apply]
+ * 部署入口实际的工作目录是 apps/server：
+ *   node --import tsx ../bot/src/backfill-default-rules.ts --apply
  */
 
 import { pathToFileURL } from 'node:url'
