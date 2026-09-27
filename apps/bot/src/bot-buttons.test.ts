@@ -1,7 +1,7 @@
 import { asChatId, asUserId } from '@skitarii/core'
 import { createInMemoryRepos, type InMemoryRepos } from '@skitarii/db'
 import type { Bot } from 'grammy'
-import type { Update } from 'grammy/types'
+import type { Message, Update } from 'grammy/types'
 import { describe, expect, test } from 'vitest'
 import { createBotRuntime } from './bot.js'
 import { contentHashOf } from './features.js'
@@ -92,10 +92,16 @@ function setup(): Harness {
 /**
  * 群消息更新。
  *
- * @param options 消息 id、文本与内联键盘按钮（按行给出）。
+ * @param options 消息 id、文本、内联键盘按钮（按行给出）与转发来源。
  * @returns 可交给 `bot.handleUpdate` 的更新。
  */
-function groupMessageUpdate(options: { updateId: number; messageId: number; text: string; buttons?: string[][] }): Update {
+function groupMessageUpdate(options: {
+  updateId: number
+  messageId: number
+  text: string
+  buttons?: string[][]
+  forwardOrigin?: Message['forward_origin']
+}): Update {
   return {
     update_id: options.updateId,
     message: {
@@ -105,8 +111,19 @@ function groupMessageUpdate(options: { updateId: number; messageId: number; text
       from: memberUser,
       text: options.text,
       ...(options.buttons === undefined ? {} : { reply_markup: inlineKeyboard(options.buttons) }),
+      ...(options.forwardOrigin === undefined ? {} : { forward_origin: options.forwardOrigin }),
     },
   } as Update
+}
+
+/** 频道转发来源；`username` 省略时分析文本里用频道标题。 */
+function channelOrigin(title: string, username?: string): NonNullable<Message['forward_origin']> {
+  return {
+    type: 'channel',
+    date: 1_758_000_000,
+    message_id: 20,
+    chat: { id: -1_000_000_000_100, type: 'channel', title, ...(username === undefined ? {} : { username }) },
+  }
 }
 
 /** 编辑后的群消息更新（Telegram 的编辑更新必带 `edit_date`）。 */
@@ -224,5 +241,67 @@ describe('按钮文本进入审核（bot 接线）', () => {
     const decision = await harness.store.repos.decisions.findById(deriveDecisionId(editEventId))
     expect(decision?.action).toEqual({ kind: 'delete' })
     expect(harness.calls.filter((call) => call.method === 'deleteMessage')).toHaveLength(1)
+  })
+})
+
+/**
+ * bot 适配层的转发来源审核测试。
+ *
+ * 走真实的 grammY `handleUpdate`：验证 `forward_origin` 的频道标题确实被组合进分析文本并参与
+ * 规则命中，而无来源的消息行为不变。来源行的提取细节由 `features.test.ts` 单测覆盖，这里只验接线。
+ */
+describe('转发来源进入审核（bot 接线）', () => {
+  test('频道标题含关键词的转发命中规则并处置，摘录含 (fwd) 来源行', async () => {
+    const harness = setup()
+    await seedChat(harness.store)
+
+    // 正文干净、载荷藏在来源频道名里：只审正文会漏判，来源行必须参与规则匹配。
+    await harness.bot.handleUpdate(
+      groupMessageUpdate({ updateId: 1, messageId: 200, text: '今天上新', forwardOrigin: channelOrigin('加微信广告') }),
+    )
+
+    const eventId = deriveEventId(chatId, 200)
+    const decision = await harness.store.repos.decisions.findById(deriveDecisionId(eventId))
+    expect(decision?.action).toEqual({ kind: 'delete' })
+    expect(decision?.signals).toEqual([{ kind: 'rule-hit', ruleId: 'r-ad', score: 0.9 }])
+    expect(harness.calls.filter((call) => call.method === 'deleteMessage')).toHaveLength(1)
+    // 摘录取的是组合后的分析文本：正文在最前，来源行随消息一起留痕，复核时能看到判罚依据。
+    expect(harness.store.sampleOf(eventId)).toBe('今天上新\n(fwd)ch:加微信广告')
+  })
+
+  test('超长来源名不挤占摘录预算：280 码点里先保正文', async () => {
+    const harness = setup()
+    await seedChat(harness.store)
+
+    // 标题远超摘录长度上限，且含关键词以触发处置（处置才会补写摘录）。
+    await harness.bot.handleUpdate(
+      groupMessageUpdate({
+        updateId: 1,
+        messageId: 202,
+        text: '今天上新',
+        forwardOrigin: channelOrigin(`加微信${'广'.repeat(400)}`),
+      }),
+    )
+
+    const eventId = deriveEventId(chatId, 202)
+    const sample = harness.store.sampleOf(eventId)
+    // 截断保留开头：摘要以正文开头，来源行只出现在被截断的尾部。
+    expect(sample?.startsWith('今天上新\n')).toBe(true)
+    expect(Array.from(sample ?? '')).toHaveLength(280)
+    expect(sample).toContain('(fwd)ch:加微信')
+  })
+
+  test('无来源的同文案消息行为不变：直接放行、不处置、无摘录', async () => {
+    const harness = setup()
+    await seedChat(harness.store)
+
+    await harness.bot.handleUpdate(groupMessageUpdate({ updateId: 1, messageId: 201, text: '今天上新' }))
+
+    const eventId = deriveEventId(chatId, 201)
+    const decision = await harness.store.repos.decisions.findById(deriveDecisionId(eventId))
+    expect(decision?.action).toEqual({ kind: 'pass' })
+    expect(decision?.signals).toEqual([])
+    expect(harness.calls.some((call) => call.method === 'deleteMessage')).toBe(false)
+    expect(harness.store.sampleOf(eventId)).toBeNull()
   })
 })

@@ -251,8 +251,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       return
     }
 
-    // 分析文本 = 正文/caption + 按钮文本（每行以 `(btn)` 开头）；按钮文本会进入归一化、
-    // 规则匹配、复核提示词、内容哈希、feed 与摘录。广告常把载荷放在按钮上，只看正文会漏判。
+    // 分析文本 = 正文/caption → 按钮行（每行以 `(btn)` 开头）→ 转发来源行（`(fwd)` 前缀）；
+    // 三段都会进入归一化、规则匹配、复核提示词、内容哈希、feed 与摘录。广告常把载荷放在按钮或来源名上，只看正文会漏判。
     const text = composeAnalysisText(message, message.text ?? message.caption ?? '')
     // 频道评论：讨论组里的评论通过回复一条「频道帖子转发」挂到原帖下，只有频道用户名 + 帖子 id
     // 拼出的深链才点得进评论上下文（t.me/c 链接在评论区打不开目标）。拿不到频道用户名时退回 null。
@@ -285,7 +285,7 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
 
   bot.on('edited_message', async (ctx) => {
     const message = ctx.editedMessage
-    // 与新消息同一条组合口径：按钮文本一并进入分析文本与 editDate 兜底哈希。
+    // 与新消息同一条组合口径：按钮文本与转发来源行一并进入分析文本与 editDate 兜底哈希。
     const text = composeAnalysisText(message, message.text ?? message.caption ?? '')
     // Telegram 的编辑更新必带 edit_date；若协议退化导致缺失，用内容哈希前 16 位构造稳定数值兜底：
     // 管线随后还会在判别符里拼上内容哈希（`edit:${editDate}:${内容哈希前 16 位}`），两项组合后

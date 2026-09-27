@@ -107,7 +107,7 @@ export interface IncomingMessage {
   chatType: ChatType
   messageId: number
   userId: UserId
-  /** 分析文本：正文/caption + 内联键盘按钮文本，见 `composeAnalysisText`。是内容哈希与摘录的唯一来源。 */
+  /** 分析文本：正文/caption + 内联键盘按钮文本 + 转发来源行，见 `composeAnalysisText`。是内容哈希与摘录的唯一来源。 */
   text: string
   features: MessageFeatures
   /**
@@ -155,7 +155,7 @@ export interface DecisionObservation {
   chatTitle: string
   messageId: number
   userId: UserId
-  /** 分析文本：正文/caption + 内联键盘按钮文本，见 `composeAnalysisText`。 */
+  /** 分析文本：正文/caption + 内联键盘按钮文本 + 转发来源行，见 `composeAnalysisText`。 */
   text: string
   /** 判定信号，按产生顺序：规则命中在前、（灰色地带的）复核结论在后。 */
   signals: Signal[]
