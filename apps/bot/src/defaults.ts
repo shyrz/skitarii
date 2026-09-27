@@ -21,7 +21,7 @@ import type { ChatConfig, ChatId, Rule } from '@skitarii/core'
  * 名字信号与来源工具的差异：n8n 工作流对可疑名字（Cyrillic/Arabic/中文广告词、用户名含 USDT）
  * 是命中即封，误杀面过大；这里只作 0.4 的计分信号，单条命中落在灰色地带，由 LLM 结合上下文判。
  */
-const DEFAULT_RULES: readonly Rule[] = [
+export const DEFAULT_RULES: readonly Rule[] = [
   { id: 'default-ad-wechat', kind: 'keyword', pattern: '加微信', score: 0.4, actionHint: 'delete', enabled: true },
   { id: 'default-ad-private', kind: 'keyword', pattern: '需要的私聊', score: 0.4, actionHint: 'delete', enabled: true },
   { id: 'default-ad-sale', kind: 'keyword', pattern: '低价出售', score: 0.4, actionHint: 'delete', enabled: true },
