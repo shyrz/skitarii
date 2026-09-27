@@ -167,6 +167,17 @@ export interface DecisionRepo {
    */
   countPriorViolations(chatId: ChatId, userId: UserId, since: Date): Promise<number>
   /**
+   * 内建策略的窗口计数：该用户在该群、`since` 之后、signals 里存在 `rule-hit` 且 `ruleId` 命中的决策数。
+   *
+   * 与 `countPriorViolations` 的区别是「按标记计数」而不是「按非放行计数」：策略命中的决策档位可能只是删除
+   * （窗口内前几次），用非放行口径会把窗口内每条都算成前科、也会把规则违规混进来。放行决策同样计入：
+   * 计数的是「该标记出现过几次」，与档位无关。signals 是 JSONB 数组，两个实现必须给出同一语义
+   * （`kind` 一起参与匹配，不能只按 `ruleId` 字段匹配）。
+   *
+   * @param since 统计起点（含）；窗口长度由调用方决定。
+   */
+  countRuleHitsSince(chatId: ChatId, userId: UserId, ruleId: string, since: Date): Promise<number>
+  /**
    * 记录处置通知的落点，供申诉生命周期编辑：提交申诉时改成「等待复核」、结案时改成终态，
    * 两处都要去掉申诉按钮。
    *

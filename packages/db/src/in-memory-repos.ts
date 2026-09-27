@@ -206,6 +206,16 @@ export function createInMemoryRepos(): InMemoryRepos {
             decision.action.kind !== 'pass',
         ).length
       },
+      async countRuleHitsSince(chatId: ChatId, userId: UserId, ruleId: string, since: Date): Promise<number> {
+        // 与 PG 的 JSONB 包含同语义：signals 里存在一条 rule-hit 命中该 ruleId，与决策档位无关。
+        return [...decisions.values()].filter(
+          (decision) =>
+            decision.chatId === chatId &&
+            decision.userId === userId &&
+            decision.decidedAt >= since &&
+            decision.signals.some((signal) => signal.kind === 'rule-hit' && signal.ruleId === ruleId),
+        ).length
+      },
       async markNoticeSent(decisionId: string, chatId: string, messageId: number): Promise<void> {
         // 与 PG 的 `UPDATE ... WHERE id = $1` 对齐：决策不存在时静默不写入。
         if (!decisions.has(decisionId)) return

@@ -105,6 +105,81 @@ async function seedSample(
   }
 }
 
+/** 预置一条带信号的决策，用于内建策略的窗口计数用例。 */
+async function seedSignalDecision(
+  store: InMemoryRepos,
+  options: {
+    id: string
+    chatId?: ChatId
+    userId?: UserId
+    decidedAt: Date
+    signals: ModerationDecision['signals']
+    action?: ModerationDecision['action']
+  },
+): Promise<void> {
+  await store.repos.decisions.insert({
+    id: options.id,
+    eventId: `ev-${options.id}`,
+    chatId: options.chatId ?? chatId,
+    userId: options.userId ?? userId,
+    action: options.action ?? { kind: 'delete' },
+    score: 1,
+    signals: options.signals,
+    decidedAt: options.decidedAt,
+    executed: true,
+  })
+}
+
+describe('内存实现：内建策略的窗口计数', () => {
+  const marker: ModerationDecision['signals'] = [{ kind: 'rule-hit', ruleId: 'builtin-nonmember-inline', score: 1 }]
+  const since = new Date('2026-09-23T09:00:00Z')
+
+  test('只数该群该用户、窗口内、signals 含指定 ruleId 的决策', async () => {
+    const store = createInMemoryRepos()
+    await seedSignalDecision(store, { id: 'hit-in', decidedAt: new Date('2026-09-23T09:30:00Z'), signals: marker })
+    // 窗口左闭：恰好等于 since 的记录也计入。
+    await seedSignalDecision(store, { id: 'hit-boundary', decidedAt: since, signals: marker })
+    // 以下都不计入：窗口外、别的 ruleId、只有 llm 信号、别的群、别的用户。
+    await seedSignalDecision(store, { id: 'before-window', decidedAt: new Date('2026-09-23T08:59:59Z'), signals: marker })
+    await seedSignalDecision(store, {
+      id: 'other-rule',
+      decidedAt: new Date('2026-09-23T09:30:00Z'),
+      signals: [{ kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 }],
+    })
+    await seedSignalDecision(store, {
+      id: 'llm-only',
+      decidedAt: new Date('2026-09-23T09:30:00Z'),
+      signals: [{ kind: 'llm', verdict: 'spam', confidence: 0.9 }],
+    })
+    await seedSignalDecision(store, {
+      id: 'other-chat',
+      decidedAt: new Date('2026-09-23T09:30:00Z'),
+      signals: marker,
+      chatId: asChatId('-1009999999999'),
+    })
+    await seedSignalDecision(store, {
+      id: 'other-user',
+      decidedAt: new Date('2026-09-23T09:30:00Z'),
+      signals: marker,
+      userId: asUserId(7_000_000_099),
+    })
+
+    expect(await store.repos.decisions.countRuleHitsSince(chatId, userId, 'builtin-nonmember-inline', since)).toBe(2)
+  })
+
+  test('放行决策也计入：计数的是标记出现次数，与档位无关', async () => {
+    const store = createInMemoryRepos()
+    await seedSignalDecision(store, {
+      id: 'pass-hit',
+      decidedAt: new Date('2026-09-23T09:30:00Z'),
+      signals: marker,
+      action: { kind: 'pass' },
+    })
+
+    expect(await store.repos.decisions.countRuleHitsSince(chatId, userId, 'builtin-nonmember-inline', since)).toBe(1)
+  })
+})
+
 describe('内存实现：误伤样本', () => {
   test('只取该群时间窗内的撤销结案，按结案时间倒序、限量，摘录可空', async () => {
     const store = createInMemoryRepos()

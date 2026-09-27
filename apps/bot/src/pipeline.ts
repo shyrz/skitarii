@@ -33,18 +33,22 @@ import type { Logger } from './logger.js'
  * 2. 手工信任名单先于判定：`config.whitelist` 命中当前用户时直接落一条 pass 决策（score 0、signals 空）
  *    并返回，不查内容白名单、不跑规则、不调复核、不施加动作；名单外账号不受影响。编辑消息走同一条快速通道
  *    （事件判别符的差异只影响事件 id，不影响这里）。
- * 3. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
+ * 3. 非成员经内联机器人发消息（`features.viaBot === true` 且惰性探针确认非成员）走锁定策略：
+ *    跳过内容白名单、规则匹配、复核与前科查询，查该 `(chatId, userId)` 过去一小时内的同标记决策数，
+ *    第 4 次起 `ban`、否则 `delete`——不发警告、不走灰区/复核。探针只在信任名单未命中时调用（惰性），
+ *    自带超时且失败开放（见 `senderNonMemberProbe`）。
+ * 4. 归一化 → 规则匹配 → `scoreOf` 分带。分数低于放行阈值不消耗 LLM 调用。
  *    规则匹配同时看正文与发送者身份（后者只服务 sender-name 规则，不落库）。
  *    误伤样本回写开启（`appealSampleWriteback`，开发中功能）且「本会被处置」（规则分 ≥ `passThreshold`）
  *    时另读一次该群误伤样本：命中内容白名单（同人 + 同内容 + 30 天内被撤销过）直接放行；
  *    灰色地带送审时把最近的非空摘录作为复核样例。开关关闭时完全不读样本（白名单与样例都不生效）；
  *    开启时低于阈值的正常消息仍不查样本（零额外开销），查询失败按「无样本」降级。
- * 4. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
+ * 5. 灰色地带（`passThreshold <= score < llmThreshold`）送复核：命中缓存就复用结论。
  *    复核失败只记日志，不追加信号，让 `decide` 走「待复核」的 warn 分支且不计累犯。这是既定口径：
  *    复核不可用时绝不能按 `actionHint` 直接动手，那等价于悄悄把 `llmThreshold` 降到 `passThreshold`。
- * 5. `decide` 出最终处置，落决策（同样用派生 id，重放不产生第二条）。
- * 6. 非放行处置补写正文摘录（是否补写以库里那条决策为准，不用本轮重算的档位），再交给执行器施加到 Telegram。
- * 7. 若配置了 `notifyOwner`，在施加动作前私聊 owner 一条判定摘要：摘要是「判定」而非「执行结果」，
+ * 6. `decide` 出最终处置，落决策（同样用派生 id，重放不产生第二条）。
+ * 7. 非放行处置补写正文摘录（是否补写以库里那条决策为准，不用本轮重算的档位），再交给执行器施加到 Telegram。
+ * 8. 若配置了 `notifyOwner`，在施加动作前私聊 owner 一条判定摘要：摘要是「判定」而非「执行结果」，
  *    动作被 Telegram 拒绝也不改变它；只在决策尚未执行时发，重投递不会重复通知。
  */
 
@@ -59,6 +63,31 @@ export const RECIDIVISM_WINDOW_DAYS = 7
 
 /** 一天的毫秒数，用于把窗口天数换算成时间戳。 */
 const DAY_MS = 24 * 60 * 60 * 1_000
+
+/**
+ * 非成员经内联机器人发消息的内建策略标记。
+ *
+ * 它是一条内建策略而不是可配置规则：规则集进面板由 owner 编辑，而这条口径要的是「无论群怎么配都生效」，
+ * 因此不进 `config.rules`、也不受规则启停影响。决策把它写进 `signals`，同时充当窗口计数的锚点
+ * （见下），因此这个值必须与 `countRuleHitsSince` 的查询参数永远一致。
+ */
+export const NONMEMBER_INLINE_RULE_ID = 'builtin-nonmember-inline'
+
+/**
+ * 窗口计数的回看时长（毫秒）。
+ *
+ * 取 1 小时：这是「短时间反复借内联机器人发消息」的时间尺度——真正的人不会持续一小时用机器人代发，
+ * 持续如此的是自动化投放。窗口短也让封禁门槛对误触后的正常使用足够宽容。
+ */
+export const NONMEMBER_INLINE_WINDOW_MS = 3_600_000
+
+/**
+ * 窗口内触发封禁的历史命中数阈值。
+ *
+ * 已发满 3 条（窗口内计数 3）后的下一条（第 4 条）起封禁：给误触与偶发留出三次删除的余地，
+ * 第四次说明这是持续性行为，删除消息已经拦不住发信方（对方可以反复重发）。
+ */
+export const NONMEMBER_INLINE_BAN_AFTER = 3
 
 /**
  * 误伤样本的回看窗口（天）。
@@ -110,6 +139,17 @@ export interface IncomingMessage {
   /** 分析文本：正文/caption + 内联键盘按钮文本 + 转发来源行，见 `composeAnalysisText`。是内容哈希与摘录的唯一来源。 */
   text: string
   features: MessageFeatures
+  /**
+   * 非成员惰性探针：bot 层在 `via_bot` 消息上给出（`() => probeNonMember(...)`）。
+   *
+   * 惰性有两个理由：信任名单命中者不该为一次用不上的探测付出 API 往返；探测结果只有走到
+   * 非成员策略分支才需要。管线在信任名单分支之后、且仅当 `features.viaBot` 时调用它一次。
+   *
+   * 返回值语义：`true` 确认非成员（触发策略）；`false` 确认是成员；`undefined` 表示探测不可用
+   * （超时、网络/服务端错误），失败开放——按成员处理（探针内部已记 warn）。缺省表示调用方没给探针，
+   * 同样按成员处理。
+   */
+  senderNonMemberProbe?: () => Promise<boolean | undefined>
   /**
    * Telegram `edit_date`（Unix 秒）；新消息为 `null`。编辑更新缺失该字段时，
    * bot 层会给出内容哈希派生的兜底值，保证同一编辑的重投递幂等（见 `bot.ts`）。
@@ -218,51 +258,81 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
     return config
   }
 
-  const normalized = normalize(message.text)
-  const identity = normalize(message.senderIdentity)
-  const ruleSignals = matchRules(normalized, message.features, config.rules, identity)
-  const ruleScore = scoreOf(ruleSignals)
-
-  // 样本回写默认关闭：关闭时按无样本处理（不查库、白名单不命中、送审不带样例）。
-  // 开启时也只对「本会被处置」的消息找样本：低于放行阈值的正常消息不付出这次查询。
-  const samples =
-    deps.appealSampleWriteback !== true || ruleScore < config.passThreshold
-      ? []
-      : await loadOverturnedSamples(deps, message, now)
-
-  // 内容白名单命中就直接放行：跳过复核与 `decide` 的累犯升档，但事件与决策照常落库（事后可回看）。
-  const whitelisted = isWhitelisted(samples, message, contentHash, now)
-  if (whitelisted) {
-    deps.logger.info(
-      `内容白名单命中，直接放行 chatId=${message.chatId} userId=${message.userId} messageId=${message.messageId}`,
-    )
-  }
-
-  const signals = whitelisted
-    ? ruleSignals
-    : await collectSignals(deps, {
-        message,
-        config,
-        normalized,
-        identity,
-        ruleSignals,
-        ruleScore,
-        contentHash,
-        samples,
-      })
-
-  // 放行带与前科无关；白名单命中的结局是放行，也不必查。
-  const priorViolations =
-    whitelisted || ruleScore < config.passThreshold
-      ? 0
-      : await deps.repos.decisions.countPriorViolations(
-          message.chatId,
-          message.userId,
-          new Date(now().getTime() - RECIDIVISM_WINDOW_DAYS * DAY_MS),
-        )
-
-  const action = whitelisted ? { kind: 'pass' as const } : decide(signals, config, { priorViolations })
+  // 本轮的判定信号与最终动作。非成员内联策略在这里分出另一条路，命中时不进入下面的常规判定。
+  let signals: Signal[]
+  let action: Action
+  // 时间基准只取一次：决策时刻与非成员窗口（1 小时）同用一个值，窗口起点不随 `now()` 的多次调用漂移。
   const decidedAt = now()
+
+  // 非成员惰性探针：信任名单已经排除完毕，只有 `via_bot` 消息才值得付出这次 API 往返。
+  // 探针缺失或返回 `undefined` 都按成员处理（失败开放，探针内部已记 warn）。
+  const senderNonMember =
+    message.features.viaBot && message.senderNonMemberProbe !== undefined
+      ? await message.senderNonMemberProbe()
+      : undefined
+
+  /** 非成员策略本轮的窗口命中数；`null` 表示未走该分支（落库后的分支日志据此区分）。 */
+  let nonMemberPriorHits: number | null = null
+
+  if (senderNonMember === true) {
+    // 非成员经内联机器人发消息：跳过内容白名单、规则匹配、复核与前科查询（口径锁定，不走灰区/复核）。
+    // 窗口内第 4 次起直接封禁；计数按已落库决策（含编辑消息各自产生的决策）。
+    nonMemberPriorHits = await deps.repos.decisions.countRuleHitsSince(
+      message.chatId,
+      message.userId,
+      NONMEMBER_INLINE_RULE_ID,
+      new Date(decidedAt.getTime() - NONMEMBER_INLINE_WINDOW_MS),
+    )
+    action = nonMemberPriorHits >= NONMEMBER_INLINE_BAN_AFTER ? { kind: 'ban' } : { kind: 'delete' }
+    // 分数固定为 1：这是策略命中而非规则打分，决策落 score 1 让报表与回看一眼可辨。
+    // 标记信号同时是窗口计数的锚点，必须与 `countRuleHitsSince` 用同一个 ruleId。
+    signals = [{ kind: 'rule-hit', ruleId: NONMEMBER_INLINE_RULE_ID, score: 1 }]
+  } else {
+    const normalized = normalize(message.text)
+    const identity = normalize(message.senderIdentity)
+    const ruleSignals = matchRules(normalized, message.features, config.rules, identity)
+    const ruleScore = scoreOf(ruleSignals)
+
+    // 样本回写默认关闭：关闭时按无样本处理（不查库、白名单不命中、送审不带样例）。
+    // 开启时也只对「本会被处置」的消息找样本：低于放行阈值的正常消息不付出这次查询。
+    const samples =
+      deps.appealSampleWriteback !== true || ruleScore < config.passThreshold
+        ? []
+        : await loadOverturnedSamples(deps, message, now)
+
+    // 内容白名单命中就直接放行：跳过复核与 `decide` 的累犯升档，但事件与决策照常落库（事后可回看）。
+    const whitelisted = isWhitelisted(samples, message, contentHash, now)
+    if (whitelisted) {
+      deps.logger.info(
+        `内容白名单命中，直接放行 chatId=${message.chatId} userId=${message.userId} messageId=${message.messageId}`,
+      )
+    }
+
+    signals = whitelisted
+      ? ruleSignals
+      : await collectSignals(deps, {
+          message,
+          config,
+          normalized,
+          identity,
+          ruleSignals,
+          ruleScore,
+          contentHash,
+          samples,
+        })
+
+    // 放行带与前科无关；白名单命中的结局是放行，也不必查。
+    const priorViolations =
+      whitelisted || ruleScore < config.passThreshold
+        ? 0
+        : await deps.repos.decisions.countPriorViolations(
+            message.chatId,
+            message.userId,
+            new Date(decidedAt.getTime() - RECIDIVISM_WINDOW_DAYS * DAY_MS),
+          )
+
+    action = whitelisted ? { kind: 'pass' as const } : decide(signals, config, { priorViolations })
+  }
 
   await deps.repos.decisions.insert({
     id: decisionId,
@@ -279,6 +349,14 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
   // 重新读一遍：重投递时 insert 是静默无操作，库里的决策与 `executed` 状态才是权威。
   const stored = await deps.repos.decisions.findById(decisionId)
   if (stored === null) throw new Error(`决策落库后读取不到 decisionId=${decisionId}`)
+
+  // 非成员策略的落库后日志：动作取库里的权威决策（重投递时本轮重算的档位可能与库里那条不同），
+  // priorHits 是本轮观察到的窗口命中数，供回看「这次为什么删/封」。
+  if (nonMemberPriorHits !== null) {
+    deps.logger.info(
+      `非成员经内联机器人发消息 chatId=${stored.chatId} userId=${stored.userId} messageId=${message.messageId} action=${stored.action.kind} priorHits=${nonMemberPriorHits} decisionId=${stored.id}`,
+    )
+  }
 
   // 摘录必须落在决策之后（数据库侧的条件是「同事件存在非 pass 决策」才允许写入），
   // 是否补摘录看库里的权威决策而不是本轮重算的 `action`：重投递时前科计数、复核缓存都可能已经变化，

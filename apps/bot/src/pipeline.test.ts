@@ -1,4 +1,4 @@
-import { asChatId, asUserId, type ChatConfig } from '@skitarii/core'
+import { asChatId, asUserId, type ChatConfig, type ChatId, type UserId } from '@skitarii/core'
 import { createCachedJudge, LlmError, type CachedJudge, type JudgeInput, type JudgeResult } from '@skitarii/llm'
 import { describe, expect, test, vi } from 'vitest'
 import type { ActionExecutor } from './executor.js'
@@ -9,7 +9,7 @@ import { deriveDecisionId, deriveEventId } from './ids.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createInMemoryRepos, type ChatMetadataPatch, type InMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
-import { handleIncomingMessage, type CommentThread, type DecisionObservation } from './pipeline.js'
+import { handleIncomingMessage, NONMEMBER_INLINE_RULE_ID, type CommentThread, type DecisionObservation } from './pipeline.js'
 import { createRecordingApi, type RecordingApi } from './recording-api.js'
 
 const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} }
@@ -1136,6 +1136,283 @@ describe('误伤样本回写', () => {
 })
 
 /**
+ * 非成员经内联机器人发消息的锁定策略。
+ *
+ * 与常规判定完全分叉：命中时跳过内容白名单、规则匹配、复核与前科查询，只按窗口计数给出 delete / ban。
+ * 成员探测在 bot 层（`nonmember.test.ts` 与 `bot-nonmember.test.ts` 覆盖），这里只构造管线入参。
+ */
+describe('非成员经内联机器人发消息', () => {
+  /**
+   * 预置一条带非成员标记的历史决策，用于把窗口计数推过封禁阈值。
+   *
+   * @param store 内存仓储。
+   * @param index 决策序号（拼 id）。
+   * @param decidedAt 判定时刻。
+   */
+  async function seedMarkerDecision(store: InMemoryRepos, index: number, decidedAt: Date): Promise<void> {
+    const suffix = String(index).padStart(4, '0')
+    await store.repos.decisions.insert({
+      id: `10000000-0000-4000-8000-00000000${suffix}`,
+      eventId: `20000000-0000-4000-8000-00000000${suffix}`,
+      chatId,
+      userId,
+      action: { kind: 'delete' },
+      score: 1,
+      signals: [{ kind: 'rule-hit', ruleId: NONMEMBER_INLINE_RULE_ID, score: 1 }],
+      decidedAt,
+      executed: true,
+    })
+  }
+
+  test('非成员经内联机器人发消息：直接删除并落固定分数与标记信号，规则/复核/样本/前科都不参与', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    let sampleQueries = 0
+    let priorQueries = 0
+    const ruleHitQueries: Array<{ ruleId: string; since: Date }> = []
+    const repos = {
+      ...store.repos,
+      appeals: {
+        ...store.repos.appeals,
+        listOverturnedSamples: async () => {
+          sampleQueries += 1
+          return []
+        },
+      },
+      decisions: {
+        ...store.repos.decisions,
+        countPriorViolations: async () => {
+          priorQueries += 1
+          return 0
+        },
+        countRuleHitsSince: async (targetChatId: ChatId, targetUserId: UserId, ruleId: string, since: Date) => {
+          ruleHitQueries.push({ ruleId, since })
+          return store.repos.decisions.countRuleHitsSince(targetChatId, targetUserId, ruleId, since)
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger: silentLogger, now: fixedNow, appealSampleWriteback: true },
+      incoming({ text: '加v推荐一个渠道', messageId: 300, viaBot: true, senderNonMemberProbe: async () => true }),
+    )
+
+    const eventId = deriveEventId(chatId, 300)
+    const decision = await store.repos.decisions.findById(deriveDecisionId(eventId))
+    expect(decision).toMatchObject({
+      action: { kind: 'delete' },
+      score: 1,
+      signals: [{ kind: 'rule-hit', ruleId: NONMEMBER_INLINE_RULE_ID, score: 1 }],
+      executed: true,
+    })
+    // 窗口 = now − 1 小时；计数锚点必须是标记 ruleId。
+    expect(ruleHitQueries).toEqual([{ ruleId: NONMEMBER_INLINE_RULE_ID, since: new Date('2026-09-23T09:00:00Z') }])
+    expect(sampleQueries).toBe(0)
+    expect(priorQueries).toBe(0)
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.countOf('deleteMessage')).toBe(1)
+    // 非放行处置照常补写摘录：共享尾部对策略命中与常规判定一视同仁。
+    expect(store.sampleOf(eventId)).toBe('加v推荐一个渠道')
+  })
+
+  test('窗口内已发满 3 条：第 4 条直接封禁，不再删除消息', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    for (let index = 1; index <= 3; index += 1) {
+      await seedMarkerDecision(store, index, new Date('2026-09-23T09:30:00Z'))
+    }
+    const observations: DecisionObservation[] = []
+
+    await handleIncomingMessage(
+      {
+        repos: store.repos,
+        judge,
+        executor,
+        logger: silentLogger,
+        now: fixedNow,
+        notifyOwner: async (observation) => {
+          observations.push(observation)
+        },
+      },
+      incoming({ text: '再发一条', messageId: 301, viaBot: true, senderNonMemberProbe: async () => true }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 301)))
+    expect(decision).toMatchObject({ action: { kind: 'ban' }, score: 1, executed: true })
+    expect(recording.countOf('banChatMember')).toBe(1)
+    expect(recording.countOf('deleteMessage')).toBe(0)
+    // owner 判定摘要复用共享尾部：字段取库里的权威决策。
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({
+      action: { kind: 'ban' },
+      score: 1,
+      signals: [{ kind: 'rule-hit', ruleId: NONMEMBER_INLINE_RULE_ID, score: 1 }],
+    })
+  })
+
+  test('窗口外的历史标记不计数：1 小时前的 3 条不影响本次判定', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    for (let index = 1; index <= 3; index += 1) {
+      await seedMarkerDecision(store, index, new Date('2026-09-23T08:59:59Z'))
+    }
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '再发一条', messageId: 302, viaBot: true, senderNonMemberProbe: async () => true }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 302)))
+    expect(decision?.action).toEqual({ kind: 'delete' })
+    expect(recording.countOf('banChatMember')).toBe(0)
+  })
+
+  test('编辑消息同样走策略：每次编辑是独立决策，照常计入窗口', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    for (let index = 1; index <= 3; index += 1) {
+      await seedMarkerDecision(store, index, new Date('2026-09-23T09:30:00Z'))
+    }
+    const editDate = 1_758_630_000
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '编辑后的广告', messageId: 303, editDate, viaBot: true, senderNonMemberProbe: async () => true }),
+    )
+
+    const eventId = deriveEventId(chatId, 303, `edit:${editDate}:${contentHashOf('编辑后的广告').slice(0, 16)}`)
+    expect((await store.repos.decisions.findById(deriveDecisionId(eventId)))?.action).toEqual({ kind: 'ban' })
+    expect(recording.countOf('banChatMember')).toBe(1)
+  })
+
+  test('探针确认是成员、缺探针或没有 via bot：照常走规则与复核，且只在 via bot 时调用探针', async () => {
+    const { store, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const deps = { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow }
+    let probes = 0
+    const memberProbe = async (): Promise<boolean> => {
+      probes += 1
+      return false
+    }
+    const nonMemberProbe = async (): Promise<boolean> => {
+      probes += 1
+      return true
+    }
+
+    // 探针确认是成员：回到原流程。
+    await handleIncomingMessage(
+      deps,
+      incoming({ text: '加v推荐一个渠道', messageId: 304, viaBot: true, senderNonMemberProbe: memberProbe }),
+    )
+    // 有 via bot 但调用方没给探针：同样按成员处理。
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 305, viaBot: true }))
+    // 没有 via bot：即使给了探针也不调用（惰性 + 条件不成立），照常走规则。
+    await handleIncomingMessage(deps, incoming({ text: '加v推荐一个渠道', messageId: 307, senderNonMemberProbe: nonMemberProbe }))
+
+    expect(probes).toBe(1)
+    expect(judgeStub.calls).toHaveLength(3)
+    for (const messageId of [304, 305, 307]) {
+      const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, messageId)))
+      // 规则命中在前、复核结论在后：策略标记从未出现。
+      expect(decision?.signals[0]).toEqual({ kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 })
+      expect(decision?.signals).toHaveLength(2)
+      expect(decision?.action).toEqual({ kind: 'delete' })
+    }
+  })
+
+  test('信任名单优先：名单内账号经内联机器人发消息仍直接放行，探针与窗口计数都不触发', async () => {
+    const { store, recording, judgeStub, executor, judge } = setup()
+    await store.repos.chats.upsert({ ...chatConfig, whitelist: [userId] })
+    let ruleHitQueries = 0
+    let probes = 0
+    const repos = {
+      ...store.repos,
+      decisions: {
+        ...store.repos.decisions,
+        countRuleHitsSince: async (...args: Parameters<typeof store.repos.decisions.countRuleHitsSince>) => {
+          ruleHitQueries += 1
+          return store.repos.decisions.countRuleHitsSince(...args)
+        },
+      },
+    }
+
+    await handleIncomingMessage(
+      { repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({
+        text: '加v推荐一个渠道',
+        messageId: 306,
+        viaBot: true,
+        senderNonMemberProbe: async () => {
+          probes += 1
+          return true
+        },
+      }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 306)))
+    expect(decision).toMatchObject({ action: { kind: 'pass' }, score: 0, signals: [], executed: true })
+    // 惰性探针：名单命中在探测之前返回，一次 API 往返都不付出。
+    expect(probes).toBe(0)
+    expect(ruleHitQueries).toBe(0)
+    expect(judgeStub.calls).toEqual([])
+    expect(recording.calls).toEqual([])
+  })
+
+  test('窗口左闭：恰在 1 小时前的 3 条标记仍计数（第 4 条封禁）', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    // 决策时刻为 fixedNow（10:00:00），窗口起点恰为 09:00:00：左闭区间上这些记录全部计入。
+    for (let index = 1; index <= 3; index += 1) {
+      await seedMarkerDecision(store, index, new Date('2026-09-23T09:00:00Z'))
+    }
+
+    await handleIncomingMessage(
+      { repos: store.repos, judge, executor, logger: silentLogger, now: fixedNow },
+      incoming({ text: '再发一条', messageId: 308, viaBot: true, senderNonMemberProbe: async () => true }),
+    )
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 308)))
+    expect(decision?.action).toEqual({ kind: 'ban' })
+    expect(recording.countOf('banChatMember')).toBe(1)
+  })
+
+  test('重投递：本轮窗口计数升档也不改写已落库的决策（stored 权威，不重复通知/执行）', async () => {
+    const { store, recording, executor, judge } = setup()
+    await store.repos.chats.upsert(chatConfig)
+    const observations: DecisionObservation[] = []
+    const deps = {
+      repos: store.repos,
+      judge,
+      executor,
+      logger: silentLogger,
+      now: fixedNow,
+      notifyOwner: async (observation: DecisionObservation) => {
+        observations.push(observation)
+      },
+    }
+    const deliver = () =>
+      handleIncomingMessage(
+        deps,
+        incoming({ text: '第一条', messageId: 309, viaBot: true, senderNonMemberProbe: async () => true }),
+      )
+
+    await deliver()
+    // 首投后窗口内又累计 3 条同标记决策：重投递本轮会算出 ban，但库里那条 delete 已经执行。
+    for (let index = 1; index <= 3; index += 1) {
+      await seedMarkerDecision(store, index, new Date('2026-09-23T09:30:00Z'))
+    }
+    await deliver()
+
+    const decision = await store.repos.decisions.findById(deriveDecisionId(deriveEventId(chatId, 309)))
+    expect(decision?.action).toEqual({ kind: 'delete' })
+    expect(recording.countOf('banChatMember')).toBe(0)
+    // 动作与判定摘要都只发生一次：重投递不再执行，也不重复通知。
+    expect(recording.countOf('deleteMessage')).toBe(1)
+    expect(observations).toHaveLength(1)
+  })
+})
+
+/**
  * 在冻结的挂钟下执行：`decide` 生成 `mute` 时会读 `Date.now()` 算解禁时刻，
  * 冻结后断言才能写成确定的字面量。只冻结 `Date`，不碰定时器（幂等闸门用的是 `Date.now`）。
  *
@@ -1197,6 +1474,9 @@ function incoming(overrides: {
   customEmojiCount?: number
   emojiCount?: number
   viaBot?: boolean
+  /** 非成员探测结果：缺省表示未探测/探测失败（失败开放）。 */
+  /** 非成员惰性探针：缺省表示调用方没给探针（按成员处理）。 */
+  senderNonMemberProbe?: () => Promise<boolean | undefined>
   commentThread?: CommentThread
 }) {
   const text = overrides.text
@@ -1215,6 +1495,7 @@ function incoming(overrides: {
       emojiCount: overrides.emojiCount ?? 0,
       viaBot: overrides.viaBot ?? false,
     },
+    ...(overrides.senderNonMemberProbe === undefined ? {} : { senderNonMemberProbe: overrides.senderNonMemberProbe }),
     editDate: overrides.editDate ?? null,
     senderIdentity: overrides.senderIdentity ?? '',
     commentThread: overrides.commentThread ?? null,

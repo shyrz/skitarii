@@ -345,6 +345,25 @@ function createDecisionRepo(db: Db): DecisionRepo {
       return rows[0]?.total ?? 0
     },
 
+    async countRuleHitsSince(chatId, userId, ruleId, since): Promise<number> {
+      // 条件与前科查询共用 (chat_id, user_id, decided_at) 索引，标记匹配走 JSONB 包含：
+      // `[{"kind":"rule-hit","ruleId":...}]` 是 signals 数组的子集，等价于「存在一条命中该 ruleId 的
+      // rule-hit 信号」。带上 `kind` 与内存实现完全同语义：只按 ruleId 匹配时，任何带该字段的脏数据
+      //（例如手写的 llm 信号）也会被算进来，两边就会漂移。
+      const rows = await db
+        .select({ total: count() })
+        .from(moderationDecisions)
+        .where(
+          and(
+            eq(moderationDecisions.chatId, chatId),
+            eq(moderationDecisions.userId, userId),
+            gte(moderationDecisions.decidedAt, since),
+            sql`${moderationDecisions.signals} @> ${JSON.stringify([{ kind: 'rule-hit', ruleId }])}::jsonb`,
+          ),
+        )
+      return rows[0]?.total ?? 0
+    },
+
     async markNoticeSent(decisionId, chatId, messageId): Promise<void> {
       // 无条件覆盖：同一条决策的通知引用只会有一个落点（私聊或群内二选一），重写是幂等的。
       await db

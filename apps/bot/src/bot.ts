@@ -18,6 +18,7 @@ import { createActionExecutor } from './executor.js'
 import { composeAnalysisText, contentHashOf, extractFeatures, extractSenderIdentity } from './features.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createLogger, type Logger } from './logger.js'
+import { probeNonMember } from './nonmember.js'
 import { createOwnerFailureNotifier, createOwnerFeed } from './owner-feed.js'
 import { handleIncomingMessage, type PipelineDeps } from './pipeline.js'
 import { createSubscriptionMemberRecorder } from './subscription-members.js'
@@ -222,6 +223,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
    * Telegram 服务账号（777000）的消息不审：那是历史形态的自动转发，与之并列过滤。
    * 没有可审发送者（匿名管理员、以聊天身份发言等 `from` 缺失的消息）不审，但仍登记群元数据：
    * 登记只依赖 `chat`，不能被 `from` 的空缺挡住。
+   * 经内联机器人发送的消息（`via_bot`）带一个惰性成员探针：管线在信任名单之后才调用它，
+   * 确认非成员的走锁定策略，探测失败按成员处理（失败开放，见 `probeNonMember`）。
    *
    * @param ctx 更新上下文。
    * @param message 待审消息（新消息或编辑后的消息）。
@@ -262,6 +265,11 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
         ? { channelUsername: forwardOrigin.chat.username, postId: forwardOrigin.message_id }
         : null
 
+    // 非成员探测是惰性的：这里只给闭包（仅在 `via_bot` 消息上），由管线在信任名单未命中后调用。
+    // 探测自带超时、失败开放，见 `probeNonMember`。
+    const senderNonMemberProbe =
+      message.via_bot === undefined ? undefined : () => probeNonMember(bot.api, chat.id, from.id, logger)
+
     const config = await handleIncomingMessage(pipelineDeps, {
       chatId: asChatId(String(chat.id)),
       chatTitle: chat.title,
@@ -270,6 +278,8 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
       userId: asUserId(from.id),
       text,
       features: extractFeatures(message, text),
+      // 只在有探针时带上该字段：缺省表示没有可用的探测（按成员处理，失败开放）。
+      ...(senderNonMemberProbe === undefined ? {} : { senderNonMemberProbe }),
       editDate,
       senderIdentity: extractSenderIdentity(from),
       commentThread,

@@ -127,6 +127,31 @@ describe('写入语句的形状与参数化', () => {
     expect(statement?.params).toEqual(['-1001234567890', 7_000_000_001, '2026-09-16T00:00:00.000Z', 'pass'])
   })
 
+  test('内建策略窗口计数按 signals 的 JSONB 包含过滤，并把标记与起点参数化', async () => {
+    const { repos, recorded } = createPgReposRecording([[3]])
+    const since = new Date('2026-09-23T09:00:00Z')
+    const total = await repos.decisions.countRuleHitsSince(
+      chatConfigFixture.chatId,
+      asUserId(7_000_000_001),
+      'builtin-nonmember-inline',
+      since,
+    )
+
+    expect(total).toBe(3)
+    const [statement] = recorded
+    expect(statement?.query).toContain('count(*)')
+    // 包含关系与参数占位符：标记不拼进 SQL 字面量，且 cast 到 jsonb 后由 PG 做结构比较。
+    // `kind` 一起进条件，与内存实现（要求 kind='rule-hit'）逐字同语义。
+    expect(statement?.query).toContain('@>')
+    expect(statement?.query).toContain('::jsonb')
+    expect(statement?.params).toEqual([
+      '-1001234567890',
+      7_000_000_001,
+      '2026-09-23T09:00:00.000Z',
+      JSON.stringify([{ kind: 'rule-hit', ruleId: 'builtin-nonmember-inline' }]),
+    ])
+  })
+
   test('结案只对未结案记录生效，条件更新在同一条语句里写「待回滚」标记', async () => {
     const appealId = 'a1b2c3d4-1111-4222-8333-555566667777'
     const resolvedAt = new Date('2026-09-23T10:30:00Z')

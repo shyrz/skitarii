@@ -5,6 +5,7 @@ import type { Repos } from '@skitarii/db'
 import { appealKeyboard } from './appeal.js'
 import type { IdempotencyRegistry } from './idempotency.js'
 import type { Logger } from './logger.js'
+import { isNonMemberTargetError } from './nonmember.js'
 import { MUTE_ALL_PERMISSIONS } from './permissions.js'
 import { callWithRetry } from './telegram-call.js'
 import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-errors.js'
@@ -25,9 +26,11 @@ import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-error
  *
  * 幂等：动作与通知都在 `eventId:action` 的闸门内执行；决策已 `executed` 时直接跳过。
  *
- * 终态判定里有两个刻意保留的例外：
+ * 终态判定里有三个刻意保留的例外：
  * - 删除动作拿到「消息已不存在」的 400 时按成功处理，详见 {@link isAlreadyGoneTarget}；
- * - 禁言/封禁的目标是管理员或群主时降级为删除同一条消息，详见 {@link applyAction}。
+ * - 禁言/封禁的目标是管理员或群主时降级为删除同一条消息，详见 {@link applyAction}；
+ * - 禁言/封禁的目标已不在群里（400「非参与者」类文案，`isNonMemberTargetError`）时同样降级为删除：
+ *   非成员策略对已离开者只能施加删除这一种仍有效的动作。
  */
 
 /**
@@ -142,8 +145,9 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
   /**
    * 施加动作到 Telegram。
    *
-   * 两个成功特例都源于「目标已经达成」：删除时消息已不存在（见 {@link isAlreadyGoneTarget}）；
-   * 禁言/封禁时目标不可被限制（管理员/群主，见 {@link isUnpunishableTarget}），降级为删除消息。
+   * 三个成功特例都源于「目标已经达成」：删除时消息已不存在（见 {@link isAlreadyGoneTarget}）；
+   * 禁言/封禁时目标不可被限制（管理员/群主，见 {@link isUnpunishableTarget}）或目标已不在群里
+   * （见 {@link isNonMemberTargetError}），降级为删除消息——消息本身仍可删除。
    *
    * @param executorDeps 执行器依赖。
    * @param decision 决策。
@@ -204,6 +208,14 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
       if (isUnpunishableTarget(error) && (decision.action.kind === 'mute' || decision.action.kind === 'ban')) {
         logger.info(
           `目标不可被限制（管理员/群主），${decision.action.kind === 'mute' ? '禁言' : '封禁'}降级为删除 decisionId=${decision.id} chatId=${decision.chatId}`,
+        )
+        return await applyAction(executorDeps, { ...decision, action: { kind: 'delete' } }, context)
+      }
+      // 目标已不在群里（从未加入或已离开）：封禁/禁言没有可施加的对象，Telegram 回「非参与者」类 400。
+      // 与上一分支同路径降级为删除：非成员策略在目标离群后仍能生效的动作只有删除消息。
+      if (isNonMemberTargetError(error) && (decision.action.kind === 'mute' || decision.action.kind === 'ban')) {
+        logger.info(
+          `目标不在群里，${decision.action.kind === 'mute' ? '禁言' : '封禁'}降级为删除 decisionId=${decision.id} chatId=${decision.chatId}`,
         )
         return await applyAction(executorDeps, { ...decision, action: { kind: 'delete' } }, context)
       }
