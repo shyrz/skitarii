@@ -1,7 +1,7 @@
 import { asChatId, asUserId, type ModerationDecision } from '@skitarii/core'
 import { GrammyError } from 'grammy'
 import { describe, expect, test } from 'vitest'
-import { createActionExecutor, noticeText } from './executor.js'
+import { createActionExecutor, GROUP_NOTICE_TTL_MS, noticeText, type Schedule } from './executor.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createInMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
@@ -13,6 +13,12 @@ const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} }
 
 const chatId = asChatId('-1001234567890')
 const userId = asUserId(7_000_000_001)
+
+/** 一次被安排、尚未执行的定时任务。 */
+interface ScheduledTask {
+  delayMs: number
+  task: () => Promise<void>
+}
 
 /**
  * 构造一条待执行决策。
@@ -46,12 +52,14 @@ function setup(
     handlers?: Parameters<typeof createRecordingApi>[0]
     logger?: Logger
     notifyOwnerFailure?: (decision: ModerationDecision, description: string) => Promise<void>
+    schedule?: Schedule
   } = {},
 ) {
   const recording: RecordingApi = createRecordingApi(overrides.handlers ?? {})
   const store = createInMemoryRepos()
   const idempotency = createIdempotencyRegistry()
   const sleeps: number[] = []
+  const scheduled: ScheduledTask[] = []
   const executor = createActionExecutor({
     api: recording.api,
     repos: store.repos,
@@ -62,10 +70,15 @@ function setup(
     sleep: async (ms) => {
       sleeps.push(ms)
     },
+    schedule:
+      overrides.schedule ??
+      ((delayMs, task) => {
+        scheduled.push({ delayMs, task })
+      }),
     notifyOwnerFailure: overrides.notifyOwnerFailure,
   })
 
-  return { executor, recording, store, idempotency, sleeps }
+  return { executor, recording, store, idempotency, sleeps, scheduled }
 }
 
 describe('处置执行', () => {
@@ -172,6 +185,163 @@ describe('处置执行', () => {
     expect(String(args[1])).toBe('🚫 已删除一条违规消息。')
     expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
     expect(await store.repos.decisions.findNoticeRef(decision.id)).toEqual({ chatId, messageId: 9 })
+  })
+
+  test('群内回退通知：发送成功后安排 5 分钟定时删除，触发任务即删除该条通知', async () => {
+    const { executor, recording, store, scheduled } = setup({
+      handlers: {
+        sendMessage: (target) => {
+          if (target === userId) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" },
+              'sendMessage',
+              {},
+            )
+          }
+          return { message_id: 9 }
+        },
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    expect(GROUP_NOTICE_TTL_MS).toBe(5 * 60_000)
+    expect(scheduled).toHaveLength(1)
+    const pending = scheduled[0]
+    expect(pending?.delayMs).toBe(GROUP_NOTICE_TTL_MS)
+
+    await pending?.task()
+
+    // 删除的是群内通知（message_id=9），不是被处置的原消息（42）。
+    expect(recording.lastArgsOf('deleteMessage')).toEqual([chatId, 9])
+  })
+
+  test('定时删除遇到「消息已不在」：按达成处理，info 且不抛', async () => {
+    const infos: string[] = []
+    const logger: Logger = {
+      info: (message) => {
+        infos.push(message)
+      },
+      warn: () => {},
+      error: () => {},
+    }
+    const { executor, store, scheduled } = setup({
+      logger,
+      handlers: {
+        sendMessage: (target) => {
+          if (target === userId) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" },
+              'sendMessage',
+              {},
+            )
+          }
+          return { message_id: 9 }
+        },
+        deleteMessage: (_target, messageId) => {
+          if (messageId === 9) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 400, description: 'Bad Request: message to delete not found' },
+              'deleteMessage',
+              {},
+            )
+          }
+          return { ok: true }
+        },
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+    await executor.execute(decision, { messageId: 42 })
+
+    await expect(scheduled[0]?.task()).resolves.toBeUndefined()
+
+    expect(infos).toContainEqual(expect.stringContaining('群内通知已不在'))
+  })
+
+  test('定时删除遇到其他错误：warn 且不抛', async () => {
+    const warnings: string[] = []
+    const logger: Logger = {
+      info: () => {},
+      warn: (message) => {
+        warnings.push(message)
+      },
+      error: () => {},
+    }
+    const { executor, store, scheduled } = setup({
+      logger,
+      handlers: {
+        sendMessage: (target) => {
+          if (target === userId) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" },
+              'sendMessage',
+              {},
+            )
+          }
+          return { message_id: 9 }
+        },
+        deleteMessage: (_target, messageId) => {
+          if (messageId === 9) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 403, description: 'Forbidden: bot is not a member of the chat' },
+              'deleteMessage',
+              {},
+            )
+          }
+          return { ok: true }
+        },
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+    await executor.execute(decision, { messageId: 42 })
+
+    await expect(scheduled[0]?.task()).resolves.toBeUndefined()
+
+    expect(warnings).toContainEqual(expect.stringContaining('群内通知删除失败'))
+  })
+
+  test('私聊通知成功：不安排定时删除', async () => {
+    const { executor, store, scheduled } = setup()
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    expect(scheduled).toHaveLength(0)
+  })
+
+  test('群内通知发送失败：不安排定时删除', async () => {
+    const { executor, store, scheduled } = setup({
+      handlers: {
+        sendMessage: (target) => {
+          if (target === userId) {
+            throw new GrammyError(
+              'failed',
+              { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" },
+              'sendMessage',
+              {},
+            )
+          }
+          throw new Error('群内发送失败')
+        },
+      },
+    })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+
+    await executor.execute(decision, { messageId: 42 })
+
+    expect(scheduled).toHaveLength(0)
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ executed: true })
   })
 
   test('私聊其余失败按通知可丢处理，不回退群内', async () => {

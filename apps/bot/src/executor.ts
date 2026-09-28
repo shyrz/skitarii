@@ -1,4 +1,4 @@
-import type { Action, ModerationDecision } from '@skitarii/core'
+import type { Action, ChatId, ModerationDecision } from '@skitarii/core'
 import type { Api } from 'grammy'
 import { GrammyError } from 'grammy'
 import type { Repos } from '@skitarii/db'
@@ -21,6 +21,7 @@ import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-error
  * - 通知失败（发送失败或 429 退避耗尽）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
  *   通知不做人为丢弃：密集时照常尝试发送，由 Telegram 的 429 退避兜底（见 `telegram-call.ts`）。
  * - 通知先私聊当事人，不可达（未 /start、被拉黑）才回退群内；实际落点记录在决策上，供申诉编辑复用。
+ *   回退到群里的通知随后被安排为 5 分钟后删除（见 `GROUP_NOTICE_TTL_MS`），私聊通知不受影响。
  * - 动作被 Telegram 终结性拒绝时不发通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
  *   留着不填只会让补偿扫描反复重投递。配置了 `notifyOwnerFailure` 时私聊 owner 一条失败通知。
  *
@@ -44,6 +45,26 @@ export interface ExecutionContext {
   messageId: number
 }
 
+/**
+ * 群内回退通知发送成功后的存活时长：到期自动删除。
+ *
+ * 为什么按「发送后」而不是「查看后」：Bot API 不提供已读/查看事件（群与私聊都没有），
+ * 拿不到「当事人已看到」的信号，只能退化为从发送时刻起算的固定 TTL。私聊通知与 owner feed
+ * 不适用本规则（见 {@link sendGroupNotice}）。
+ *
+ * 计时只活在进程内存里：进程重启会丢掉尚未触发的删除，部署窗口内极少数群内通知可能残留。
+ * 这是有意接受的取舍——不为可丢的旁路通知引入持久化调度。
+ */
+export const GROUP_NOTICE_TTL_MS = 5 * 60_000
+
+/**
+ * 延迟执行一次任务。
+ *
+ * 供群内通知的定时删除用（见 {@link GROUP_NOTICE_TTL_MS}）。实现负责在延迟后调用 `task`，
+ * 并保证任务异常不会变成未处理拒绝。
+ */
+export type Schedule = (delayMs: number, task: () => Promise<void>) => void
+
 /** 执行器依赖。 */
 export interface ActionExecutorDeps {
   api: Api
@@ -55,6 +76,12 @@ export interface ActionExecutorDeps {
   now?: (() => Date) | undefined
   /** 429 退避用的 sleep，测试注入以避免真实等待。 */
   sleep?: ((ms: number) => Promise<void>) | undefined
+  /**
+   * 延迟任务调度器，用于群内通知的定时删除（见 {@link GROUP_NOTICE_TTL_MS}）。
+   * 默认真实定时器：`setTimeout` 加 `unref`（不阻止进程退出），任务异常吞掉并 warn；
+   * 测试注入 fake 记录任务、手动触发，避免 5 分钟真实等待。
+   */
+  schedule?: Schedule | undefined
   /**
    * 终结性拒绝后的私聊通知（处置失败通知）。缺省时不发。
    * 实现必须自行吞掉发送失败（见 `owner-feed.ts` 的 `createOwnerFailureNotifier`），
@@ -106,6 +133,7 @@ export function idempotencyKeyOf(decision: ModerationDecision): string {
 export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
   const now = deps.now ?? (() => new Date())
   const retryOptions = { logger: deps.logger, sleep: deps.sleep }
+  const schedule = deps.schedule ?? createTimerSchedule(deps.logger)
 
   return {
     async execute(decision, context): Promise<void> {
@@ -125,7 +153,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
         // 终结性拒绝时不发群内通知：说「已删除」而实际没删是误导群成员，而且会给出一个指向不存在的处置的申诉入口。
         // 降级为删除时 outcome 带着实际生效的动作，文案随之改成「已删除」。
         if (outcome.kind === 'applied') {
-          await sendNotice(deps, decision, outcome.action, now())
+          await sendNotice(deps, decision, outcome.action, now(), schedule)
         } else {
           await notifyFailure(deps, decision, outcome.description)
         }
@@ -231,6 +259,26 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
 }
 
 /**
+ * 默认定时器实现：延迟到点后执行一次任务。
+ *
+ * `unref` 让等待中的计时不阻止进程退出（与 `scheduler.ts` 的处理一致）；任务自身已有兜底，
+ * 这里再吞一层 rejection，避免未处理拒绝把进程带崩。
+ *
+ * @param logger 日志。
+ * @returns 可注入的调度函数。
+ */
+function createTimerSchedule(logger: Logger): Schedule {
+  return (delayMs, task) => {
+    const timer = setTimeout(() => {
+      void task().catch((error: unknown) => {
+        logger.warn(`定时任务执行失败（已忽略）delayMs=${delayMs}`, error)
+      })
+    }, delayMs)
+    timer.unref?.()
+  }
+}
+
+/**
  * 发送处置通知：**先私聊当事人，不可达才回退群内**。
  *
  * 私聊优先的理由：处置结果直接递到当事人手里，群里不再出现一条匿名通知（完全静默）。
@@ -244,17 +292,19 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
  * @param decision 决策（取群、用户与 decisionId）。
  * @param action 实际生效的动作；降级时它与决策上的原动作不同（见 {@link applyAction}）。
  * @param instant 当前时刻（渲染禁言剩余分钟数）。
+ * @param schedule 延迟任务调度器（群内通知的定时删除用）。
  */
 async function sendNotice(
   deps: ActionExecutorDeps,
   decision: ModerationDecision,
   action: Action,
   instant: Date,
+  schedule: Schedule,
 ): Promise<void> {
   const dm = await sendDirectNotice(deps, decision, action, instant)
   // 只有「私聊不可达」才回退群内；其余私聊失败按通知可丢处理，不发群内。
   if (dm !== 'fallback') return
-  await sendGroupNotice(deps, decision, action, instant)
+  await sendGroupNotice(deps, decision, action, instant, schedule)
 }
 
 /** 私聊投递结果：成功；回退群内（不可达）；失败（其余错误，通知可丢）。 */
@@ -300,16 +350,22 @@ async function sendDirectNotice(
 /**
  * 群内通知（回退形态）：匿名文案 + 申诉按钮，现状不变。
  *
+ * 发送成功并记录引用后，安排一次 TTL 删除（见 {@link GROUP_NOTICE_TTL_MS}）：只有这条回退到
+ * 群里的通知会被删，私聊通知与 owner feed 不动。删除不清理通知引用——申诉编辑
+ * （`updateDecisionNotice`）本就是 best-effort，引用在而消息已删只会 warn 后跳过。
+ *
  * @param deps 执行器依赖。
  * @param decision 决策。
  * @param action 实际生效的动作。
  * @param instant 当前时刻。
+ * @param schedule 延迟任务调度器。
  */
 async function sendGroupNotice(
   deps: ActionExecutorDeps,
   decision: ModerationDecision,
   action: Action,
   instant: Date,
+  schedule: Schedule,
 ): Promise<void> {
   const text = noticeText(action, instant, 'group')
   try {
@@ -318,6 +374,7 @@ async function sendGroupNotice(
       { logger: deps.logger, label: 'sendMessage(notice)' },
     )
     await recordNoticeRef(deps, decision, decision.chatId, message.message_id)
+    scheduleGroupNoticeDeletion(deps, decision.chatId, message.message_id, schedule)
   } catch (error) {
     deps.logger.warn(`处置通知发送失败 decisionId=${decision.id}`, error)
   }
@@ -342,6 +399,37 @@ async function recordNoticeRef(
   } catch (error) {
     deps.logger.warn(`通知引用记录失败，后续编辑将跳过 decisionId=${decision.id}`, error)
   }
+}
+
+/**
+ * 安排群内通知的定时删除：**单次尝试、不重试**，失败只记日志、不向上抛。
+ *
+ * - 「消息已不在」（见 {@link isMessageGoneError}）按达成处理：人工删过或同 id 已删过，记 info 即可；
+ * - 其他错误记 warn：通知是可丢的旁路，删除失败不该影响任何主流程。
+ *
+ * @param deps 执行器依赖（取 api 与日志）。
+ * @param chatId 群 id。
+ * @param messageId 通知消息 id。
+ * @param schedule 延迟任务调度器。
+ */
+function scheduleGroupNoticeDeletion(
+  deps: ActionExecutorDeps,
+  chatId: ChatId,
+  messageId: number,
+  schedule: Schedule,
+): void {
+  schedule(GROUP_NOTICE_TTL_MS, async () => {
+    try {
+      await deps.api.deleteMessage(chatId, messageId)
+      deps.logger.info(`群内通知已按时删除 chatId=${chatId} messageId=${messageId}`)
+    } catch (error) {
+      if (isMessageGoneError(error)) {
+        deps.logger.info(`群内通知已不在，删除视为达成 chatId=${chatId} messageId=${messageId}`)
+        return
+      }
+      deps.logger.warn(`群内通知删除失败 chatId=${chatId} messageId=${messageId}`, error)
+    }
+  })
 }
 
 /**
