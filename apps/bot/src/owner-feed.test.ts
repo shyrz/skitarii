@@ -1,7 +1,14 @@
 import { asChatId, asUserId, type ModerationDecision } from '@skitarii/core'
 import { describe, expect, test } from 'vitest'
 import type { Logger } from './logger.js'
-import { createOwnerFailureNotifier, createOwnerFeed, formatDecisionFeed, formatFailureNotice } from './owner-feed.js'
+import {
+  createOwnerFailureNotifier,
+  createOwnerFeed,
+  feedDeleteKeyboard,
+  formatDecisionFeed,
+  formatFailureNotice,
+  isSuspectedViolation,
+} from './owner-feed.js'
 import type { DecisionObservation } from './pipeline.js'
 import { createRecordingApi } from './recording-api.js'
 
@@ -177,6 +184,25 @@ describe('判定 feed 渲染', () => {
   })
 })
 
+describe('疑似违规范围', () => {
+  test('pass 且 score > 0 与 warn 命中；0 分放行、NaN 与已处置不命中', () => {
+    expect(isSuspectedViolation({ kind: 'pass' }, 0)).toBe(false)
+    expect(isSuspectedViolation({ kind: 'pass' }, 0.4)).toBe(true)
+    // 分数只该是 0..1 的有限数：NaN 不能当「带信号」。
+    expect(isSuspectedViolation({ kind: 'pass' }, Number.NaN)).toBe(false)
+    expect(isSuspectedViolation({ kind: 'warn' }, 0.4)).toBe(true)
+    expect(isSuspectedViolation({ kind: 'delete' }, 0.9)).toBe(false)
+    expect(isSuspectedViolation({ kind: 'ban' }, 1)).toBe(false)
+    expect(isSuspectedViolation({ kind: 'mute', until: new Date('2026-09-23T11:00:00Z') }, 0.9)).toBe(false)
+  })
+
+  test('「删除消息」按钮的回调数据带群与消息 id', () => {
+    expect(feedDeleteKeyboard(asChatId('-1001692471411'), 42)).toEqual({
+      inline_keyboard: [[{ text: '删除消息', callback_data: 'feeddel:-1001692471411:42' }]],
+    })
+  })
+})
+
 describe('判定 feed 发送', () => {
   test('渲染后私聊 owner（HTML 解析模式）', async () => {
     const recording = createRecordingApi()
@@ -188,6 +214,36 @@ describe('判定 feed 发送', () => {
     expect(args[0]).toBe(ownerId)
     expect(args[1]).toBe(SAMPLE_FEED)
     expect(args[2]).toEqual({ parse_mode: 'HTML' })
+  })
+
+  test('疑似违规附「删除消息」按钮：pass 带分与 warn 都在范围内', async () => {
+    const recording = createRecordingApi()
+    const feed = createOwnerFeed({ api: recording.api, ownerUserId: ownerId, logger: silentLogger, now: () => now })
+    const expected = {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '删除消息', callback_data: 'feeddel:-1001692471411:42' }]] },
+    }
+
+    await feed(observation({ action: { kind: 'pass' }, score: 0.4 }))
+
+    expect(recording.lastArgsOf('sendMessage')?.[2]).toEqual(expected)
+
+    await feed(observation({ action: { kind: 'warn' }, score: 0.5 }))
+
+    expect(recording.lastArgsOf('sendMessage')?.[2]).toEqual(expected)
+  })
+
+  test('0 分放行与已处置判定不带键盘', async () => {
+    const recording = createRecordingApi()
+    const feed = createOwnerFeed({ api: recording.api, ownerUserId: ownerId, logger: silentLogger, now: () => now })
+
+    await feed(observation({ action: { kind: 'pass' }, score: 0 }))
+
+    expect(recording.lastArgsOf('sendMessage')?.[2]).toEqual({ parse_mode: 'HTML' })
+
+    await feed(observation({ action: { kind: 'delete' }, score: 0.8 }))
+
+    expect(recording.lastArgsOf('sendMessage')?.[2]).toEqual({ parse_mode: 'HTML' })
   })
 
   test('发送失败只记 warn，永不抛出', async () => {

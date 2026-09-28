@@ -1,5 +1,6 @@
-import type { Action, ModerationDecision, Signal, UserId } from '@skitarii/core'
+import type { Action, ChatId, ModerationDecision, Signal, UserId } from '@skitarii/core'
 import type { Api } from 'grammy'
+import type { InlineKeyboardMarkup } from 'grammy/types'
 import type { Logger } from './logger.js'
 import type { DecisionObservation } from './pipeline.js'
 
@@ -8,6 +9,8 @@ import type { DecisionObservation } from './pipeline.js'
  *
  * 测试期给 owner 一份逐条可读的判定流水：每条过审消息（含放行）私聊一条摘要，
  * 用来核对规则命中与复核结论，不必去群里对着消息猜。
+ * 疑似违规（未被自动处置但带信号，见 {@link isSuspectedViolation}）的摘要附一个「删除消息」按钮，
+ * 供 owner 人工补删；按钮回调在 `feed-actions.ts`。
  * 另有一路「处置失败」通知：动作被 Telegram 终结性拒绝后补偿扫描不会再动它，必须让 owner 看到。
  *
  * 两条路径共用 HTML 解析模式与转义口径：消息字段里有用户可控文本（群标题、正文、拒绝原因），
@@ -95,6 +98,37 @@ function targetLink(observation: DecisionObservation): string | null {
 }
 
 /**
+ * 判断一条判定是否属于「疑似违规」：未被自动处置但带信号。
+ *
+ * 范围：`pass` 且 `score > 0`（规则或复核看到了东西，但没到处置档位）与 `warn`（警示天然带信号）。
+ * 放行分支用 `Number.isFinite` 而不是裸 `> 0`：分数只该是 0..1 的有限数，NaN 这类异常值
+ * 不该被当成「带信号」而给出按钮。
+ * 已处置的 delete / mute / ban 不属于此列；`score === 0` 的纯放行没有信号，也不加按钮。
+ *
+ * @param action 判定档位。
+ * @param score 违规总分，0..1。
+ * @returns 需要附「删除消息」按钮时为 `true`。
+ */
+export function isSuspectedViolation(action: Action, score: number): boolean {
+  if (action.kind === 'warn') return true
+  return action.kind === 'pass' && Number.isFinite(score) && score > 0
+}
+
+/**
+ * 疑似违规摘要的「删除消息」按钮。
+ *
+ * 回调数据形状固定为 `feeddel:<chatId>:<messageId>`，由 `feed-actions.ts` 的
+ * `FEED_DELETE_CALLBACK_PATTERN` 解析；按钮虽只在 owner 私聊里出现，回调侧仍按 owner 校验。
+ *
+ * @param chatId 消息所在群/超级群 id。
+ * @param messageId 消息 id。
+ * @returns inline 键盘。
+ */
+export function feedDeleteKeyboard(chatId: ChatId, messageId: number): InlineKeyboardMarkup {
+  return { inline_keyboard: [[{ text: '删除消息', callback_data: `feeddel:${chatId}:${messageId}` }]] }
+}
+
+/**
  * 建立判定 feed 的发送器。
  *
  * 渲染与发送的任何失败都只记 warn 并正常返回：feed 是测试期的观察手段，不能因为 owner
@@ -113,7 +147,13 @@ export function createOwnerFeed(deps: {
 
   return async (observation) => {
     try {
-      await deps.api.sendMessage(deps.ownerUserId, formatDecisionFeed(observation, now()), { parse_mode: 'HTML' })
+      await deps.api.sendMessage(deps.ownerUserId, formatDecisionFeed(observation, now()), {
+        parse_mode: 'HTML',
+        // 只有疑似违规附「删除消息」按钮；其余判定保持纯摘要，不提供多余人工作业面。
+        ...(isSuspectedViolation(observation.action, observation.score)
+          ? { reply_markup: feedDeleteKeyboard(observation.chatId, observation.messageId) }
+          : {}),
+      })
     } catch (error) {
       deps.logger.warn(
         `判定 feed 发送失败 ownerUserId=${deps.ownerUserId} decisionId=${observation.decisionId}`,

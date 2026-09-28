@@ -418,7 +418,24 @@ function isTerminalTelegramError(error: unknown): error is GrammyError {
 const TARGET_GONE_PATTERN = /message(?: to delete)? not found/u
 
 /**
+ * 判断 Telegram 的 400 拒绝是不是「目标消息已经不在了」。
+ *
+ * 只按错误判断、不看动作，是这条判定唯一的一份实现：executor 的删除动作（{@link isAlreadyGoneTarget}）
+ * 在它之上叠加「仅 delete」的动作门控；owner feed 的「删除消息」按钮（`feed-actions.ts`）本就只做删除，
+ * 直接复用。两处不各写一份正则，避免日后漂移。
+ *
+ * @param error 捕获到的异常。
+ * @returns 是 GrammyError、`error_code` 为 400 且描述命中时为 `true`（此时 `error` 一定是 GrammyError）。
+ */
+export function isMessageGoneError(error: unknown): error is GrammyError {
+  return error instanceof GrammyError && error.error_code === 400 && TARGET_GONE_PATTERN.test(error.description)
+}
+
+/**
  * 判断删除动作是不是「消息本来就没了」。
+ *
+ * 分层：400 与描述的判定在 {@link isMessageGoneError}，这里只加动作门控——只有删除动作
+ * 才谈得上「消息不在也算目标达成」。
  *
  * 处置的目标只是让这条消息从群里消失，Telegram 回「message to delete not found」或「message not found」
  * 说明目标已达成（人工删了、上一条 update 已经删过、或两次重投递撞在一起）。把它当失败会让决策停在
@@ -430,7 +447,5 @@ const TARGET_GONE_PATTERN = /message(?: to delete)? not found/u
  * @returns 删除动作且描述命中「message not found」时为 `true`（此时 `error` 一定是 GrammyError）。
  */
 function isAlreadyGoneTarget(error: unknown, action: Action): error is GrammyError {
-  if (action.kind !== 'delete') return false
-  if (!(error instanceof GrammyError) || error.error_code !== 400) return false
-  return TARGET_GONE_PATTERN.test(error.description)
+  return action.kind === 'delete' && isMessageGoneError(error)
 }

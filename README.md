@@ -126,7 +126,7 @@ docker run --rm --env-file .env -p 3000:3000 skitarii
 | `DATABASE_URL` | 是 | Postgres 连接串（postgres.js 格式）；迁移与服务都读它。 |
 | `MINI_APP_URL` | 是 | 申诉按钮的目标地址，形如 `${MINI_APP_URL}?startapp=${decisionId}`。 |
 | `OWNER_USER_ID` | 是 | 申诉负责人（Telegram 数字 id）：新申诉私聊该用户，也只有该用户能维持/撤销。 |
-| `OWNER_DEBUG_NOTIFY` | 否 | owner 判定 feed 开关：每条过审消息（含放行；信任名单直放的除外）私聊 owner 一条判定摘要。缺省开启；只接受 `true`/`false`，置 `false` 关闭。 |
+| `OWNER_DEBUG_NOTIFY` | 否 | owner 判定 feed 开关：每条过审消息（含放行；信任名单直放的除外）私聊 owner 一条判定摘要。缺省开启；只接受 `true`/`false`，置 `false` 关闭。疑似违规（未被处置但带信号：`pass` 且 score > 0、`warn`）的摘要附「删除消息」按钮，仅 owner 可点：删除成功或消息已不存在时在摘要末尾追加结果并去掉按钮，失败弹出原因、按钮保留可重试。 |
 | `APPEAL_SAMPLE_WRITEBACK` | 否 | 误伤样本回写开关（开发中功能）：`true` 启用，缺省与 `false` 关闭。关闭时管线不读误伤样本，few-shot 样例与内容白名单都不生效。 |
 | `PUBLIC_URL` | 否 | 服务对外根地址；非空时启动阶段自动注册 webhook，空串或缺省跳过。 |
 | `PORT` | 否 | HTTP 监听端口，缺省 3000；Zeabur 等平台会注入自己的值。 |

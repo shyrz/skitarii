@@ -15,6 +15,7 @@ import {
 import { createChatMetadataService } from './chat-metadata.js'
 import { createDecisionRetryService, type DecisionRetryService } from './decision-retry.js'
 import { createActionExecutor } from './executor.js'
+import { createFeedDeleteCallbackHandler, FEED_DELETE_CALLBACK_PATTERN } from './feed-actions.js'
 import { composeAnalysisText, contentHashOf, extractFeatures, extractSenderIdentity } from './features.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createLogger, type Logger } from './logger.js'
@@ -71,8 +72,8 @@ export type AllowedUpdate = Exclude<keyof Update, 'update_id'>
  * 允许的更新类型。webhook 注册（`setWebhook`）与长轮询（`bot.start`）共用这一份，
  * 两个入口不允许各写一份名单，否则会悄悄漏收某种更新。
  *
- * 只列确有处理器的类型：`message` / `edited_message` 走审核管线，`callback_query` 走申诉回调，
- * `channel_post` 登记频道元数据，`my_chat_member` 跟踪 bot 自己加入/升管理员，
+ * 只列确有处理器的类型：`message` / `edited_message` 走审核管线，`callback_query` 走 owner 回调
+ * （申诉处理与判定 feed 的「删除消息」按钮），`channel_post` 登记频道元数据，`my_chat_member` 跟踪 bot 自己加入/升管理员，
  * `chat_member` 驱动订阅成员台账（只读事实，不做权限处置）。
  * 不处理也不订阅 `edited_channel_post` 等其他类型，它们没有处理器，只会多几跳流量。
  */
@@ -340,6 +341,12 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
 
   bot.callbackQuery(APPEAL_CALLBACK_PATTERN, createAppealCallbackHandler(appealDeps))
 
+  // 判定 feed 的「删除消息」按钮：owner 点按后补删群里的原消息，并把摘要改成终态。
+  bot.callbackQuery(
+    FEED_DELETE_CALLBACK_PATTERN,
+    createFeedDeleteCallbackHandler({ api: bot.api, ownerUserId: options.ownerUserId, logger }),
+  )
+
   /**
    * 更新级错误兜底：单条更新失败不能让进程退出，否则一次 Telegram 抖动就会丢掉整个机器人。
    * 致命错误（token 失效、网络不可达）由 `bot.start()` 的 rejection 处理。
@@ -371,7 +378,7 @@ export function createBotRuntime(options: CreateBotOptions): BotRuntime {
  * - `edited_message`：编辑后的群消息重走同一条管线；每次编辑产生独立事件与决策。
  * - `channel_post`：只登记频道元数据（类型、标题、linked 讨论组），不审帖子、不落帖子内容。
  * - `my_chat_member`：bot 被加入/升为管理员时登记或刷新群/频道元数据；被移出/降权时保留配置。
- * - `callbackQuery`：owner 的申诉处理回调。
+ * - `callbackQuery`：owner 的申诉处理回调与判定 feed「删除消息」回调。
  * - `command('start')`：介绍语与申诉说明。
  * - `catch`：单条更新失败不退出进程。
  *
