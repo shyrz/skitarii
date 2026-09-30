@@ -16,13 +16,22 @@ import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-error
  * 职责边界：把已落库的决策施加到 Telegram，并给当事人发一条带申诉入口的处置通知。
  * 判定与落库在管线侧完成，这里不做任何分数或阈值判断。
  *
- * 执行序：先施加动作，再发通知，最后回填 `executed`。
+ * 执行序：删除动作「先投递通知、再施加动作」，其余动作「先施加动作、再投递通知」，最后回填 `executed`。
+ * - 删除动作先发通知：群内回退通知要「回复被处置消息」，被处置消息必须还在，删掉后回复无从指向。
+ *   投递前先读通知引用（`notice_*` 列），已有引用说明上次已经发过（崩溃重跑、补偿重投递），跳过投递；
+ *   命中群内落点时重挂一次 TTL（计时只活在进程内存里，见 {@link sendNotice}）。
+ *   删除被 Telegram 终结性拒绝时撤回那条已发出的通知（见 {@link retractNotice}），避免留下
+ *   「已删除」的假消息与指向未生效处置的申诉入口；撤回是 best-effort，失败只记日志。
+ * - 其余动作都保留先动作后通知：警示/禁言/封禁都不删消息，群内回复照常成立；禁言/封禁降级为删除时
+ *   消息可能已被降级删除，`allow_sending_without_reply` 保证通知照发（无回复链接），文案仍按实际生效动作说。
  * - 动作失败（非终态）时不回填，决策留成「未执行」，重投递或人工补偿还能再试一次。
+ *   删除动作在这个重试窗口内有固有不一致：通知已发出（声称已删除）而消息尚未删除（先通知后删的必然取舍）；
+ *   补偿重试成功即收口，最终终结拒绝则撤回通知。窗口长度以补偿扫描的节奏为界，不做额外的一致性补偿。
  * - 通知失败（发送失败或 429 退避耗尽）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
  *   通知不做人为丢弃：密集时照常尝试发送，由 Telegram 的 429 退避兜底（见 `telegram-call.ts`）。
  * - 通知先私聊当事人，不可达（未 /start、被拉黑）才回退群内；实际落点记录在决策上，供申诉编辑复用。
  *   回退到群里的通知随后被安排为 5 分钟后删除（见 `GROUP_NOTICE_TTL_MS`），私聊通知不受影响。
- * - 动作被 Telegram 终结性拒绝时不发通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
+ * - 动作被 Telegram 终结性拒绝时不发新通知，但照旧回填 `executed`：终结意味着重试不会改变结果，
  *   留着不填只会让补偿扫描反复重投递。配置了 `notifyOwnerFailure` 时私聊 owner 一条失败通知。
  *
  * 幂等：动作与通知都在 `eventId:action` 的闸门内执行；决策已 `executed` 时直接跳过。
@@ -149,12 +158,24 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
       }
 
       await deps.idempotency.run(idempotencyKeyOf(decision), async () => {
+        const instant = now()
+        // 删除先通知后删：群内回退通知要回复被处置消息，消息必须还在。其余动作的通知仍在动作后发。
+        const notice =
+          decision.action.kind === 'delete'
+            ? await sendNotice(deps, decision, decision.action, instant, schedule, context)
+            : null
+
         const outcome = await applyAction(deps, decision, context)
-        // 终结性拒绝时不发群内通知：说「已删除」而实际没删是误导群成员，而且会给出一个指向不存在的处置的申诉入口。
+        // 终结性拒绝时不发新通知：说「已删除」而实际没删是误导群成员，而且会给出一个指向不存在的处置的申诉入口。
         // 降级为删除时 outcome 带着实际生效的动作，文案随之改成「已删除」。
         if (outcome.kind === 'applied') {
-          await sendNotice(deps, decision, outcome.action, now(), schedule)
+          // 删除的通知已在动作前投递；降级为删除的禁言/封禁不在此列，它们按实际生效的动作在动作后通知。
+          if (decision.action.kind !== 'delete') {
+            await sendNotice(deps, decision, outcome.action, instant, schedule, context)
+          }
         } else {
+          // 删除没生效，撤回动作前发出的通知（best-effort），避免群里留下假消息与失效的申诉入口。
+          if (notice !== null) await retractNotice(deps, decision, notice)
           await notifyFailure(deps, decision, outcome.description)
         }
         await deps.repos.decisions.markExecuted(decision.id)
@@ -279,10 +300,31 @@ function createTimerSchedule(logger: Logger): Schedule {
 }
 
 /**
- * 发送处置通知：**先私聊当事人，不可达才回退群内**。
+ * 已投递通知的句柄。
+ *
+ * 删除动作被终结性拒绝时要用它撤回那条通知（见 {@link retractNotice}），因此必须带落点与消息 id；
+ * `audience` 用于日志措辞与取舍说明（群内形态另有 TTL 定时删除兜底，私聊形态没有）。
+ */
+interface NoticeHandle {
+  /** 通知落点：私聊为当事人 id（数字），群内回退为群 id（字符串）。 */
+  chatId: string | number
+  /** 通知消息 id。 */
+  messageId: number
+  /** 落点形态。 */
+  audience: 'dm' | 'group'
+}
+
+/**
+ * 发送处置通知：**先私聊当事人，不可达才回退群内**；返回已投递通知的句柄。
  *
  * 私聊优先的理由：处置结果直接递到当事人手里，群里不再出现一条匿名通知（完全静默）。
- * 私聊不可达（从未 /start、已拉黑 bot，或目标是 bot / 已注销账号）时回退群内通知，保留现状形态：匿名文案 + 申诉按钮。
+ * 私聊不可达（从未 /start、已拉黑 bot，或目标是 bot / 已注销账号）时回退群内通知：匿名文案 + 申诉按钮，
+ * 并以「回复被处置消息」的形式落群（见 {@link sendGroupNotice}）；私聊通知不回复——跨聊天无法回复。
+ *
+ * 投递前先查通知引用（见 {@link findDeliveredNotice}）：引用已在说明这条通知已经发过。
+ * 删除动作的通知在动作前发出，崩溃重跑与补偿重投递都会重放 `execute`，没有这道守卫就会重复发，
+ * 因此命中时跳过投递，直接返回已有引用的句柄（终结性拒绝时照常可撤回）。
+ *
  * 通知不做人为丢弃：密集时直接尝试发送，由 Telegram 的 429 退避兜底；其余失败（含退避耗尽）
  * 都按「通知可丢」处理：通知是旁路，不能反过来影响动作执行。
  *
@@ -293,6 +335,8 @@ function createTimerSchedule(logger: Logger): Schedule {
  * @param action 实际生效的动作；降级时它与决策上的原动作不同（见 {@link applyAction}）。
  * @param instant 当前时刻（渲染禁言剩余分钟数）。
  * @param schedule 延迟任务调度器（群内通知的定时删除用）。
+ * @param context 执行上下文（群内通知回复被处置消息需要消息 id）。
+ * @returns 已投递通知的句柄；跳过投递（引用已在）时返回已发通知的句柄；投递失败时为 `null`。
  */
 async function sendNotice(
   deps: ActionExecutorDeps,
@@ -300,15 +344,71 @@ async function sendNotice(
   action: Action,
   instant: Date,
   schedule: Schedule,
-): Promise<void> {
+  context: ExecutionContext,
+): Promise<NoticeHandle | null> {
+  const delivered = await findDeliveredNotice(deps, decision)
+  if (delivered !== null) {
+    // 群内通知的 TTL 只挂在进程内存里（见 GROUP_NOTICE_TTL_MS）：投递后、调度前崩溃，或重启后的
+    // 补偿重试，都会让这条通知失去定时删除。命中群内句柄时重挂一次；重复删除无害（「已不在」按达成）。
+    // 私聊通知没有 TTL，不安排。
+    if (delivered.audience === 'group') {
+      scheduleGroupNoticeDeletion(deps, decision.chatId, delivered.messageId, schedule)
+    }
+    deps.logger.info(`通知已投递过，跳过重复发送 decisionId=${decision.id} audience=${delivered.audience}`)
+    return delivered
+  }
+
   const dm = await sendDirectNotice(deps, decision, action, instant)
+  if (dm.kind === 'sent') return dm.handle
   // 只有「私聊不可达」才回退群内；其余私聊失败按通知可丢处理，不发群内。
-  if (dm !== 'fallback') return
-  await sendGroupNotice(deps, decision, action, instant, schedule)
+  if (dm.kind === 'failed') return null
+  return await sendGroupNotice(deps, decision, action, instant, schedule, context)
 }
 
-/** 私聊投递结果：成功；回退群内（不可达）；失败（其余错误，通知可丢）。 */
-type DirectNoticeOutcome = 'sent' | 'fallback' | 'failed'
+/**
+ * 查这条决策已经投递过的通知。
+ *
+ * 引用命中即「已经发过」：删除动作的通知在动作前投递，崩溃重跑与补偿重投递会重放 `execute`，
+ * 守卫据此避免重复发送（否则引用还会被覆盖成最后一条，申诉编辑指向新消息）。命中时按落点重建句柄，
+ * 调用方据此撤回（见 {@link retractNotice}）或重挂群内通知的 TTL（见 {@link sendNotice}）。
+ *
+ * 只认两种可识别的落点：`String(decision.chatId)` 是群内回退通知；`String(decision.userId)` 且为
+ * 正整数形态是当事人私聊。其余落点（脏数据、串了决策）无法归属，按「没有有效引用」处理：
+ * warn 后返回 `null`，既不用于撤回、也不重挂 TTL，后续照常投递（新落点覆盖这条引用）——
+ * 不臆断落点去删一条陌生消息。
+ *
+ * 读取失败同样只 warn、按「尚未投递」处理：守卫是去重优化，读失败不该挡住动作执行；
+ * 极端情况下重复发一条通知，且旧通知可能失去 TTL，与「通知可丢」的既有口径同量级。
+ *
+ * @param deps 执行器依赖。
+ * @param decision 决策。
+ * @returns 已有引用且落点可识别时返回对应句柄，否则 `null`。
+ */
+async function findDeliveredNotice(deps: ActionExecutorDeps, decision: ModerationDecision): Promise<NoticeHandle | null> {
+  let ref: { chatId: string; messageId: number } | null
+  try {
+    ref = await deps.repos.decisions.findNoticeRef(decision.id)
+  } catch (error) {
+    deps.logger.warn(`通知引用读取失败，按尚未投递处理 decisionId=${decision.id}`, error)
+    return null
+  }
+  if (ref === null) return null
+
+  if (ref.chatId === String(decision.chatId)) {
+    return { chatId: decision.chatId, messageId: ref.messageId, audience: 'group' }
+  }
+  if (ref.chatId === String(decision.userId) && DIRECT_CHAT_ID_PATTERN.test(ref.chatId)) {
+    return { chatId: decision.userId, messageId: ref.messageId, audience: 'dm' }
+  }
+  deps.logger.warn(`通知引用落点无法识别，忽略该引用 decisionId=${decision.id} chatId=${ref.chatId}`)
+  return null
+}
+
+/** 当事人私聊落点的形态：Telegram 用户 id 的字符串形态是正整数。 */
+const DIRECT_CHAT_ID_PATTERN = /^[1-9]\d*$/u
+
+/** 私聊投递结果：成功（带可撤回句柄）；回退群内（不可达）；失败（其余错误，通知可丢）。 */
+type DirectNoticeOutcome = { kind: 'sent'; handle: NoticeHandle } | { kind: 'fallback' } | { kind: 'failed' }
 
 /**
  * 私聊当事人。
@@ -336,19 +436,23 @@ async function sendDirectNotice(
       { logger: deps.logger, label: 'sendMessage(dm-notice)' },
     )
     await recordNoticeRef(deps, decision, target, message.message_id)
-    return 'sent'
+    return { kind: 'sent', handle: { chatId: decision.userId, messageId: message.message_id, audience: 'dm' } }
   } catch (error) {
     if (isPrivateChatUnreachable(error)) {
       deps.logger.info(`当事人私聊不可达，回退群内通知 decisionId=${decision.id}`)
-      return 'fallback'
+      return { kind: 'fallback' }
     }
     deps.logger.warn(`当事人私聊通知发送失败 decisionId=${decision.id}`, error)
-    return 'failed'
+    return { kind: 'failed' }
   }
 }
 
 /**
- * 群内通知（回退形态）：匿名文案 + 申诉按钮，现状不变。
+ * 群内通知（回退形态）：匿名文案 + 申诉按钮，并以「回复被处置消息」的形式发送。
+ *
+ * 回复对象是被处置的那条消息（`context.messageId`）：删除动作的通知在此之后才执行删除，
+ * 所以消息还在；禁言/封禁降级为删除时消息可能已被降级删除，`allow_sending_without_reply`
+ * 让通知照发、只是没有回复链接。
  *
  * 发送成功并记录引用后，安排一次 TTL 删除（见 {@link GROUP_NOTICE_TTL_MS}）：只有这条回退到
  * 群里的通知会被删，私聊通知与 owner feed 不动。删除不清理通知引用——申诉编辑
@@ -359,6 +463,8 @@ async function sendDirectNotice(
  * @param action 实际生效的动作。
  * @param instant 当前时刻。
  * @param schedule 延迟任务调度器。
+ * @param context 执行上下文（提供回复目标消息 id）。
+ * @returns 已投递通知的句柄；发送失败时为 `null`（通知可丢，动作照常）。
  */
 async function sendGroupNotice(
   deps: ActionExecutorDeps,
@@ -366,17 +472,56 @@ async function sendGroupNotice(
   action: Action,
   instant: Date,
   schedule: Schedule,
-): Promise<void> {
+  context: ExecutionContext,
+): Promise<NoticeHandle | null> {
   const text = noticeText(action, instant, 'group')
   try {
     const message = await callWithRetry(
-      () => deps.api.sendMessage(decision.chatId, text, { reply_markup: appealKeyboard(deps.miniAppUrl, decision.id) }),
+      () =>
+        deps.api.sendMessage(decision.chatId, text, {
+          reply_markup: appealKeyboard(deps.miniAppUrl, decision.id),
+          reply_parameters: { message_id: context.messageId, allow_sending_without_reply: true },
+        }),
       { logger: deps.logger, label: 'sendMessage(notice)' },
     )
     await recordNoticeRef(deps, decision, decision.chatId, message.message_id)
     scheduleGroupNoticeDeletion(deps, decision.chatId, message.message_id, schedule)
+    return { chatId: decision.chatId, messageId: message.message_id, audience: 'group' }
   } catch (error) {
     deps.logger.warn(`处置通知发送失败 decisionId=${decision.id}`, error)
+    return null
+  }
+}
+
+/**
+ * 撤回已投递的通知：删除动作被终结性拒绝时调用（见 `execute`）。
+ *
+ * 删除的通知在动作前发出，动作没生效时这条「已删除」就是假消息，附带一个指向无效处置的申诉入口，
+ * 必须收回。**单次尝试、不重试**：撤回是旁路清理，失败只记日志，不影响 `executed` 回填与 owner 失败通知。
+ * 「消息已不在」（见 {@link isMessageGoneError}）按达成处理：TTL 定时删除或人工已经删过。
+ * 群内形态撤回失败时，那条通知仍会走既有的 5 分钟 TTL 删除兜底；私聊形态没有兜底，残留在当事人私聊里。
+ *
+ * @param deps 执行器依赖（取 api 与日志）。
+ * @param decision 决策（日志用）。
+ * @param notice 待撤回通知的句柄。
+ */
+async function retractNotice(deps: ActionExecutorDeps, decision: ModerationDecision, notice: NoticeHandle): Promise<void> {
+  try {
+    await deps.api.deleteMessage(notice.chatId, notice.messageId)
+    deps.logger.info(
+      `未生效处置的通知已撤回 decisionId=${decision.id} audience=${notice.audience} messageId=${notice.messageId}`,
+    )
+  } catch (error) {
+    if (isMessageGoneError(error)) {
+      deps.logger.info(
+        `未生效处置的通知已不在，撤回视为达成 decisionId=${decision.id} audience=${notice.audience} messageId=${notice.messageId}`,
+      )
+      return
+    }
+    deps.logger.warn(
+      `未生效处置的通知撤回失败 decisionId=${decision.id} audience=${notice.audience} messageId=${notice.messageId}`,
+      error,
+    )
   }
 }
 
