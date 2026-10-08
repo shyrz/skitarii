@@ -18,6 +18,8 @@ export type {
   ChatId,
   ChatType,
   DailyAggregate,
+  ExecutionCompletion,
+  ExecutionResult,
   MessageEvent,
   MessageFeatures,
   ModerationDecision,

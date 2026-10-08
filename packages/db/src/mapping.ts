@@ -177,6 +177,13 @@ export function toModerationDecision(row: ModerationDecisionRow): ModerationDeci
     signals,
     decidedAt: row.decidedAt,
     executed: row.executed,
+    execution: row.executionState === null
+      ? { kind: row.executed ? 'unknown' : 'pending' }
+      : row.executionState === 'applied' && row.effectiveAction !== null
+        ? { kind: 'applied', action: row.effectiveAction }
+        : row.executionState === 'rejected' && row.executionFailureReason !== null
+          ? { kind: 'rejected', reason: row.executionFailureReason }
+          : invalidExecutionResult(row.id),
   }
 }
 
@@ -196,7 +203,12 @@ export function toAppeal(row: AppealRow): Appeal {
     note: row.note,
     createdAt: row.createdAt,
     resolvedAt: row.resolvedAt,
+    rollbackPending: row.rollbackPending,
   }
+}
+
+function invalidExecutionResult(id: string): never {
+  throw new Error(`处置执行结果不完整 decisionId=${id}`)
 }
 
 /**

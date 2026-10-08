@@ -18,6 +18,9 @@ export interface TelegramWebApp {
   ready(): void
   /** 把 webview 展开到全高，避免半截视口里做表单。 */
   expand(): void
+  BackButton?: { show(): void; hide(): void; onClick(callback: () => void): void; offClick(callback: () => void): void }
+  enableClosingConfirmation?(): void
+  disableClosingConfirmation?(): void
 }
 
 declare global {

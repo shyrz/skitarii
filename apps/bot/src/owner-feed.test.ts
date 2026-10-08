@@ -279,6 +279,7 @@ const rejectedDecision: ModerationDecision = {
   signals: [],
   decidedAt: new Date('2026-09-23T10:00:00Z'),
   executed: false,
+  execution: { kind: 'pending' },
 }
 
 describe('处置失败通知', () => {

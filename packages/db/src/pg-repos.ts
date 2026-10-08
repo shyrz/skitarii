@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, exists, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, exists, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from 'drizzle-orm'
 import { asChatId, asUserId, type ChatConfig, type ChatId } from '@skitarii/core'
 import type { Db } from './client.js'
 import {
@@ -273,6 +273,9 @@ function createDecisionRepo(db: Db): DecisionRepo {
           signals: decision.signals,
           decidedAt: decision.decidedAt,
           executed: decision.executed,
+          executionState: decision.execution.kind === 'applied' || decision.execution.kind === 'rejected' ? decision.execution.kind : null,
+          effectiveAction: decision.execution.kind === 'applied' ? decision.execution.action : null,
+          executionFailureReason: decision.execution.kind === 'rejected' ? decision.execution.reason : null,
         })
         .onConflictDoNothing({ target: moderationDecisions.id })
     },
@@ -283,8 +286,13 @@ function createDecisionRepo(db: Db): DecisionRepo {
       return row === undefined ? null : toModerationDecision(row)
     },
 
-    async markExecuted(decisionId): Promise<void> {
-      await db.update(moderationDecisions).set({ executed: true }).where(eq(moderationDecisions.id, decisionId))
+    async completeExecution(decisionId, result): Promise<void> {
+      await db.update(moderationDecisions).set({
+        executed: true,
+        executionState: result.kind,
+        effectiveAction: result.kind === 'applied' ? result.action : null,
+        executionFailureReason: result.kind === 'rejected' ? result.reason : null,
+      }).where(and(eq(moderationDecisions.id, decisionId), eq(moderationDecisions.executed, false)))
     },
 
     async listUnexecutedBetween(from, to, limit) {
@@ -307,6 +315,11 @@ function createDecisionRepo(db: Db): DecisionRepo {
 
     async listRecent(filter) {
       const conditions = []
+      if (filter.executionIssuesSince !== undefined) conditions.push(
+        gte(moderationDecisions.decidedAt, filter.executionIssuesSince),
+        eq(moderationDecisions.executionState, 'rejected'),
+        ne(moderationDecisions.executionFailureReason, 'cancelled_by_appeal'),
+      )
       if (filter.chatId !== undefined) conditions.push(eq(moderationDecisions.chatId, filter.chatId))
       // 缺省 = 非放行；'all' = 不过滤；具体档位 = 精确匹配。
       if (filter.action === undefined) conditions.push(ne(moderationDecisions.action, 'pass'))
@@ -408,6 +421,7 @@ function createAppealRepo(db: Db): AppealRepo {
           note: appeal.note,
           createdAt: appeal.createdAt,
           resolvedAt: appeal.resolvedAt,
+          rollbackPending: appeal.rollbackPending,
         })
         .onConflictDoNothing({ target: appeals.decisionId })
     },
@@ -496,15 +510,41 @@ function createAppealRepo(db: Db): AppealRepo {
       return rows.map((row) => toAppeal(row.appeal))
     },
 
-    async listByStateWithDecision(state, limit) {
-      // 单条 join 拿到申诉与它的决策：面板一次要一页，逐条回查决策就是 N+1。
-      const joined = db
-        .select({ appeal: appeals, decision: moderationDecisions })
+    async listWithDecision(filter) {
+      const history = filter.state !== null && filter.state !== 'open'
+      const at = history ? appeals.resolvedAt : appeals.createdAt
+      const beforeAt = filter.before === undefined ? undefined : sql`${filter.before.at}::timestamptz`
+      const rows = await db
+        .select({
+          appeal: appeals,
+          decision: moderationDecisions,
+          cursorAt: sql<string>`to_char(${at} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
+        })
         .from(appeals)
         .innerJoin(moderationDecisions, eq(appeals.decisionId, moderationDecisions.id))
-      const filtered = state === null ? joined : joined.where(eq(appeals.state, state))
-      const rows = await filtered.orderBy(desc(appeals.createdAt)).limit(limit)
-      return rows.map((row) => ({ appeal: toAppeal(row.appeal), decision: toModerationDecision(row.decision) }))
+        .where(and(
+          history ? isNotNull(appeals.resolvedAt) : undefined,
+          filter.state === null ? undefined : filter.state === 'resolved'
+            ? inArray(appeals.state, ['upheld', 'overturned']) : eq(appeals.state, filter.state),
+          filter.chatId === undefined ? undefined : eq(moderationDecisions.chatId, filter.chatId),
+          filter.before === undefined || beforeAt === undefined ? undefined
+            : or(lt(at, beforeAt), and(eq(at, beforeAt), lt(appeals.id, filter.before.id))),
+        ))
+        .orderBy(sql`${at} desc nulls last`, sql`${appeals.id} desc nulls last`)
+        .limit(filter.limit)
+      return rows.map((row) => ({
+        appeal: toAppeal(row.appeal), decision: toModerationDecision(row.decision), cursorAt: row.cursorAt,
+      }))
+    },
+
+    async countOpenByChat(chatIds) {
+      if (chatIds.length === 0) return new Map()
+      const rows = await db.select({ chatId: moderationDecisions.chatId, total: count() })
+        .from(appeals)
+        .innerJoin(moderationDecisions, eq(appeals.decisionId, moderationDecisions.id))
+        .where(and(eq(appeals.state, 'open'), inArray(moderationDecisions.chatId, [...chatIds])))
+        .groupBy(moderationDecisions.chatId)
+      return new Map(rows.map((row) => [asChatId(row.chatId), row.total]))
     },
 
     async markNotified(appealId, notifiedAt): Promise<void> {
@@ -663,6 +703,13 @@ function createSubscriptionLinkRepo(db: Db): SubscriptionLinkRepo {
         .limit(1)
       const row = rows[0]
       return row === undefined ? null : toSubscriptionLink(row)
+    },
+
+    async findNames(chatId, ids) {
+      if (ids.length === 0) return new Map()
+      const rows = await db.select({ id: subscriptionLinks.id, name: subscriptionLinks.name }).from(subscriptionLinks)
+        .where(and(eq(subscriptionLinks.chatId, chatId), inArray(subscriptionLinks.id, ids))).limit(ids.length)
+      return new Map(rows.map(row => [row.id, row.name]))
     },
 
     async findByInviteLink(chatId, fullLink) {

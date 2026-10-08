@@ -13,7 +13,7 @@ import {
   type UserId,
 } from '@skitarii/core'
 import type { AppealResolution, Logger } from '@skitarii/bot'
-import type { Repos } from '@skitarii/db'
+import type { AppealListFilter, Repos } from '@skitarii/db'
 import { z } from 'zod'
 import type { ApiResponse } from './api.js'
 import { verifyInitData } from './init-data.js'
@@ -35,18 +35,20 @@ import { verifyInitData } from './init-data.js'
 const OVERVIEW_WINDOW_DAYS = 7
 
 /**
- * 概览里 open 申诉的扫描上限。
+ * 列表端点默认与最大页大小。
  *
- * `openAppeals` 是每群的待处理计数，需要一个上界避免一次拉全表；自用规模下 1000 条远超真实积压量，
- * 触顶时计数会偏低（宁可少报也不做无界查询）。
+ * 越界与非整数一律 400（见 {@link parseListLimit}），不静默截断：`?limit=0` 被夹成 1 条会让
+ * 客户端把「只有一条」当成事实，把调用方的参数错误藏起来。口径与订阅端点（`subscriptions.ts` 的
+ * `parseLimit`）一致，也与本模块对 `action` / `state` / `before` 的既有处理一致。
  */
-const OPEN_APPEAL_SCAN_LIMIT = 1_000
-
-/** 列表端点默认与最大页大小（spec：默认 50，上限 100）。 */
 const DEFAULT_LIST_LIMIT = 50
 const MAX_LIST_LIMIT = 100
 
-/** 报表序列的窗口范围与默认值（spec：默认 30，clamp 到 [7, 90]）。 */
+/**
+ * 报表序列的窗口范围与默认值。
+ *
+ * 与 `limit` 同一口径：越界与非整数一律 400（见 {@link parseSeriesDays}），不静默夹取。
+ */
 const DEFAULT_SERIES_DAYS = 30
 const MIN_SERIES_DAYS = 7
 const MAX_SERIES_DAYS = 90
@@ -144,15 +146,8 @@ export async function getPanelOverview(
   const today = utcDate(now)
   const windowStart = utcDate(shiftUtcDays(now, -(OVERVIEW_WINDOW_DAYS - 1)))
 
-  const [chats, openAppeals] = await Promise.all([
-    deps.repos.chats.listAll(),
-    deps.repos.appeals.listByStateWithDecision('open', OPEN_APPEAL_SCAN_LIMIT),
-  ])
-
-  const openByChat = new Map<string, number>()
-  for (const { decision } of openAppeals) {
-    openByChat.set(decision.chatId, (openByChat.get(decision.chatId) ?? 0) + 1)
-  }
+  const chats = await deps.repos.chats.listAll()
+  const openByChat = await deps.repos.appeals.countOpenByChat(chats.map((chat) => chat.chatId))
 
   const rows = await Promise.all(
     chats.map(async (chat) => {
@@ -172,6 +167,11 @@ export async function getPanelOverview(
   )
 
   // 活跃在前；同分按 chatId 升序，让响应顺序确定（页面刷新不会换位）。
+  const [executionIssues, pendingRollback] = await Promise.all([
+    deps.repos.decisions.listRecent({ executionIssuesSince: new Date(now.getTime() - 7 * DAY_MS), limit: 11 }),
+    deps.repos.appeals.listPendingRollback(11),
+  ])
+
   rows.sort((a, b) => b.last7d.actionCount - a.last7d.actionCount || a.chatId.localeCompare(b.chatId))
 
   return {
@@ -182,6 +182,12 @@ export async function getPanelOverview(
         last7d: sumDailyCounts(rows.map((row) => row.last7d)),
       },
       chats: rows,
+      attention: {
+        executionIssues: executionIssues.slice(0, 10).map(decision => ({ id: decision.id, chatId: decision.chatId, userId: decision.userId, execution: decision.execution, action: decision.action.kind })),
+        moreExecutionIssues: executionIssues.length > 10,
+        pendingRollbackCount: Math.min(pendingRollback.length, 10),
+        morePendingRollback: pendingRollback.length > 10,
+      },
       serverTime: now,
     },
   }
@@ -191,8 +197,8 @@ export async function getPanelOverview(
  * 某群的日序列：连续日期、缺失日补零、升序。
  *
  * @param deps 面板依赖。
- * @param query `chatId` 来自路径；`days` 来自查询串（缺省 30，clamp 到 [7, 90]）。
- * @returns 200 序列；401 / 403 鉴权失败。
+ * @param query `chatId` 来自路径；`days` 来自查询串（缺省 30，合法范围 [7, 90] 的整数）。
+ * @returns 200 序列；400 `days` 非法；401 / 403 鉴权失败；404 群未登记。
  */
 export async function getPanelSeries(
   deps: PanelApiDeps,
@@ -201,8 +207,17 @@ export async function getPanelSeries(
   const auth = verifyOwner(deps, query.initData)
   if (!auth.ok) return auth.response
 
+  const days = parseSeriesDays(query.days)
+  if (days === 'invalid') {
+    return invalidRequest([`days 取值非法：${String(query.days)}（需要 ${MIN_SERIES_DAYS}..${MAX_SERIES_DAYS} 的整数）`])
+  }
+
+  // 未登记的群按 404 回答（与 getPanelChatConfig 同口径）：返回全零序列会让前端把「这个群不存在」
+  // 读成「这个群没有任何活动」，两种完全不同的情况在界面上无法区分。
+  const chat = await deps.repos.chats.findByChatId(asChatId(query.chatId))
+  if (chat === null) return { status: 404, body: { error: 'chat_not_found' } }
+
   const now = deps.now?.() ?? new Date()
-  const days = clampSeriesDays(query.days)
   const today = utcDate(now)
   const start = utcDate(shiftUtcDays(now, -(days - 1)))
 
@@ -250,7 +265,11 @@ export async function getPanelDecisions(
     return invalidRequest([`before 与 beforeId 必须成对给出且格式合法：before=${String(query.before)} beforeId=${String(query.beforeId)}`])
   }
 
-  const limit = clampListLimit(query.limit)
+  const limit = parseListLimit(query.limit)
+  if (limit === 'invalid') {
+    return invalidRequest([`limit 取值非法：${String(query.limit)}（需要 1..${MAX_LIST_LIMIT} 的整数）`])
+  }
+
   const rows = await deps.repos.decisions.listRecent({
     ...(query.chatId === null || query.chatId.length === 0 ? {} : { chatId: asChatId(query.chatId) }),
     ...(action === undefined ? {} : { action }),
@@ -277,15 +296,22 @@ export async function getPanelDecisions(
 }
 
 /**
- * 申诉队列：按创建时间倒序，带原处置摘要与正文摘录。
+ * 申诉队列：待处理及全部按创建时间，已结案按结案时间倒序，带原处置摘要与摘录。
  *
  * @param deps 面板依赖。
- * @param query 查询串参数；`state` 缺省为 `open`，`all` 表示全部状态。
+ * @param query `state` 缺省为 `open`，`resolved` 为两种已结案状态，`all` 为全部。
  * @returns 200 列表；400 参数非法；401 / 403 鉴权失败。
  */
 export async function getPanelAppeals(
   deps: PanelApiDeps,
-  query: { initData: string | null; state: string | null; limit: string | null },
+  query: {
+    initData: string | null
+    state: string | null
+    limit: string | null
+    chatId?: string | null
+    before?: string | null
+    beforeId?: string | null
+  },
 ): Promise<ApiResponse> {
   const auth = verifyOwner(deps, query.initData)
   if (!auth.ok) return auth.response
@@ -293,28 +319,47 @@ export async function getPanelAppeals(
   const state = parseStateFilter(query.state)
   if (state === 'invalid') return invalidRequest([`state 取值非法：${String(query.state)}`])
 
-  const rows = await deps.repos.appeals.listByStateWithDecision(state, clampListLimit(query.limit))
+  const limit = parseListLimit(query.limit)
+  if (limit === 'invalid') {
+    return invalidRequest([`limit 取值非法：${String(query.limit)}（需要 1..${MAX_LIST_LIMIT} 的整数）`])
+  }
+
+  const before = parseAppealCursor(query.before ?? null, query.beforeId ?? null)
+  if (before === 'invalid') return invalidRequest(['before 与 beforeId 必须成对给出，使用返回的分页游标。'])
+  const rows = await deps.repos.appeals.listWithDecision({
+    state,
+    limit: limit + 1,
+    ...(query.chatId ? { chatId: asChatId(query.chatId) } : {}),
+    ...(before === undefined ? {} : { before }),
+  })
+  const items = rows.slice(0, limit)
+  const last = items.at(-1)
   const [chats, samples] = await Promise.all([
     deps.repos.chats.listAll(),
-    deps.repos.events.findSamples(rows.map(({ decision }) => decision.eventId)),
+    deps.repos.events.findSamples(items.map(({ decision }) => decision.eventId)),
   ])
   const titles = new Map(chats.map((chat) => [String(chat.chatId), chat.title]))
 
   return {
     status: 200,
     body: {
-      items: rows.map(({ appeal, decision }) => ({
+      nextBefore: rows.length > limit && last !== undefined ? { at: last.cursorAt, id: last.appeal.id } : null,
+      items: items.map(({ appeal, decision }) => ({
         id: appeal.id,
         userId: appeal.userId,
         state: appeal.state,
         note: appeal.note,
         createdAt: appeal.createdAt,
         resolvedAt: appeal.resolvedAt,
+        rollbackPending: appeal.rollbackPending,
         decision: {
           id: decision.id,
           action: decision.action.kind,
+          execution: decision.execution,
           actionUntil: decision.action.kind === 'mute' ? decision.action.until : null,
           score: decision.score,
+          ruleIds: decision.signals.flatMap(signal => signal.kind === 'rule-hit' ? [signal.ruleId] : []),
+          llm: serializeDecision(decision, titles, samples).llm,
           chatId: decision.chatId,
           chatTitle: titles.get(String(decision.chatId)) ?? String(decision.chatId),
           sampleText: samples.get(decision.eventId) ?? null,
@@ -682,11 +727,21 @@ function parseActionFilter(raw: string | null): RuleAction | 'all' | undefined |
  * @param raw 查询串里的 `state`。
  * @returns 缺省（含空串）为 `'open'`；`'all'` 为 `null`；非法字面量返回 `'invalid'`。
  */
-function parseStateFilter(raw: string | null): AppealState | null | 'invalid' {
+function parseStateFilter(raw: string | null): AppealListFilter['state'] | 'invalid' {
   if (raw === null || raw.length === 0) return 'open'
   if (raw === 'all') return null
+  if (raw === 'resolved') return 'resolved'
   if (APPEAL_STATES.has(raw)) return raw as AppealState
   return 'invalid'
+}
+
+function parseAppealCursor(at: string | null, id: string | null): AppealListFilter['before'] | 'invalid' {
+  if (!at && !id) return undefined
+  if (!at || !id || !UUID_PATTERN.test(id)) return 'invalid'
+  const date = new Date(at)
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/u.test(at) ||
+    Number.isNaN(date.getTime()) || date.toISOString().slice(0, 19) !== at.slice(0, 19)) return 'invalid'
+  return { at, id }
 }
 
 /**
@@ -717,29 +772,37 @@ function parseBeforeCursor(
 }
 
 /**
- * clamp 页大小。
+ * 解析页大小。
+ *
+ * 缺省（`null` 与空串）取默认值；其余必须是 1..100 的**整数**，越界、小数、非数字一律 `'invalid'`
+ * （由调用方回 400），不静默夹取——`?limit=0` 被夹成 1 条会让客户端把「只有一条」当成事实，
+ * 把调用方的参数错误藏起来。
+ *
+ * 判据与订阅端点的 `parseLimit` 逐字同口径：先 `Number` 再 `Number.isInteger`，因此 `'5abc'`、
+ * `'1.5'` 都是非法，而不是被 `parseInt` 前缀解析成 5 与 1。两处刻意各留一份实现（返回约定与
+ * 错误体不同），但判定规则必须同时修改。
  *
  * @param raw 查询串里的 `limit`。
- * @returns 缺省与非数字为默认值 50，其余夹到 [1, 100]。
+ * @returns 合法页大小；非法返回 `'invalid'`。
  */
-function clampListLimit(raw: string | null): number {
-  if (raw === null) return DEFAULT_LIST_LIMIT
-  const parsed = Number.parseInt(raw, 10)
-  if (Number.isNaN(parsed)) return DEFAULT_LIST_LIMIT
-  return Math.min(MAX_LIST_LIMIT, Math.max(1, parsed))
+function parseListLimit(raw: string | null): number | 'invalid' {
+  if (raw === null || raw.length === 0) return DEFAULT_LIST_LIMIT
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_LIST_LIMIT) return 'invalid'
+  return parsed
 }
 
 /**
- * clamp 报表窗口天数。
+ * 解析报表窗口天数。与 {@link parseListLimit} 同一口径，范围换成 [7, 90]。
  *
  * @param raw 查询串里的 `days`。
- * @returns 缺省与非数字为默认值 30，其余夹到 [7, 90]。
+ * @returns 合法天数；非法返回 `'invalid'`。
  */
-function clampSeriesDays(raw: string | null): number {
-  if (raw === null) return DEFAULT_SERIES_DAYS
-  const parsed = Number.parseInt(raw, 10)
-  if (Number.isNaN(parsed)) return DEFAULT_SERIES_DAYS
-  return Math.min(MAX_SERIES_DAYS, Math.max(MIN_SERIES_DAYS, parsed))
+function parseSeriesDays(raw: string | null): number | 'invalid' {
+  if (raw === null || raw.length === 0) return DEFAULT_SERIES_DAYS
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < MIN_SERIES_DAYS || parsed > MAX_SERIES_DAYS) return 'invalid'
+  return parsed
 }
 
 /** 400 响应里 `details` 的条数上限；超出时截断并追加一行汇总，避免把整份请求体回显给前端。 */
@@ -809,6 +872,7 @@ function serializeDecision(
     actionUntil: decision.action.kind === 'mute' ? decision.action.until : null,
     score: decision.score,
     executed: decision.executed,
+    execution: decision.execution,
     decidedAt: decision.decidedAt,
     ruleIds: decision.signals.flatMap((signal) => (signal.kind === 'rule-hit' ? [signal.ruleId] : [])),
     llm: llm === undefined ? null : { verdict: llm.verdict, confidence: llm.confidence },

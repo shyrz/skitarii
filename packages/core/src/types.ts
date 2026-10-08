@@ -137,7 +137,13 @@ export interface MessageEvent {
   createdAt: Date
 }
 
-/** 一次审核决策。`executed` 区分「已判定」与「已对 Telegram 施加动作」，便于崩溃后补偿执行。 */
+export type ExecutionCompletion =
+  | { kind: 'applied'; action: Action['kind'] }
+  | { kind: 'rejected'; reason: 'telegram_rejected' | 'warning_delivery_unconfirmed' | 'cancelled_by_appeal' }
+
+export type ExecutionResult = { kind: 'pending' } | { kind: 'unknown' } | ExecutionCompletion
+
+/** 一次审核决策。`executed` 是停止补偿的标记；实际结果由 `execution` 表达。 */
 export interface ModerationDecision {
   id: string
   eventId: string
@@ -148,6 +154,7 @@ export interface ModerationDecision {
   signals: Signal[]
   decidedAt: Date
   executed: boolean
+  execution: ExecutionResult
 }
 
 /**
@@ -162,6 +169,7 @@ export interface Appeal {
   note: string | null
   createdAt: Date
   resolvedAt: Date | null
+  rollbackPending: boolean
 }
 
 /**

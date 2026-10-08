@@ -784,9 +784,12 @@ async function runListSubscriptionMembers(
     }),
   )
 
+  const linkIds = [...new Set(page.items.flatMap(member => member.linkId === null ? [] : [member.linkId]))]
+  const linkNames = await deps.repos.subscriptionLinks.findNames(channel.chat.chatId, linkIds)
+
   return {
     status: 200,
-    body: { items: page.items.map(serializeMember), nextCursor: page.nextCursor, serverTime: nowIso(deps) },
+    body: { items: page.items.map(member => ({ ...serializeMember(member), linkName: member.linkId === null ? null : linkNames.get(member.linkId) ?? null })), nextCursor: page.nextCursor, serverTime: nowIso(deps) },
   }
 }
 

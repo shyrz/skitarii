@@ -249,6 +249,8 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 
 跨群管理台（Mini App 面板视图）的数据面。所有 `/api/panel/*` 端点先验 initData，再要求 `userId === OWNER_USER_ID`；GET 的凭据在查询串，POST 与 PUT 的在 body。列表端点都在 SQL 侧完成过滤、排序与 limit，群标题与正文摘录批量取，不做 N+1 查询。
 
+参数口径与订阅端点统一：分页与范围参数（`limit`、`days`）缺省时取默认值，越界、小数或非数字一律 `400 {"error":"invalid_request","details":[...]}`，**不静默截断**（`?limit=0` 被夹成 1 条会让客户端把「只有一条」当成事实）；按路径定位的资源（`chatId`、`appealId`）不存在一律 404。
+
 鉴权失败的状态码对所有端点一致：
 
 - `401 {"error":"init_data_invalid"}`：缺凭据、验签失败或过期（前端提示重新从 Telegram 打开）
@@ -285,7 +287,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 { "chatId": "-1001234567890", "days": [ { "date": "2026-08-25", "messageCount": 0, "actionCount": 0, "appealCount": 0, "overturnedCount": 0 } ] }
 ```
 
-序列升序且日期连续，缺失日补零。`days` 默认 30，clamp 到 [7, 90]。调度器每小时滚动日报，今天的数字可能滞后至多一小时。
+序列升序且日期连续，缺失日补零。`days` 默认 30，合法范围 `[7, 90]` 的整数，越界或非整数 400（不夹取）。**群未登记返回 `404 {"error":"chat_not_found"}`**，与 config 端点同口径；已登记但还没有聚合数据的群照常返回全零的连续序列。调度器每小时滚动日报，今天的数字可能滞后至多一小时。
 
 #### `GET /api/panel/chats/:chatId/config?initData=...`
 
@@ -346,6 +348,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
       "actionUntil": null,
       "score": 0.9,
       "executed": true,
+      "execution": { "kind": "applied", "action": "delete" },
       "decidedAt": "2026-09-23T10:00:01.000Z",
       "ruleIds": ["default-ad-wechat"],
       "llm": { "verdict": "spam", "confidence": 0.92 },
@@ -356,11 +359,13 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 }
 ```
 
-默认只返回非放行（`action != 'pass'`）；`action=all` 或具体档位（`pass | warn | delete | mute | ban`）可覆盖，非法取值 400。排序 `(decidedAt, id)` 倒序，`limit` 默认 50、上限 100。
+`execution` 是实际执行结果。`pending` 表示等待执行或重试，不能据此断言远端尚未发生动作；`unknown` 表示历史记录没有保存结果；`applied` 携带实际 `action`，可能与原动作不同；`rejected` 携带安全原因 `telegram_rejected`、`warning_delivery_unconfirmed` 或 `cancelled_by_appeal`。警告送达未确认不代表确定未送达。`executed` 保留为补偿停止位，不代表处罚成功。本人申诉和面板申诉中的 decision 同样返回 `execution`。
+
+默认只返回非放行（`action != 'pass'`）；`action=all` 或具体档位（`pass | warn | delete | mute | ban`）可覆盖，非法取值 400。排序 `(decidedAt, id)` 倒序，`limit` 默认 50、合法范围 1..100 的整数，越界或非整数 400。
 
 游标是复合的：`nextBefore` 非 `null` 时把 `decidedAt` 与 `id` 分别作为 `before` 与 `beforeId` 原样传回。两个参数必须成对出现且格式合法（`before` 为 ISO、`beforeId` 为 uuid），缺一或非法一律 400：同一毫秒可能有多条记录，只按时间翻页会静默漏条，因此后端不接受半截游标。`sampleText` 为 `null` 表示没有摘录（放行、无正文且无按钮，或已被保留期清理）。
 
-#### `GET /api/panel/appeals?initData=&state=open|upheld|overturned|all&limit=50`
+#### `GET /api/panel/appeals?initData=&state=open|resolved|upheld|overturned|all&chatId=&limit=50&before=&beforeId=`
 
 ```json
 {
@@ -372,9 +377,11 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
       "note": "这是我自己的闲置转让",
       "createdAt": "2026-09-23T10:05:00.000Z",
       "resolvedAt": null,
+      "rollbackPending": false,
       "decision": {
         "id": "9c8b7a65-1111-4222-8333-999900001111",
         "action": "mute",
+        "execution": { "kind": "applied", "action": "mute" },
         "actionUntil": "2026-09-23T11:00:00.000Z",
         "score": 0.8,
         "chatId": "-1001234567890",
@@ -386,7 +393,11 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 }
 ```
 
-默认 `state=open`，`all` 表示全部状态，非法取值 400。按申诉创建时间倒序，`limit` 默认 50、上限 100。
+默认 `state=open`，`resolved` 表示全部已结案，`all` 表示全部状态，非法取值 400。可按 `chatId` 筛选。待处理及全部按创建时间倒序，已结案状态按结案时间倒序，同时间按申诉 id 倒序。`limit` 默认 50、合法范围 1..100 的整数，越界或非整数 400。
+
+响应另含 `nextBefore`，没有后续页时为 `null`，否则为 `{ "at": "2026-09-23T10:05:00.123456Z", "id": "申诉 UUID" }`。下一页把 `at` 和 `id` 原样传入 `before`、`beforeId`，不能转为 JavaScript Date 丢失微秒。游标必须成对，缺一或格式非法返回 400。切换群或状态后从第一页重新读取。面板待处理和已结案分别查询，不从有限的全部记录里分组。概览待处理数按已登记群聚合，不受分页上限影响。
+
+本人和面板申诉均返回持久字段 `rollbackPending`。为 true 时显示解除限制仍待处理，为 false 只表示当前没有待补偿标记，不证明历史权限已恢复。新记录依据实际动作恢复权限，降级删除或终态拒绝不会触发解禁；历史未知记录继续沿用原动作补偿。该兼容策略不能证明现有受限状态属于哪一次处罚。执行与撤销竞态沿用单进程幂等约束，多实例仍需共享执行闸门。
 
 #### `POST /api/panel/appeals/:appealId/resolve`
 
@@ -394,7 +405,7 @@ Telegram 更新入口。请求头 `X-Telegram-Bot-Api-Secret-Token` 必须等于
 { "initData": "<Telegram.WebApp.initData>", "resolution": "upheld" }
 ```
 
-- `200 {"state":"upheld"|"overturned","rollbackFailed":false}`：结案成功。`rollbackFailed=true` 表示撤销已生效但权限回滚失败（Telegram 拒绝），前端提示「已结案，但解除限制失败：请手动解禁或解封」
+- `200 {"state":"upheld"|"overturned","rollbackFailed":false}`：结案成功。`rollbackFailed=true` 表示撤销已生效但权限恢复尚未完成，可能是 Telegram 调用失败或原处置仍在执行。页面提示核实权限，后续补偿会继续处理
 - `400 {"error":"invalid_request","details":[...]}`：请求体不合法（鉴权前先校验）
 - `401 {"error":"init_data_invalid"}` / `403 {"error":"forbidden"}`
 - `404 {"error":"appeal_not_found"}`：申诉或关联决策不存在，路径参数不是 uuid 也按此处理

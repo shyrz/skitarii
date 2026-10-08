@@ -5,6 +5,7 @@ import type {
   ChatId,
   ChatType,
   DailyAggregate,
+  ExecutionCompletion,
   MessageEvent,
   ModerationDecision,
   Rule,
@@ -133,8 +134,8 @@ export interface DecisionRepo {
   insert(decision: ModerationDecision): Promise<void>
   /** 按 id 读取。申诉回滚与崩溃补偿都需要它。 */
   findById(decisionId: string): Promise<ModerationDecision | null>
-  /** 动作施加到 Telegram 后回填，崩溃恢复时据此找出未执行的决策。 */
-  markExecuted(decisionId: string): Promise<void>
+  /** 原子记录完成结果并停止补偿；已完成的记录不覆盖。 */
+  completeExecution(decisionId: string, result: ExecutionCompletion): Promise<void>
   /**
    * 未执行决策的补偿扫描输入：`executed = false` 且 `decidedAt` 落在 `[from, to)`，按判定时间升序、最多 `limit` 条。
    *
@@ -156,6 +157,7 @@ export interface DecisionRepo {
   listRecent(filter: {
     chatId?: ChatId
     action?: 'all' | RuleAction
+    executionIssuesSince?: Date
     before?: { decidedAt: Date; id: string }
     limit: number
   }): Promise<ModerationDecision[]>
@@ -206,6 +208,14 @@ export interface OverturnedSample {
 }
 
 /** 申诉读写。 */
+export interface AppealListFilter {
+  state: AppealState | 'resolved' | null
+  chatId?: ChatId
+  /** 原样往返数据库时间，保留 PostgreSQL 的微秒精度。 */
+  before?: { at: string; id: string }
+  limit: number
+}
+
 export interface AppealRepo {
   /** 追加一条申诉。同一 `decisionId` 重复插入被忽略（数据库层唯一约束，见 `appeals_decision_unique`）。 */
   insert(appeal: Appeal): Promise<void>
@@ -255,15 +265,16 @@ export interface AppealRepo {
   /** 某群的待处理申诉，按创建时间升序。 */
   listOpen(chatId: ChatId): Promise<Appeal[]>
   /**
-   * 面板申诉队列：按创建时间倒序取一组申诉与它们的决策（单条 join，禁止逐条回查）。
-   *
-   * @param state `null` 表示全部状态；否则只取该状态。
-   * @param limit 单页上限，调用方负责 clamp。
+   * 面板队列。已结案状态按结案时间，其余按创建时间，均以 id 决定同时间记录的顺序。
+   * `null` 查询全部，`resolved` 查询两种已结案状态；cursorAt 用于精确分页。
    */
-  listByStateWithDecision(
-    state: AppealState | null,
-    limit: number,
-  ): Promise<{ appeal: Appeal; decision: ModerationDecision }[]>
+  listWithDecision(filter: AppealListFilter): Promise<{
+    appeal: Appeal
+    decision: ModerationDecision
+    cursorAt: string
+  }[]>
+  /** 仅统计指定群的待处理申诉，返回聚合计数，不加载申诉明细。 */
+  countOpenByChat(chatIds: readonly ChatId[]): Promise<Map<ChatId, number>>
   /**
    * 回填 owner 通知时刻：`notified_at` 只表示「Telegram 接受了那条私聊」，
    * 不参与申诉状态机。调度器据此找出「已提交但还没通知成功」的申诉补发。
@@ -335,6 +346,7 @@ export interface SubscriptionLinkRepo {
   /** 明确失败或结果不确定时落状态；只从 `creating` 迁移。 */
   markCreateOutcome(id: string, state: 'create_unknown' | 'create_failed', changedAt: Date): Promise<void>
   findById(chatId: ChatId, id: string): Promise<SubscriptionLink | null>
+  findNames(chatId: ChatId, ids: string[]): Promise<Map<string, string>>
   /** 完整链接精确匹配（成员来源关联用）。 */
   findByInviteLink(chatId: ChatId, fullLink: string): Promise<SubscriptionLink | null>
   /**

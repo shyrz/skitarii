@@ -35,26 +35,10 @@ export function SubscriptionChannelPicker({
         </div>
       )}
       {channels.items.length > 0 && (
-        <div className="channel-list">
-          {channels.items.map((channel) => (
-            <button
-              key={channel.chatId}
-              type="button"
-              className={channel.chatId === selectedChatId ? 'channel-item active' : 'channel-item'}
-              aria-pressed={channel.chatId === selectedChatId}
-              disabled={disabled}
-              onClick={() => onSelect(channel.chatId)}
-            >
-              <span className="channel-name">{channel.title}</span>
-              <span className="channel-meta">
-                ID {channel.chatId}
-                {channel.linkedChatId !== null
-                  ? ` · 关联讨论组 ${channel.linkedChatId}（仅作信息展示，不会对其调整权限）`
-                  : ''}
-              </span>
-            </button>
-          ))}
-        </div>
+        <select className="select" aria-label="选择频道" value={selectedChatId ?? ''} disabled={disabled} onChange={event => onSelect(event.target.value)}>
+          <option value="" disabled>选择频道…</option>
+          {channels.items.map(channel => <option key={channel.chatId} value={channel.chatId}>{channel.title}</option>)}
+        </select>
       )}
       {channels.status === 'ready' && channels.items.length === 0 && (
         <p className="empty-state">还没有已登记的频道。把机器人设为频道管理员后会自动登记。</p>

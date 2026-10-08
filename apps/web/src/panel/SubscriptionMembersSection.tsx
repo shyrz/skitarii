@@ -1,18 +1,16 @@
 import type { SubscriptionMemberDto } from '../api.js'
-import { MEMBER_STATE_LABEL, MEMBER_STATE_TONE, OBSERVATION_DISCLAIMER, expiryObservation, memberLinkLabel } from './subscriptions.js'
+import { MEMBER_STATE_LABEL, MEMBER_STATE_TONE, OBSERVATION_DISCLAIMER, expiryObservation } from './subscriptions.js'
 import type { PageState } from './subscriptions-model.js'
 import { formatTime } from './util.js'
 
 /** 成员观测台账：非实时数据，只展示 Bot 观测到的事实；刷新本身失败时不破坏已有列表。 */
 export function SubscriptionMembersSection({
   members,
-  linkNames,
   onRefresh,
   onRetry,
   onLoadMore,
 }: {
   members: PageState<SubscriptionMemberDto>
-  linkNames: ReadonlyMap<string, string>
   onRefresh: () => void
   onRetry: () => void
   onLoadMore: () => void
@@ -24,7 +22,7 @@ export function SubscriptionMembersSection({
         <button
           type="button"
           className="text-btn"
-          disabled={members.status === 'loading'}
+          disabled={members.status === 'loading' || members.refreshing || members.loadingMore}
           onClick={onRefresh}
         >
           刷新
@@ -52,7 +50,7 @@ export function SubscriptionMembersSection({
       )}
 
       {members.items.map((member) => (
-        <MemberCard key={member.id} member={member} linkNames={linkNames} />
+        <MemberCard key={member.id} member={member} />
       ))}
 
       {members.nextCursor !== null && (
@@ -61,7 +59,7 @@ export function SubscriptionMembersSection({
           <button
             type="button"
             className="btn btn-secondary"
-            disabled={members.loadingMore}
+            disabled={members.loadingMore || members.refreshing}
             onClick={onLoadMore}
           >
             {members.loadingMore ? '加载中…' : '加载更多成员'}
@@ -74,10 +72,8 @@ export function SubscriptionMembersSection({
 
 function MemberCard({
   member,
-  linkNames,
 }: {
   member: SubscriptionMemberDto
-  linkNames: ReadonlyMap<string, string>
 }) {
   const expiry = expiryObservation(member.expiresAt, new Date())
   return (
@@ -89,7 +85,7 @@ function MemberCard({
         </span>
       </div>
       <p className="list-line">到期观测：{expiry.text}</p>
-      <p className="list-sub">可关联链接：{memberLinkLabel(member.linkId, linkNames)}</p>
+      <p className="list-sub">可关联链接：{member.linkId === null ? '未关联本 Bot 创建的付费链接' : member.linkName === null ? `链接 ID ${member.linkId}（未获取名称）` : member.linkName || '未命名链接'}</p>
       <p className="list-sub">
         最后观测 {formatTime(member.observedAt)} · 来源{' '}
         {member.observationSource === 'event' ? '事件' : '对账轮询'}

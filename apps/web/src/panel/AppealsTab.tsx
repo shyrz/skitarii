@@ -1,253 +1,214 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ConflictError, NotFoundError, fetchPanelAppeals, resolvePanelAppeal } from '../api.js'
-import type { PanelAppealDto, PanelResolution } from '../api.js'
-import { ACTION_LABEL, ACTION_TONE, formatTime } from './util.js'
+import { executionText } from '../execution.js'
+import type { PanelAppealDto, PanelAppealPage, PanelResolution } from '../api.js'
+import { ACTION_LABEL, ACTION_TONE, VERDICT_LABEL, formatTime } from './util.js'
 
-/**
- * 申诉页签：待处理队列（含网页内结案）+ 最近已结案。
- * 结案是二次确认的内联交互：第一次点只展开确认条，确认才发请求。
- */
+type QueueState =
+  | { kind: 'loading' }
+  | { kind: 'failed' }
+  | { kind: 'ready'; page: PanelAppealPage; pending: 'none' | 'refresh' | 'more'; error: string | null }
 
-/** 结案按钮文案与确认提示；撤销伴随权限回滚，确认语写明后果。 */
-const RESOLUTION_TEXT: Record<PanelResolution, { button: string; confirm: string }> = {
-  upheld: { button: '维持原处置', confirm: '确认维持原处理？' },
-  overturned: { button: '撤销并解除限制', confirm: '确认撤销处置，并解除对该用户的限制？' },
-}
+type Notice = { text: string; tone: 'notice' | 'caution' | 'danger' }
 
-export function AppealsTab({
-  initData,
-  onFatal,
-}: {
+export function AppealsTab({ initData, chatId, queue, active, revision, onChanged, onBusyChange, onOpenRule, onFatal }: {
   initData: string
+  chatId: string
+  queue: 'open' | 'resolved'
+  active: boolean
+  revision: number
+  onChanged: () => void
+  onBusyChange: (busy: boolean) => void
+  onOpenRule: (chatId: string, ruleId: string) => void
   onFatal: (error: unknown) => boolean
 }) {
-  const [state, setState] = useState<'loading' | 'failed' | 'ready'>('loading')
-  const [open, setOpen] = useState<PanelAppealDto[]>([])
-  const [resolved, setResolved] = useState<PanelAppealDto[]>([])
-  /** 正在二次确认的卡片；null 表示没有进行中的确认。 */
-  const [confirming, setConfirming] = useState<{ id: string; resolution: PanelResolution } | null>(
-    null,
-  )
-  /** 正在等待接口返回的申诉 id，期间禁用所有结案按钮。 */
+  const [state, setState] = useState<QueueState>({ kind: 'loading' })
+  const [confirming, setConfirming] = useState<{ id: string; resolution: PanelResolution } | null>(null)
   const [resolving, setResolving] = useState<string | null>(null)
-  /** 结案结果提示（rollbackFailed 警告 / 并发冲突后的刷新说明 / 网络错误）。 */
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNotice] = useState<Notice | null>(null)
+  const requestSeq = useRef(0)
+  const reading = useRef(false)
+  const writing = useRef(false)
+  const loadedPages = useRef(1)
+  const loadedKey = useRef('')
+  const updatedAt = useRef(0)
+  const seenRevision = useRef(-1)
 
-  const load = useCallback(async () => {
-    setState('loading')
-    setConfirming(null)
+  const load = useCallback(async (more?: PanelAppealPage['nextBefore']) => {
+    if (reading.current) return
+    const seq = ++requestSeq.current
+    reading.current = true
+    setState((current) => current.kind === 'ready'
+      ? { ...current, pending: more ? 'more' : 'refresh', error: null }
+      : { kind: 'loading' })
     try {
-      // 一次取回（state=all），客户端按状态分组；接口本身按 createdAt 倒序
-      const items = await fetchPanelAppeals(initData, 'all')
-      setOpen(items.filter((a) => a.state === 'open'))
-      setResolved(
-        items
-          .filter((a) => a.state !== 'open')
-          .sort((a, b) => (b.resolvedAt ?? b.createdAt).localeCompare(a.resolvedAt ?? a.createdAt)),
-      )
-      setState('ready')
+      let page: PanelAppealPage = { items: [], nextBefore: null }
+      let cursor = more ?? undefined
+      const pages = more ? 1 : loadedPages.current
+      for (let index = 0; index < pages; index += 1) {
+        const result = await fetchPanelAppeals(initData, {
+          state: queue, ...(chatId === '' ? {} : { chatId }), ...(cursor ? { before: cursor } : {}),
+        })
+        if (seq !== requestSeq.current) return
+        page = { items: [...page.items, ...result.items], nextBefore: result.nextBefore }
+        cursor = result.nextBefore ?? undefined
+        if (cursor === undefined) break
+      }
+      if (more) loadedPages.current += 1
+      updatedAt.current = Date.now()
+      if (seq !== requestSeq.current) return
+      setState((current) => {
+        const previous = more && current.kind === 'ready' ? current.page.items : []
+        const ids = new Set(previous.map((item) => item.id))
+        return { kind: 'ready', page: {
+          items: [...previous, ...page.items.filter((item) => !ids.has(item.id))],
+          nextBefore: page.nextBefore,
+        }, pending: 'none', error: null }
+      })
     } catch (error) {
-      if (!onFatal(error)) setState('failed')
+      if (seq !== requestSeq.current || onFatal(error)) return
+      setState((current) => current.kind === 'ready'
+        ? { ...current, pending: 'none', error: '更新失败，保留当前记录。请重试。' }
+        : { kind: 'failed' })
+    } finally {
+      if (seq === requestSeq.current) reading.current = false
     }
-  }, [initData, onFatal])
+  }, [initData, queue, chatId, onFatal])
 
   useEffect(() => {
-    void load()
-  }, [load])
-
-  const onResolve = useCallback(
-    async (appeal: PanelAppealDto, resolution: PanelResolution) => {
-      if (resolving !== null) return
-      setResolving(appeal.id)
+    const key = `${queue}:${chatId}`
+    if (loadedKey.current !== key) {
+      loadedKey.current = key
+      loadedPages.current = 1
+      updatedAt.current = 0
+      setState({ kind: 'loading' })
+      setConfirming(null)
       setNotice(null)
-      try {
-        const result = await resolvePanelAppeal(appeal.id, initData, resolution)
-        // 成功后本地搬运卡片，不必整单刷新
-        setOpen((list) => list.filter((a) => a.id !== appeal.id))
-        setResolved((list) => [
-          { ...appeal, state: result.state, resolvedAt: new Date().toISOString() },
-          ...list,
-        ])
-        if (result.rollbackFailed) {
-          setNotice('已结案，但解除限制失败：请手动解禁或解封')
-        }
-      } catch (error) {
-        if (error instanceof ConflictError) {
-          // 409：已被处理（含并发结案），以服务端为准刷新列表
-          setNotice('这条申诉刚刚已被处理，列表已刷新。')
-          await load()
-        } else if (error instanceof NotFoundError) {
-          setNotice('这条申诉或关联的处置记录不存在，列表已刷新。')
-          await load()
-        } else if (!onFatal(error)) {
-          setNotice('操作失败，请检查网络后再试一次。')
-        }
-      } finally {
-        setResolving(null)
-        setConfirming(null)
+    }
+    if (active && !writing.current && (Date.now() - updatedAt.current > 30_000 || seenRevision.current !== revision)) {
+      seenRevision.current = revision
+      void load()
+    }
+    return () => {
+      requestSeq.current += 1
+      reading.current = false
+      setState(current => current.kind === 'ready' ? { ...current, pending: 'none' } : current)
+    }
+  }, [load, active, revision, queue, chatId])
+
+  const onResolve = async (appeal: PanelAppealDto, resolution: PanelResolution) => {
+    if (writing.current) return
+    writing.current = true
+    onBusyChange(true)
+    requestSeq.current += 1
+    reading.current = false
+    setState((current) => current.kind === 'ready' ? { ...current, pending: 'none', error: null } : current)
+    setResolving(appeal.id)
+    setNotice(null)
+    const removeFromQueue = async () => {
+      setState((current) => current.kind === 'ready' ? {
+        ...current, page: { ...current.page, items: current.page.items.filter((item) => item.id !== appeal.id) },
+      } : current)
+      if (state.kind === 'ready' && state.page.items.length === 1 && state.page.nextBefore !== null) {
+        await load(state.page.nextBefore)
       }
-    },
-    [initData, resolving, load, onFatal],
-  )
-
-  if (state === 'loading') {
-    return (
-      <div className="tab-pending">
-        <div className="spinner" aria-hidden="true" />
-        <p role="status">正在加载申诉…</p>
-      </div>
-    )
+    }
+    try {
+      const result = await resolvePanelAppeal(appeal.id, initData, resolution)
+      setNotice({ tone: result.rollbackFailed ? 'caution' : 'notice',
+        text: result.rollbackFailed ? '已撤销，解除限制仍待处理，请核实当前权限。'
+          : result.state === 'upheld' ? '已维持原处置。' : '已撤销处置。已删除的消息不会恢复。' })
+      await removeFromQueue()
+      seenRevision.current = revision + 1
+      onChanged()
+    } catch (error) {
+      if (error instanceof ConflictError || error instanceof NotFoundError) {
+        setNotice({ tone: 'caution', text: error instanceof ConflictError
+          ? '这条申诉已被处理，可在已结案中查看结果。' : '记录已不可用，已从当前列表移除。' })
+        await removeFromQueue()
+        seenRevision.current = revision + 1
+      onChanged()
+      } else if (!onFatal(error)) setNotice({ tone: 'danger', text: '操作失败，当前申诉仍保留。请检查网络后重试。' })
+    } finally {
+      writing.current = false
+      onBusyChange(false)
+      setResolving(null)
+      setConfirming(null)
+    }
   }
 
-  if (state === 'failed') {
-    return (
-      <div className="tab-pending">
-        <p>申诉列表没加载出来。</p>
-        <button type="button" className="btn btn-secondary" onClick={() => void load()}>
-          重试
-        </button>
-      </div>
-    )
-  }
-
+  const busy = resolving !== null
+  useEffect(() => { onBusyChange(busy); return () => onBusyChange(false) }, [busy, onBusyChange])
   return (
     <div className="stack">
-      {notice !== null && (
-        <section
-          className="appeal-status"
-          style={{ ['--tone' as string]: 'var(--tone-caution)' }}
-          role="status"
-        >
-          <div>
-            <p>{notice}</p>
-          </div>
-        </section>
-      )}
-
-      {open.length === 0 ? (
-        <p className="empty-state">没有待处理的申诉。</p>
-      ) : (
-        open.map((appeal) => (
-          <OpenAppealCard
-            key={appeal.id}
-            appeal={appeal}
-            confirming={confirming?.id === appeal.id ? confirming.resolution : null}
-            resolving={resolving !== null}
-            onConfirmAsk={(resolution) => setConfirming({ id: appeal.id, resolution })}
-            onCancel={() => setConfirming(null)}
-            onResolve={(resolution) => void onResolve(appeal, resolution)}
-          />
-        ))
-      )}
-
-      {resolved.length > 0 && (
-        <>
-          <h2 className="section-title">最近已结案</h2>
-          {resolved.map((appeal) => (
-            <article className="list-card" key={appeal.id}>
-              <div className="row-between">
-                <span
-                  className="badge"
-                  style={{
-                    ['--tone' as string]:
-                      appeal.state === 'upheld' ? 'var(--tone-danger)' : 'var(--tone-success)',
-                  }}
-                >
-                  {appeal.state === 'upheld' ? '已维持' : '已撤销'}
-                </span>
-                {appeal.resolvedAt !== null && (
-                  <span className="list-time">{formatTime(appeal.resolvedAt)}</span>
-                )}
-              </div>
-              <p className="list-line">
-                {appeal.decision.chatTitle} · 用户 {appeal.userId} · 原处置：
-                {ACTION_LABEL[appeal.decision.action]}
-              </p>
-            </article>
-          ))}
-        </>
-      )}
-    </div>
-  )
-}
-
-function OpenAppealCard({
-  appeal,
-  confirming,
-  resolving,
-  onConfirmAsk,
-  onCancel,
-  onResolve,
-}: {
-  appeal: PanelAppealDto
-  confirming: PanelResolution | null
-  resolving: boolean
-  onConfirmAsk: (resolution: PanelResolution) => void
-  onCancel: () => void
-  onResolve: (resolution: PanelResolution) => void
-}) {
-  return (
-    <article className="list-card">
       <div className="row-between">
-        <span
-          className="badge"
-          style={{ ['--tone' as string]: ACTION_TONE[appeal.decision.action] }}
-        >
-          {ACTION_LABEL[appeal.decision.action]}
-        </span>
-        <span className="list-time">{formatTime(appeal.createdAt)}</span>
+        <p className="list-sub">{queue === 'open' ? '阅读证据后选择维持或撤销。' : '查看已结案申诉及权限恢复状态。'}</p>
+        <button type="button" className="text-btn" disabled={busy || state.kind === 'loading' ||
+          (state.kind === 'ready' && state.pending !== 'none')} onClick={() => void load()}>
+          {state.kind === 'ready' && state.pending === 'refresh' ? '刷新中…' : '刷新'}
+        </button>
       </div>
-      <p className="list-line">
-        {appeal.decision.chatTitle} · 用户 {appeal.userId} · 分数 {appeal.decision.score.toFixed(2)}
-      </p>
-      <div className="field">
-        <p className="label">申诉理由</p>
-        <p className="quote clamp">{appeal.note}</p>
-      </div>
-      {appeal.decision.sampleText !== null && (
-        <div className="field">
-          <p className="label">被处理的内容</p>
-          <p className="quote clamp">{appeal.decision.sampleText}</p>
-        </div>
-      )}
-
-      {confirming === null ? (
-        <div className="btn-row">
-          <button
-            type="button"
-            className="btn btn-secondary"
-            disabled={resolving}
-            onClick={() => onConfirmAsk('upheld')}
-          >
-            {RESOLUTION_TEXT.upheld.button}
-          </button>
-          <button
-            type="button"
-            className="btn"
-            disabled={resolving}
-            onClick={() => onConfirmAsk('overturned')}
-          >
-            {RESOLUTION_TEXT.overturned.button}
-          </button>
-        </div>
-      ) : (
-        <div className="confirm-box">
-          <p className="confirm-text">{RESOLUTION_TEXT[confirming].confirm}</p>
-          <div className="btn-row">
-            <button type="button" className="btn btn-secondary" disabled={resolving} onClick={onCancel}>
-              取消
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={resolving}
-              onClick={() => onResolve(confirming)}
-            >
-              {resolving ? '处理中…' : '确认'}
-            </button>
+      {notice !== null && <section className="appeal-status"
+        style={{ ['--tone' as string]: `var(--tone-${notice.tone})` }}
+        role={notice.tone === 'danger' ? 'alert' : 'status'}><p>{notice.text}</p></section>}
+      {state.kind === 'loading' && <p className="tab-pending" role="status">正在加载申诉…</p>}
+      {state.kind === 'failed' && <div className="tab-pending">
+        <p>申诉列表没加载出来。</p>
+        <button type="button" className="btn btn-secondary" onClick={() => void load()}>重试</button>
+      </div>}
+      {state.kind === 'ready' && <>
+        {state.error !== null && <p className="form-error" role="alert">{state.error}</p>}
+        {state.page.items.length === 0 && <p className="empty-state">
+          {state.page.nextBefore !== null ? '本页已处理完，可继续加载。'
+            : queue === 'open' ? '没有待处理的申诉。' : '没有已结案的申诉。'}
+        </p>}
+        {state.page.items.map((appeal) => <article className="list-card" key={appeal.id}>
+          <div className="row-between">
+            <span className="badge" style={{ ['--tone' as string]: ACTION_TONE[appeal.decision.action] }}>
+              {appeal.state === 'open' ? ACTION_LABEL[appeal.decision.action]
+                : appeal.state === 'upheld' ? '已维持' : '已撤销'}
+            </span>
+            <span className="list-time">{formatTime(appeal.resolvedAt ?? appeal.createdAt)}</span>
           </div>
-        </div>
-      )}
-    </article>
+          <p className="list-line">{appeal.decision.chatTitle} · 用户 {appeal.userId}</p>
+          <p className="list-sub">原处置 {ACTION_LABEL[appeal.decision.action]}</p>
+          <p className="list-sub">{executionText(appeal.decision.execution, appeal.decision.action)}</p>
+          {appeal.rollbackPending && <p className="form-error" role="status">已撤销，解除限制仍待处理。系统会继续尝试，请核实当前权限。</p>}
+          <p className="quote clamp">{appeal.note}</p>
+          <details className="appeal-evidence">
+            <summary>查看完整申诉与消息摘录</summary>
+            <p className="label">申诉理由</p><p className="quote">{appeal.note}</p>
+            <p className="label">判断依据</p>
+            <p className="list-sub">分数 {appeal.decision.score.toFixed(2)}，不代表误判概率。</p>
+            <p className="list-sub">{appeal.decision.llm === null ? '未进行模型复核' : `模型复核 ${VERDICT_LABEL[appeal.decision.llm.verdict] ?? appeal.decision.llm.verdict} · 置信度 ${Math.round(appeal.decision.llm.confidence * 100)}%`}</p>
+            <div className="chips">{appeal.decision.ruleIds.map(id => <button type="button" className="chip" key={id} disabled={busy} onClick={() => onOpenRule(appeal.decision.chatId, id)}>{id}</button>)}</div>
+            <p className="footnote">规则入口展示当前配置，可能与判定时不同。</p>
+            <p className="label">已保存消息摘录</p>
+            <p className="quote">{appeal.decision.sampleText ?? '未保存消息摘录。'}</p>
+          </details>
+          {appeal.state === 'open' && (confirming?.id === appeal.id ? <div className="confirm-box">
+            <p className="confirm-text">{confirming.resolution === 'upheld' ? '确认维持原处置？'
+              : '确认撤销处置？已生效的限制将尝试解除，已删除的消息不会恢复。'}</p>
+            <div className="btn-row">
+              <button type="button" className="btn btn-secondary" disabled={busy} onClick={() => setConfirming(null)}>取消</button>
+              <button type="button" className="btn" disabled={busy} onClick={() => void onResolve(appeal, confirming.resolution)}>
+                {resolving === appeal.id ? '处理中…' : '确认'}
+              </button>
+            </div>
+          </div> : <div className="btn-row">
+            <button type="button" className="btn btn-secondary" disabled={busy}
+              onClick={() => setConfirming({ id: appeal.id, resolution: 'upheld' })}>维持原处置</button>
+            <button type="button" className="btn btn-secondary" disabled={busy}
+              onClick={() => setConfirming({ id: appeal.id, resolution: 'overturned' })}>
+              撤销处置
+            </button>
+          </div>)}
+        </article>)}
+        {state.page.nextBefore !== null && <button type="button" className="btn btn-secondary"
+          disabled={busy || state.pending !== 'none'} onClick={() => void load(state.page.nextBefore)}>
+          {state.pending === 'more' ? '加载中…' : '加载更多'}
+        </button>}
+      </>}
+    </div>
   )
 }

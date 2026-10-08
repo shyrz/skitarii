@@ -51,13 +51,15 @@ export interface PageState<T> {
   nextCursor: string | null
   loadingMore: boolean
   moreFailed: boolean
-  /** 已有首页数据时刷新失败的提示；不清空现有列表。 */
+  refreshing: boolean
+  /** 已有数据时刷新失败的提示；不清空现有列表。 */
   refreshFailed: boolean
 }
 
 export interface LoadableState<T> {
   status: 'idle' | 'loading' | 'ready' | 'failed'
   value: T | null
+  refreshing: boolean
   refreshFailed: boolean
 }
 
@@ -73,6 +75,7 @@ export interface SubscriptionsState {
   notice: OperationNotice | null
   /** 在途操作：非 idle 时频道切换被禁用，保证结果只落发起频道。 */
   operation: OperationKind
+  lastCreatedLink: SubscriptionLinkDto | null
   /** 当前频道的创建意图；不确定时跨刷新保留，需显式放弃才能新建。 */
   createIntent: CreateIntent | null
   /** sessionStorage 不可用或写入失败时的降级提示。 */
@@ -103,7 +106,7 @@ function idlePage<T>(): PageState<T> {
     nextCursor: null,
     loadingMore: false,
     moreFailed: false,
-    refreshFailed: false,
+    refreshing: false, refreshFailed: false,
   }
 }
 
@@ -139,11 +142,12 @@ export class SubscriptionsModel {
   private state: SubscriptionsState = {
     channels: loadingPage(),
     chatId: null,
-    details: { status: 'idle', value: null, refreshFailed: false },
+    details: { status: 'idle', value: null, refreshing: false, refreshFailed: false },
     links: idlePage(),
     members: idlePage(),
     notice: null,
     operation: 'idle',
+    lastCreatedLink: null,
     createIntent: null,
     intentStorageDegraded: false,
   }
@@ -152,6 +156,9 @@ export class SubscriptionsModel {
 
   /** 每个加载链的请求序号：换频道或重新发起时递增，旧响应据此丢弃。 */
   private readonly guards = { channels: 0, details: 0, links: 0, members: 0 }
+
+  private readonly reading = { channels: 0, details: 0, links: 0, members: 0 }
+  private readonly loadedPages = { links: 1, members: 1 }
 
   private readonly pageSize: number
   private readonly storage: IntentStorage | null
@@ -210,15 +217,18 @@ export class SubscriptionsModel {
   selectChannel(chatId: string): void {
     if (this.state.operation !== 'idle') return
     if (chatId === this.state.chatId) return
+    this.loadedPages.links = 1
+    this.loadedPages.members = 1
     this.guards.details += 1
     this.guards.links += 1
     this.guards.members += 1
     this.patch({
       chatId,
       notice: null,
-      details: { status: 'loading', value: null, refreshFailed: false },
+      details: { status: 'loading', value: null, refreshing: false, refreshFailed: false },
       links: loadingPage(),
       members: loadingPage(),
+      lastCreatedLink: null,
       createIntent: loadStoredIntent(this.storage, this.intentKey(chatId), chatId),
     })
     void this.loadDetails(chatId)
@@ -308,7 +318,9 @@ export class SubscriptionsModel {
           },
         })
       }
-      this.refreshAfterLinkChange(chatId)
+      this.acceptLink(result.link)
+      this.patch({ lastCreatedLink: result.link })
+      void this.loadDetails(chatId)
       return result.replayed ? 'replayed' : 'created'
     } catch (error) {
       if (this.onFatal(error)) return 'failed'
@@ -337,14 +349,14 @@ export class SubscriptionsModel {
     if (chatId === null || link.chatId !== chatId || this.state.operation !== 'idle') return false
     this.patch({ operation: 'renaming', notice: null })
     try {
-      await this.api.renameLink(chatId, link.id, this.initData, {
+      const updated = await this.api.renameLink(chatId, link.id, this.initData, {
         name,
         expectedVersion: link.version,
       })
       if (this.state.chatId === chatId) {
         this.patch({ notice: { tone: 'success', text: RENAME_SUCCESS_TEXT } })
       }
-      this.refreshAfterLinkChange(chatId)
+      this.acceptLink(updated)
       return true
     } catch (error) {
       return this.handleMutationFailure(error, 'rename', chatId)
@@ -358,13 +370,13 @@ export class SubscriptionsModel {
     if (chatId === null || link.chatId !== chatId || this.state.operation !== 'idle') return false
     this.patch({ operation: 'revoking', notice: null })
     try {
-      await this.api.revokeLink(chatId, link.id, this.initData, {
+      const updated = await this.api.revokeLink(chatId, link.id, this.initData, {
         expectedVersion: link.version,
       })
       if (this.state.chatId === chatId) {
         this.patch({ notice: { tone: 'success', text: REVOKE_SUCCESS_TEXT } })
       }
-      this.refreshAfterLinkChange(chatId)
+      this.acceptLink(updated)
       return true
     } catch (error) {
       return this.handleMutationFailure(error, 'revoke', chatId)
@@ -421,7 +433,7 @@ export class SubscriptionsModel {
   }
 
   /**
-   * 操作成功后：链接首页刷新重置分页，counts（频道详情）独立重读。
+   * 冲突或未知结果后重新读取已加载的链接页，详情独立重读。
    * 传 expectedChatId 时只在仍停留在该频道才刷新，避免操作途中切频道后刷错列表。
    */
   refreshAfterLinkChange(expectedChatId?: string): void {
@@ -432,15 +444,28 @@ export class SubscriptionsModel {
     void this.loadDetails(chatId)
   }
 
+  private acceptLink(link: SubscriptionLinkDto): void {
+    this.guards.links += 1
+    const current = this.state.links
+    const existing = current.items.some(item => item.id === link.id)
+    if (this.state.lastCreatedLink?.id === link.id) this.patch({ lastCreatedLink: link.state === 'active' ? link : null })
+    this.patch({ links: { ...current, status: 'ready', loadingMore: false, refreshing: false, refreshFailed: false,
+      items: existing ? current.items.map(item => item.id === link.id && item.version <= link.version ? link : item) : [link, ...current.items],
+    } })
+    if (current.status !== 'ready') this.loadLinks(link.chatId, 'refresh')
+  }
+
   private async loadChannels(mode: PageMode): Promise<void> {
+    if (this.reading.channels !== 0 && this.reading.channels === this.guards.channels) return
     const current = this.state.channels
     const cursor = mode === 'more' ? current.nextCursor ?? undefined : undefined
     const seq = ++this.guards.channels
+    this.reading.channels = seq
     this.patch({
       channels:
         mode === 'initial'
           ? loadingPage()
-          : { ...current, loadingMore: mode === 'more', moreFailed: false, refreshFailed: false },
+          : { ...current, loadingMore: mode === 'more', moreFailed: false, refreshing: mode === 'refresh', refreshFailed: false },
     })
     try {
       const page = await this.api.fetchChannels(this.initData, withCursor(this.pageSize, cursor))
@@ -456,7 +481,7 @@ export class SubscriptionsModel {
           nextCursor: page.nextCursor,
           loadingMore: false,
           moreFailed: false,
-          refreshFailed: false,
+          refreshing: false, refreshFailed: false,
         },
       })
     } catch (error) {
@@ -469,27 +494,29 @@ export class SubscriptionsModel {
           status: mode === 'initial' ? 'failed' : 'ready',
           loadingMore: false,
           moreFailed: mode === 'more',
-          refreshFailed: mode === 'refresh',
+          refreshing: false, refreshFailed: mode === 'refresh',
         },
       })
-    }
+    } finally { if (this.reading.channels === seq) this.reading.channels = 0 }
   }
 
   private async loadDetails(chatId: string): Promise<void> {
+    if (this.reading.details !== 0 && this.reading.details === this.guards.details) return
     const seq = ++this.guards.details
+    this.reading.details = seq
     const previous = this.state.details.value
     // 刷新时保留旧值展示；失败也不清空 counts，只标记 refreshFailed
     this.patch({
       details: {
         status: previous === null ? 'loading' : 'ready',
         value: previous,
-        refreshFailed: false,
+        refreshing: true, refreshFailed: false,
       },
     })
     try {
       const details = await this.api.fetchChannelDetails(chatId, this.initData)
       if (seq !== this.guards.details) return
-      this.patch({ details: { status: 'ready', value: details, refreshFailed: false } })
+      this.patch({ details: { status: 'ready', value: details, refreshing: false, refreshFailed: false } })
     } catch (error) {
       if (seq !== this.guards.details) return
       if (this.onFatal(error)) return
@@ -497,10 +524,10 @@ export class SubscriptionsModel {
         details: {
           status: previous === null ? 'failed' : 'ready',
           value: previous,
-          refreshFailed: previous !== null,
+          refreshing: false, refreshFailed: previous !== null,
         },
       })
-    }
+    } finally { if (this.reading.details === seq) this.reading.details = 0 }
   }
 
   private loadLinks(chatId: string, mode: PageMode): void {
@@ -508,7 +535,11 @@ export class SubscriptionsModel {
       'links',
       mode,
       () => this.state.links,
-      (page) => this.patch({ links: page }),
+      (page) => {
+        const created = this.state.lastCreatedLink
+        const current = created === null ? null : page.items.find(link => link.id === created.id)
+        this.patch({ links: page, lastCreatedLink: current === undefined ? created : current?.state === 'active' ? current : null })
+      },
       (cursor) => this.api.fetchLinks(chatId, this.initData, withCursor(this.pageSize, cursor)),
     )
   }
@@ -536,17 +567,27 @@ export class SubscriptionsModel {
     write: (page: PageState<T>) => void,
     fetchPage: (cursor: string | undefined) => Promise<SubscriptionPage<T>>,
   ): Promise<void> {
+    if (this.reading[key] !== 0 && this.reading[key] === this.guards[key]) return
     const current = read()
-    const cursor = mode === 'more' ? current.nextCursor ?? undefined : undefined
+    let cursor = mode === 'more' ? current.nextCursor ?? undefined : undefined
     const seq = ++this.guards[key]
+    this.reading[key] = seq
     write(
       mode === 'initial'
         ? loadingPage<T>()
-        : { ...current, loadingMore: mode === 'more', moreFailed: false, refreshFailed: false },
+        : { ...current, loadingMore: mode === 'more', moreFailed: false, refreshing: mode === 'refresh', refreshFailed: false },
     )
     try {
-      const page = await fetchPage(cursor)
-      if (seq !== this.guards[key]) return
+      let page: SubscriptionPage<T> = { items: [], nextCursor: null, serverTime: '' }
+      const count = mode === 'refresh' ? this.loadedPages[key] : 1
+      for (let index = 0; index < count; index += 1) {
+        const result = await fetchPage(cursor)
+        if (seq !== this.guards[key]) return
+        page = { ...result, items: mergeItemsById(page.items, result.items) }
+        cursor = result.nextCursor ?? undefined
+        if (cursor === undefined) break
+      }
+      if (mode === 'more') this.loadedPages[key] += 1
       const before = read()
       write({
         status: 'ready',
@@ -554,7 +595,7 @@ export class SubscriptionsModel {
         nextCursor: page.nextCursor,
         loadingMore: false,
         moreFailed: false,
-        refreshFailed: false,
+        refreshing: false, refreshFailed: false,
       })
     } catch (error) {
       if (seq !== this.guards[key]) return
@@ -565,8 +606,8 @@ export class SubscriptionsModel {
         status: mode === 'initial' ? 'failed' : 'ready',
         loadingMore: false,
         moreFailed: mode === 'more',
-        refreshFailed: mode === 'refresh',
+        refreshing: false, refreshFailed: mode === 'refresh',
       })
-    }
+    } finally { if (this.reading[key] === seq) this.reading[key] = 0 }
   }
 }

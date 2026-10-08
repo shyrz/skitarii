@@ -84,6 +84,7 @@ export async function getAppeal(
       decision: {
         id: decision.id,
         action: decision.action.kind,
+        execution: decision.execution,
         actionUntil: decision.action.kind === 'mute' ? decision.action.until : null,
         chatTitle: context.chatTitle,
         createdAt: decision.decidedAt,
@@ -131,6 +132,7 @@ export async function createAppeal(deps: AppealApiDeps, body: unknown): Promise<
     note: parsed.data.reason,
     createdAt: now(),
     resolvedAt: null,
+    rollbackPending: false,
   }
 
   await deps.repos.appeals.insert(appeal)
@@ -249,6 +251,7 @@ function serializeAppeal(appeal: Appeal): {
   reason: string | null
   createdAt: Date
   resolvedAt: Date | null
+  rollbackPending: boolean
 } {
   return {
     id: appeal.id,
@@ -256,5 +259,6 @@ function serializeAppeal(appeal: Appeal): {
     reason: appeal.note,
     createdAt: appeal.createdAt,
     resolvedAt: appeal.resolvedAt,
+    rollbackPending: appeal.rollbackPending,
   }
 }

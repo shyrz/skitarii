@@ -1,0 +1,3 @@
+CREATE INDEX "appeals_created_cursor_idx" ON "appeals" USING btree ("created_at" DESC NULLS LAST,"id" DESC NULLS LAST);--> statement-breakpoint
+CREATE INDEX "appeals_state_created_cursor_idx" ON "appeals" USING btree ("state","created_at" DESC NULLS LAST,"id" DESC NULLS LAST);--> statement-breakpoint
+CREATE INDEX "appeals_resolved_cursor_idx" ON "appeals" USING btree ("resolved_at" DESC NULLS LAST,"id" DESC NULLS LAST) WHERE "appeals"."resolved_at" is not null;

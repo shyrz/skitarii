@@ -201,13 +201,13 @@ describe('面板接口客户端', () => {
     )
     vi.stubGlobal('fetch', spy)
 
-    const items = await fetchPanelAppeals('i', 'all', 10)
+    const page = await fetchPanelAppeals('i', { state: 'all', limit: 10 })
 
     expect(String((spy.mock.calls[0] as unknown[])[0])).toBe(
       '/api/panel/appeals?initData=i&state=all&limit=10',
     )
-    expect(items).toHaveLength(1)
-    expect(items[0]?.decision.chatTitle).toBe('测试群')
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0]?.decision.chatTitle).toBe('测试群')
   })
 
   test('结案：POST body 携带 initData 与 resolution，解析 rollbackFailed', async () => {

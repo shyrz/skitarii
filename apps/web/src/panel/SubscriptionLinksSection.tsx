@@ -12,19 +12,15 @@ import {
   formatPriceLine,
   linkDisplayName,
   linkStateNotice,
-  renameConfirmText,
   validateCreateDraft,
 } from './subscriptions.js'
 import type { CreateSubmitResult, PageState } from './subscriptions-model.js'
 import { formatTime } from './util.js'
 
-/**
- * 链接区：创建表单（二次确认 + 不确定意图处理）、链接列表（复制/改名/撤销各自二次确认）。
- * 确认框、输入草稿、复制反馈都是本组件局部状态；父级用 key=chatId 重挂载，
- * 换频道时自动清空，不需要父级代为清理。
- */
 export function SubscriptionLinksSection({
   channelTitle,
+  createdLink,
+  canWrite,
   links,
   createIntent,
   busy,
@@ -37,6 +33,8 @@ export function SubscriptionLinksSection({
   onLoadMore,
 }: {
   channelTitle: string
+  createdLink: SubscriptionLinkDto | null
+  canWrite: boolean
   links: PageState<SubscriptionLinkDto>
   createIntent: CreateIntent | null
   busy: boolean
@@ -48,16 +46,13 @@ export function SubscriptionLinksSection({
   onRetry: () => void
   onLoadMore: () => void
 }) {
+  const [formOpen, setFormOpen] = useState(false)
   const [formName, setFormName] = useState('')
   const [formPrice, setFormPrice] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingCreate, setConfirmingCreate] = useState(false)
   const [confirmingDiscard, setConfirmingDiscard] = useState(false)
   const [renaming, setRenaming] = useState<{ linkId: string; draft: string } | null>(null)
-  const [confirmingRename, setConfirmingRename] = useState<{
-    link: SubscriptionLinkDto
-    name: string
-  } | null>(null)
   const [confirmingRevoke, setConfirmingRevoke] = useState<SubscriptionLinkDto | null>(null)
   const [copyState, setCopyState] = useState<Record<string, 'ok' | 'failed'>>({})
 
@@ -90,27 +85,19 @@ export function SubscriptionLinksSection({
       setFormName('')
       setFormPrice('')
       setFormError(null)
+      setFormOpen(false)
     }
     setConfirmingCreate(false)
   }
 
   const askRename = (link: SubscriptionLinkDto) => {
     setRenaming({ linkId: link.id, draft: link.name })
-    setConfirmingRename(null)
     setConfirmingRevoke(null)
   }
 
-  const nextRename = (link: SubscriptionLinkDto) => {
+  const saveRename = async (link: SubscriptionLinkDto) => {
     if (renaming === null || [...renaming.draft].length > 32) return
-    setConfirmingRename({ link, name: renaming.draft })
-    setRenaming(null)
-  }
-
-  const confirmRename = async () => {
-    if (confirmingRename === null) return
-    await onRename(confirmingRename.link, confirmingRename.name)
-    setRenaming(null)
-    setConfirmingRename(null)
+    if (await onRename(link, renaming.draft)) setRenaming(null)
   }
 
   const confirmRevoke = async () => {
@@ -132,15 +119,16 @@ export function SubscriptionLinksSection({
         <button
           type="button"
           className="text-btn"
-          disabled={busy || links.status === 'loading'}
+          disabled={busy || links.status === 'loading' || links.refreshing || links.loadingMore}
           onClick={onRefresh}
         >
           刷新
         </button>
       </div>
 
-      <article className="card" aria-label="创建订阅链接">
-        <h3 className="section-title">创建订阅链接</h3>
+      {createdLink !== null && <div className="card" role="status"><p>{createdLink.state === 'active' ? '链接已创建，可以复制分享。' : `已确认原请求，链接当前${LINK_STATE_LABEL[createdLink.state]}。`}</p><p className="link-url">{createdLink.inviteLink}</p>{createdLink.state === 'active' && <button type="button" className="btn" onClick={() => void copyLink(createdLink)}>复制新链接</button>}{copyState[createdLink.id] === 'ok' && <p>已复制</p>}{copyState[createdLink.id] === 'failed' && <p>复制失败，请选择上面的链接文本复制。</p>}</div>}
+      <details className="card" open={formOpen || intentUncertain} onToggle={event => setFormOpen(event.currentTarget.open)}><summary>新建订阅链接</summary>
+      <article aria-label="创建订阅链接">
         <div className="field">
           <label className="label" htmlFor="subscription-link-name">
             链接名称（可留空，最多 32 个字符）
@@ -149,7 +137,7 @@ export function SubscriptionLinksSection({
             id="subscription-link-name"
             className="input"
             value={formName}
-            disabled={busy || confirmingCreate}
+            disabled={busy || !canWrite || intentUncertain || confirmingCreate}
             onChange={(event) => setFormName(event.target.value)}
           />
           <p className={nameLength > 32 ? 'counter over' : 'counter'}>{nameLength}/32</p>
@@ -168,7 +156,7 @@ export function SubscriptionLinksSection({
             step={1}
             placeholder="1..10000"
             value={formPrice}
-            disabled={busy || confirmingCreate}
+            disabled={busy || !canWrite || intentUncertain || confirmingCreate}
             onChange={(event) => setFormPrice(event.target.value)}
           />
         </div>
@@ -196,13 +184,13 @@ export function SubscriptionLinksSection({
               >
                 取消
               </button>
-              <button type="button" className="btn" disabled={busy} onClick={() => void confirmCreate()}>
+              <button type="button" className="btn" disabled={busy || !canWrite || intentUncertain} onClick={() => void confirmCreate()}>
                 {busy ? '创建中…' : '确认创建'}
               </button>
             </div>
           </div>
         ) : (
-          <button type="button" className="btn" disabled={busy} onClick={askCreate}>
+          <button type="button" className="btn" disabled={busy || !canWrite || intentUncertain} onClick={askCreate}>
             创建链接
           </button>
         )}
@@ -236,9 +224,16 @@ export function SubscriptionLinksSection({
           ) : (
             <div className="confirm-box">
               <p className="confirm-text">
-                有一个结果不确定的创建请求。请先用同一请求重试（不会重复创建），或核查后放弃它。
+                上次创建结果尚未确认。检查结果会使用原请求，不会重新创建链接。
               </p>
+              {createIntent !== null && <p className="list-sub">
+                {linkDisplayName(createIntent.payload.name)} · {formatPriceLine(createIntent.payload.priceStars)}
+              </p>}
               <div className="btn-row">
+                <button type="button" className="btn" disabled={busy}
+                  onClick={() => {
+                    if (createIntent !== null) void onCreate(createIntent.payload.name, createIntent.payload.priceStars)
+                  }}>检查上次结果</button>
                 <button
                   type="button"
                   className="btn btn-secondary"
@@ -250,7 +245,7 @@ export function SubscriptionLinksSection({
               </div>
             </div>
           ))}
-      </article>
+      </article></details>
 
       {links.status === 'loading' && links.items.length === 0 && (
         <div className="tab-pending">
@@ -276,8 +271,8 @@ export function SubscriptionLinksSection({
           key={link.id}
           link={link}
           busy={busy}
+          canWrite={canWrite}
           renaming={renaming?.linkId === link.id ? renaming.draft : null}
-          confirmingRenameName={confirmingRename?.link.id === link.id ? confirmingRename.name : null}
           confirmingRevoke={confirmingRevokeLinkId === link.id}
           copyState={copyState[link.id] ?? null}
           onRenameAsk={() => askRename(link)}
@@ -285,12 +280,9 @@ export function SubscriptionLinksSection({
             setRenaming((current) => (current === null ? current : { ...current, draft }))
           }
           onCancelRename={() => setRenaming(null)}
-          onRenameNext={() => nextRename(link)}
-          onRenameCancelConfirm={() => setConfirmingRename(null)}
-          onRenameConfirm={() => void confirmRename()}
+          onRenameSave={() => void saveRename(link)}
           onRevokeAsk={() => {
             setConfirmingRevoke(link)
-            setConfirmingRename(null)
             setRenaming(null)
           }}
           onRevokeCancel={() => setConfirmingRevoke(null)}
@@ -305,7 +297,7 @@ export function SubscriptionLinksSection({
           <button
             type="button"
             className="btn btn-secondary"
-            disabled={links.loadingMore}
+            disabled={links.loadingMore || links.refreshing}
             onClick={onLoadMore}
           >
             {links.loadingMore ? '加载中…' : '加载更多链接'}
@@ -319,16 +311,14 @@ export function SubscriptionLinksSection({
 function LinkCard({
   link,
   busy,
+  canWrite,
   renaming,
-  confirmingRenameName,
   confirmingRevoke,
   copyState,
   onRenameAsk,
+  onRenameSave,
   onRenameDraft,
   onCancelRename,
-  onRenameNext,
-  onRenameCancelConfirm,
-  onRenameConfirm,
   onRevokeAsk,
   onRevokeCancel,
   onRevokeConfirm,
@@ -336,16 +326,14 @@ function LinkCard({
 }: {
   link: SubscriptionLinkDto
   busy: boolean
+  canWrite: boolean
   renaming: string | null
-  confirmingRenameName: string | null
   confirmingRevoke: boolean
   copyState: 'ok' | 'failed' | null
+  onRenameSave: () => void
   onRenameAsk: () => void
   onRenameDraft: (draft: string) => void
   onCancelRename: () => void
-  onRenameNext: () => void
-  onRenameCancelConfirm: () => void
-  onRenameConfirm: () => void
   onRevokeAsk: () => void
   onRevokeCancel: () => void
   onRevokeConfirm: () => void
@@ -382,15 +370,15 @@ function LinkCard({
                   <span className="list-sub">复制失败，请长按或手动选择上面的链接文本。</span>
                 )}
               </div>
-              {renaming === null && confirmingRenameName === null && !confirmingRevoke && (
+              {renaming === null && !confirmingRevoke && (
                 <div className="inline-actions">
-                  <button type="button" className="text-btn" disabled={busy} onClick={onRenameAsk}>
+                  <button type="button" className="text-btn" disabled={busy || !canWrite} onClick={onRenameAsk}>
                     改名
                   </button>
                   <button
                     type="button"
                     className="text-btn danger"
-                    disabled={busy}
+                    disabled={busy || !canWrite}
                     onClick={onRevokeAsk}
                   >
                     撤销
@@ -407,41 +395,22 @@ function LinkCard({
           <input
             className="input"
             value={renaming}
-            disabled={busy}
+            disabled={busy || !canWrite}
             onChange={(event) => onRenameDraft(event.target.value)}
             aria-label="新的链接名称"
           />
           <p className={renameTooLong ? 'counter over' : 'counter'}>{[...renaming].length}/32</p>
           <div className="btn-row">
-            <button type="button" className="btn btn-secondary" disabled={busy} onClick={onCancelRename}>
+            <button type="button" className="btn btn-secondary" disabled={busy || !canWrite} onClick={onCancelRename}>
               取消
             </button>
             <button
               type="button"
               className="btn"
-              disabled={busy || renameTooLong}
-              onClick={onRenameNext}
+              disabled={busy || !canWrite || renameTooLong}
+              onClick={onRenameSave}
             >
-              下一步
-            </button>
-          </div>
-        </div>
-      )}
-
-      {confirmingRenameName !== null && (
-        <div className="confirm-box">
-          <p className="confirm-text">{renameConfirmText(link.name, confirmingRenameName)}</p>
-          <div className="btn-row">
-            <button
-              type="button"
-              className="btn btn-secondary"
-              disabled={busy}
-              onClick={onRenameCancelConfirm}
-            >
-              取消
-            </button>
-            <button type="button" className="btn" disabled={busy} onClick={onRenameConfirm}>
-              {busy ? '保存中…' : '确认改名'}
+              {busy ? '保存中…' : '保存名称'}
             </button>
           </div>
         </div>
@@ -451,10 +420,10 @@ function LinkCard({
         <div className="confirm-box">
           <p className="confirm-text">{REVOKE_CONFIRM_TEXT}</p>
           <div className="btn-row">
-            <button type="button" className="btn btn-secondary" disabled={busy} onClick={onRevokeCancel}>
+            <button type="button" className="btn btn-secondary" disabled={busy || !canWrite} onClick={onRevokeCancel}>
               取消
             </button>
-            <button type="button" className="btn" disabled={busy} onClick={onRevokeConfirm}>
+            <button type="button" className="btn" disabled={busy || !canWrite} onClick={onRevokeConfirm}>
               {busy ? '撤销中…' : '确认撤销'}
             </button>
           </div>

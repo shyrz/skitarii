@@ -43,7 +43,7 @@ export function SubscriptionChannelDetails({
     <article className="card" aria-label="频道详情">
       <div className="row-between">
         <h2 className="section-title">{value.title}</h2>
-        <span className="chip">ID {value.chatId}</span>
+
       </div>
       <div className="field">
         <p className="label">频道可见性</p>
@@ -52,19 +52,9 @@ export function SubscriptionChannelDetails({
       <div className="field">
         <p className="label">机器人的链接管理能力</p>
         <p className="value">
-          {value.canManageLinks ? '可用' : '不可用'}
-          {value.capabilityErrorCode !== null ? `（检查失败：${value.capabilityErrorCode}）` : ''}
+          {value.canManageLinks ? '可以管理链接' : value.capabilityErrorCode === 'bot_permission_required' ? '权限不足，请在 Telegram 为机器人开启邀请用户权限后刷新' : '能力尚未确认，请重新检查'}
         </p>
       </div>
-      {value.linkedChatId !== null && (
-        <div className="field">
-          <p className="label">关联讨论组</p>
-          <p className="value">ID {value.linkedChatId}（仅作信息展示）</p>
-        </div>
-      )}
-      <p className="list-sub">
-        能力检查时间 {formatTime(value.capabilityCheckedAt)} · 数据快照 {formatTime(value.serverTime)}
-      </p>
       {details.refreshFailed && (
         <p className="form-error">详情刷新失败，下面是上次的检查结果。</p>
       )}
@@ -79,6 +69,16 @@ export function SubscriptionChannelDetails({
         </div>
       )}
 
+      <details><summary>技术信息与观测计数</summary><p className="list-sub">频道 ID {value.chatId}</p><p className="list-sub">检查代码 {value.capabilityErrorCode ?? '无'}</p>
+      {value.linkedChatId !== null && (
+        <div className="field">
+          <p className="label">关联讨论组</p>
+          <p className="value">ID {value.linkedChatId}（仅作信息展示）</p>
+        </div>
+      )}
+      <p className="list-sub">
+        能力检查时间 {formatTime(value.capabilityCheckedAt)} · 数据快照 {formatTime(value.serverTime)}
+      </p>
       <h3 className="section-title" style={{ marginTop: 16 }}>
         成员观测计数
       </h3>
@@ -95,8 +95,9 @@ export function SubscriptionChannelDetails({
       </div>
       <p className="list-sub">计数是观测台账的独立汇总，不代表付费会员总数或收入。</p>
 
-      <button type="button" className="btn btn-secondary" onClick={onRefresh}>
-        刷新详情与计数
+      </details>
+      <button type="button" className="btn btn-secondary" disabled={details.refreshing} onClick={onRefresh}>
+        {details.refreshing ? '检查中…' : '重新检查权限与计数'}
       </button>
     </article>
   )

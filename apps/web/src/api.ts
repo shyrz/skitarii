@@ -11,11 +11,14 @@
  * - 其余（网络失败、5xx、异常响应）：可重试。
  */
 
+import type { ExecutionResult } from '@skitarii/core'
+
 export type DecisionAction = 'warn' | 'delete' | 'mute' | 'ban'
 
 export interface DecisionDto {
   id: string
   action: DecisionAction
+  execution: ExecutionResult
   chatTitle: string
   createdAt: string
   sampleText: string
@@ -29,6 +32,7 @@ export interface AppealDto {
   reason: string | null
   createdAt: string
   resolvedAt: string | null
+  rollbackPending: boolean
 }
 
 export interface AppealView {
@@ -121,6 +125,8 @@ export interface DailyCountsDto {
 export interface PanelChatDto {
   chatId: string
   title: string
+  chatType: 'group' | 'supergroup' | 'channel'
+  linkedChatId: string | null
   today: DailyCountsDto
   last7d: DailyCountsDto
   openAppeals: number
@@ -129,6 +135,12 @@ export interface PanelChatDto {
 export interface PanelOverviewDto {
   totals: { today: DailyCountsDto; last7d: DailyCountsDto }
   chats: PanelChatDto[]
+  attention: {
+    executionIssues: Pick<PanelDecisionDto, 'id' | 'chatId' | 'userId' | 'execution' | 'action'>[]
+    moreExecutionIssues: boolean
+    pendingRollbackCount: number
+    morePendingRollback: boolean
+  }
   serverTime: string
 }
 
@@ -155,6 +167,7 @@ export interface PanelDecisionDto {
   actionUntil: string | null
   score: number
   executed: boolean
+  execution: ExecutionResult
   decidedAt: string
   ruleIds: string[]
   llm: { verdict: string; confidence: number } | null
@@ -181,7 +194,24 @@ export interface PanelDecisionFilter {
   limit?: number
 }
 
-export type PanelAppealStateFilter = AppealStateDto | 'all'
+export type PanelAppealStateFilter = AppealStateDto | 'resolved' | 'all'
+
+export interface PanelAppealCursor {
+  at: string
+  id: string
+}
+
+export interface PanelAppealFilter {
+  state?: PanelAppealStateFilter
+  chatId?: string
+  before?: PanelAppealCursor
+  limit?: number
+}
+
+export interface PanelAppealPage {
+  items: PanelAppealDto[]
+  nextBefore: PanelAppealCursor | null
+}
 
 export interface PanelAppealDto {
   id: string
@@ -191,11 +221,15 @@ export interface PanelAppealDto {
   note: string
   createdAt: string
   resolvedAt: string | null
+  rollbackPending: boolean
   decision: {
     id: string
     action: PanelDecisionAction
+    execution: ExecutionResult
     actionUntil: string | null
     score: number
+    ruleIds: string[]
+    llm: PanelDecisionDto['llm']
     chatId: string
     chatTitle: string
     sampleText: string | null
@@ -230,9 +264,11 @@ export async function fetchPanelSeries(
   chatId: string,
   days: number,
   initData: string,
+  signal?: AbortSignal,
 ): Promise<PanelSeriesDto> {
   const res = await fetch(
     `/api/panel/chats/${encodeURIComponent(chatId)}/series?${panelQuery(initData, { days })}`,
+    signal === undefined ? undefined : { signal },
   )
   if (!res.ok) throwForStatus(res)
   return (await res.json()) as PanelSeriesDto
@@ -241,6 +277,7 @@ export async function fetchPanelSeries(
 export async function fetchPanelDecisions(
   initData: string,
   filter: PanelDecisionFilter = {},
+  signal?: AbortSignal,
 ): Promise<PanelDecisionPage> {
   const query = panelQuery(initData, {
     chatId: filter.chatId,
@@ -250,20 +287,24 @@ export async function fetchPanelDecisions(
     before: filter.before?.decidedAt,
     beforeId: filter.before?.id,
   })
-  const res = await fetch(`/api/panel/decisions?${query}`)
+  const res = await fetch(`/api/panel/decisions?${query}`, signal === undefined ? undefined : { signal })
   if (!res.ok) throwForStatus(res)
   return (await res.json()) as PanelDecisionPage
 }
 
 export async function fetchPanelAppeals(
   initData: string,
-  state: PanelAppealStateFilter = 'open',
-  limit = 50,
-): Promise<PanelAppealDto[]> {
-  const res = await fetch(`/api/panel/appeals?${panelQuery(initData, { state, limit })}`)
+  filter: PanelAppealFilter = {},
+): Promise<PanelAppealPage> {
+  const res = await fetch(`/api/panel/appeals?${panelQuery(initData, {
+    state: filter.state ?? 'open',
+    limit: filter.limit ?? 50,
+    chatId: filter.chatId,
+    before: filter.before?.at,
+    beforeId: filter.before?.id,
+  })}`)
   if (!res.ok) throwForStatus(res)
-  const body = (await res.json()) as { items: PanelAppealDto[] }
-  return body.items
+  return (await res.json()) as PanelAppealPage
 }
 
 export async function resolvePanelAppeal(
@@ -413,6 +454,7 @@ export interface SubscriptionMemberDto {
   chatId: string
   userId: number
   linkId: string | null
+  linkName: string | null
   state: SubscriptionMemberState
   expiresAt: string | null
   /** 纳入台账的最近肯定证据；不代表当前付款或当前链路。 */

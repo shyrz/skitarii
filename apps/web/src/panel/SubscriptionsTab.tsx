@@ -1,4 +1,5 @@
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useImperativeHandle, useState, useSyncExternalStore } from 'react'
+import type { Ref } from 'react'
 import { subscriptionsApi } from '../api.js'
 import { getWebApp } from '../telegram.js'
 import { SubscriptionChannelDetails } from './SubscriptionChannelDetails.js'
@@ -10,7 +11,6 @@ import {
   INTENT_STORAGE_DEGRADED_NOTICE,
   OBSERVATION_DISCLAIMER,
   browserIntentStorage,
-  indexLinkNames,
   resolveIntentScope,
 } from './subscriptions.js'
 import type { NoticeTone } from './subscriptions.js'
@@ -26,14 +26,25 @@ const TONE_VAR: Record<NoticeTone, string> = {
   danger: 'var(--tone-danger)',
 }
 
+export interface SubscriptionsHandle {
+  selectChannel(chatId: string): boolean
+}
+
 export function SubscriptionsTab({
   initData,
   onFatal,
+  ref,
+  onOpenDiscussion,
+  onSelected,
 }: {
   initData: string
   /** 401/403 上升到整屏状态；返回 true 表示已接管，本页不要再画局部错误。 */
   onFatal: (error: unknown) => boolean
+  ref?: Ref<SubscriptionsHandle>
+  onOpenDiscussion: (chatId: string) => void
+  onSelected: (chatId: string) => void
 }) {
+  const [section, setSection] = useState<'links' | 'members'>('links')
   const [model] = useState(
     () =>
       new SubscriptionsModel(subscriptionsApi, initData, onFatal, {
@@ -43,15 +54,32 @@ export function SubscriptionsTab({
   )
   const state = useSyncExternalStore(model.subscribe, model.getState)
 
+  const selectChannel = (chatId: string): boolean => {
+    if (model.getState().operation !== 'idle') return false
+    model.selectChannel(chatId)
+    setSection('links')
+    onSelected(chatId)
+    return true
+  }
+  useImperativeHandle(ref, () => ({ selectChannel }))
+
   useEffect(() => {
     // 幂等；页签挂载后由 PanelApp 保持常驻，不随切换卸载
     model.start()
   }, [model])
 
+  useEffect(() => {
+    if (state.chatId === null && state.channels.status === 'ready' && state.channels.nextCursor === null && state.channels.items.length === 1) {
+      selectChannel(state.channels.items[0]!.chatId)
+    }
+  }, [state.chatId, state.channels])
+
   const busy = state.operation !== 'idle'
 
   return (
     <div className="stack">
+      {state.details.value?.linkedChatId != null && <button type="button" className="text-btn"
+        onClick={() => { const id = state.details.value?.linkedChatId; if (id != null) onOpenDiscussion(id) }}>管理关联讨论组审核</button>}
       <div className="notice-banner" style={{ ['--tone' as string]: 'var(--tone-notice)' }}>
         <span className="notice-dot" aria-hidden="true" />
         <p style={{ margin: 0 }}>{OBSERVATION_DISCLAIMER}</p>
@@ -80,7 +108,7 @@ export function SubscriptionsTab({
         channels={state.channels}
         selectedChatId={state.chatId}
         disabled={busy}
-        onSelect={(chatId) => model.selectChannel(chatId)}
+        onSelect={selectChannel}
         onRetry={() => model.retryChannels()}
         onLoadMore={() => model.loadMoreChannels()}
       />
@@ -95,8 +123,15 @@ export function SubscriptionsTab({
             onRefresh={() => model.refreshDetails()}
           />
 
+          <div className="seg" role="group" aria-label="频道内容">
+            <button type="button" className={section === 'links' ? 'active' : ''} aria-pressed={section === 'links'} onClick={() => setSection('links')}>订阅链接</button>
+            <button type="button" className={section === 'members' ? 'active' : ''} aria-pressed={section === 'members'} onClick={() => setSection('members')}>已观测成员</button>
+          </div>
+          <div hidden={section !== 'links'}>
           <SubscriptionLinksSection
             key={state.chatId}
+            createdLink={state.lastCreatedLink}
+            canWrite={state.details.value !== null && (state.details.value.canManageLinks || (state.details.value.capabilityErrorCode !== null && state.details.value.capabilityErrorCode !== 'bot_permission_required' && state.details.value.capabilityErrorCode !== 'channel_required'))}
             channelTitle={state.details.value?.title ?? state.chatId}
             links={state.links}
             createIntent={state.createIntent}
@@ -110,13 +145,15 @@ export function SubscriptionsTab({
             onLoadMore={() => model.loadMoreLinks()}
           />
 
+          </div>
+          <div hidden={section !== 'members'}>
           <SubscriptionMembersSection
             members={state.members}
-            linkNames={indexLinkNames(state.links.items)}
             onRefresh={() => model.refreshMembers()}
             onRetry={() => model.retryMembers()}
             onLoadMore={() => model.loadMoreMembers()}
           />
+          </div>
         </>
       )}
     </div>

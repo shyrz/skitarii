@@ -76,6 +76,7 @@ describe('维护任务', () => {
       signals: [],
       decidedAt: new Date('2026-09-22T01:01:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
     await store.repos.decisions.insert({
       id: 'd2',
@@ -87,6 +88,7 @@ describe('维护任务', () => {
       signals: [],
       decidedAt: new Date('2026-09-22T02:01:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
     await store.repos.appeals.insert({
       id: 'p1',
@@ -96,6 +98,7 @@ describe('维护任务', () => {
       note: '误判',
       createdAt: new Date('2026-09-22T03:00:00Z'),
       resolvedAt: new Date('2026-09-22T03:30:00Z'),
+      rollbackPending: false,
     })
     // 前一天的越界样本：不该被算进 09-22。
     await seedEvent(store, chatA, 'a0', new Date('2026-09-21T23:59:59Z'))
@@ -114,6 +117,7 @@ describe('维护任务', () => {
       signals: [],
       decidedAt: new Date('2026-09-22T10:01:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
     await store.repos.appeals.insert({
       id: 'p2',
@@ -123,6 +127,7 @@ describe('维护任务', () => {
       note: '不服',
       createdAt: new Date('2026-09-22T11:00:00Z'),
       resolvedAt: null,
+      rollbackPending: false,
     })
 
     const result = await runMaintenance({ repos: store.repos, logger: silentLogger, now: () => now })

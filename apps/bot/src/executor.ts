@@ -27,7 +27,7 @@ import { isPrivateChatUnreachable, isUnpunishableTarget } from './telegram-error
  * - 动作失败（非终态）时不回填，决策留成「未执行」，重投递或人工补偿还能再试一次。
  *   删除动作在这个重试窗口内有固有不一致：通知已发出（声称已删除）而消息尚未删除（先通知后删的必然取舍）；
  *   补偿重试成功即收口，最终终结拒绝则撤回通知。窗口长度以补偿扫描的节奏为界，不做额外的一致性补偿。
- * - 通知失败（发送失败或 429 退避耗尽）不回滚动作，只在日志里留痕：动作已经生效，通知是可丢的。
+ * - 通知失败（发送失败或 429 退避耗尽）不回滚已生效动作。warn 的通知就是动作，未确认送达会记录结果并通知 owner。
  *   通知不做人为丢弃：密集时照常尝试发送，由 Telegram 的 429 退避兜底（见 `telegram-call.ts`）。
  * - 通知先私聊当事人，不可达（未 /start、被拉黑）才回退群内；实际落点记录在决策上，供申诉编辑复用。
  *   回退到群里的通知随后被安排为 5 分钟后删除（见 `GROUP_NOTICE_TTL_MS`），私聊通知不受影响。
@@ -151,13 +151,19 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
         return
       }
 
-      if (decision.action.kind === 'pass') {
-        // 放行也要回填 executed：崩溃恢复时「未执行的决策」应当只剩真正待施加的动作。
-        await deps.repos.decisions.markExecuted(decision.id)
-        return
-      }
-
       await deps.idempotency.run(idempotencyKeyOf(decision), async () => {
+        const current = await deps.repos.decisions.findById(decision.id)
+        if (current === null || current.executed) return
+        decision = current
+        const appeal = await deps.repos.appeals.findByDecisionId(decision.id)
+        if (appeal?.state === 'overturned') {
+          await deps.repos.decisions.completeExecution(decision.id, { kind: 'rejected', reason: 'cancelled_by_appeal' })
+          return
+        }
+        if (decision.action.kind === 'pass') {
+          await deps.repos.decisions.completeExecution(decision.id, { kind: 'applied', action: 'pass' })
+          return
+        }
         const instant = now()
         // 删除先通知后删：群内回退通知要回复被处置消息，消息必须还在。其余动作的通知仍在动作后发。
         const notice =
@@ -171,14 +177,21 @@ export function createActionExecutor(deps: ActionExecutorDeps): ActionExecutor {
         if (outcome.kind === 'applied') {
           // 删除的通知已在动作前投递；降级为删除的禁言/封禁不在此列，它们按实际生效的动作在动作后通知。
           if (decision.action.kind !== 'delete') {
-            await sendNotice(deps, decision, outcome.action, instant, schedule, context)
+            const delivered = await sendNotice(deps, decision, outcome.action, instant, schedule, context)
+            if (outcome.action.kind === 'warn' && delivered === null) {
+              await deps.repos.decisions.completeExecution(decision.id, { kind: 'rejected', reason: 'warning_delivery_unconfirmed' })
+              await notifyFailure(deps, decision, '警告送达未确认')
+              return
+            }
           }
         } else {
           // 删除没生效，撤回动作前发出的通知（best-effort），避免群里留下假消息与失效的申诉入口。
           if (notice !== null) await retractNotice(deps, decision, notice)
-          await notifyFailure(deps, decision, outcome.description)
         }
-        await deps.repos.decisions.markExecuted(decision.id)
+        await deps.repos.decisions.completeExecution(decision.id, outcome.kind === 'applied'
+          ? { kind: 'applied', action: outcome.action.kind }
+          : { kind: 'rejected', reason: 'telegram_rejected' })
+        if (outcome.kind === 'rejected') await notifyFailure(deps, decision, outcome.description)
         // 降级时把实际动作也写进日志（如 action=mute effective=delete），否则日志会让人以为禁言真的生效了。
         const effective =
           outcome.kind === 'applied' && outcome.action.kind !== decision.action.kind
@@ -326,7 +339,7 @@ interface NoticeHandle {
  * 因此命中时跳过投递，直接返回已有引用的句柄（终结性拒绝时照常可撤回）。
  *
  * 通知不做人为丢弃：密集时直接尝试发送，由 Telegram 的 429 退避兜底；其余失败（含退避耗尽）
- * 都按「通知可丢」处理：通知是旁路，不能反过来影响动作执行。
+ * 返回 null；执行器对 warn 记录送达未确认，其他动作仍保留实际执行结果。
  *
  * 发送成功后记录通知引用（`notice_*` 列），申诉生命周期据此编辑原通知；记录失败只 warn。
  *
@@ -578,14 +591,14 @@ function scheduleGroupNoticeDeletion(
 }
 
 /**
- * 终结性拒绝后私聊 owner。
+ * 终结性拒绝或警告送达未确认后私聊 owner。
  *
- * 迟到的失败通知比不通知好：终态决策不再被补偿扫描接手，owner 只能靠这条私聊知道有人需要人工处理。
+ * 迟到的失败通知比不通知好：终态决策不再被补偿扫描接手，owner 可通过私聊或面板的持久结果发现待核实问题。
  * 通知是旁路：未配置时跳过，实现抛错时吞掉并记 warn，`executed` 回填不受影响。
  *
  * @param deps 执行器依赖。
- * @param decision 被拒绝的决策。
- * @param description Telegram 返回的拒绝原因。
+ * @param decision 需要核实的决策。
+ * @param description 拒绝原因或警告送达未确认的说明。
  */
 async function notifyFailure(deps: ActionExecutorDeps, decision: ModerationDecision, description: string): Promise<void> {
   if (deps.notifyOwnerFailure === undefined) return

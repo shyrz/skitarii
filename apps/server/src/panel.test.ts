@@ -152,6 +152,7 @@ function decisionFixture(id: string, decidedAt: Date, overrides: Partial<Moderat
     signals: [{ kind: 'rule-hit', ruleId: 'r-1', score: 0.8 }],
     decidedAt,
     executed: true,
+    execution: { kind: 'unknown' },
     ...overrides,
   }
 }
@@ -166,6 +167,7 @@ function appealFixture(id: string, decisionId: string, createdAt: Date, override
     note: '误判了',
     createdAt,
     resolvedAt: null,
+    rollbackPending: false,
     ...overrides,
   }
 }
@@ -294,8 +296,32 @@ describe('面板概览', () => {
           openAppeals: 2,
         },
       ],
+      attention: { executionIssues: [], moreExecutionIssues: false, pendingRollbackCount: 0, morePendingRollback: false },
       serverTime: now,
     })
+  })
+
+  test('工作台异常限制时间与数量，排除历史未知、正常执行和申诉取消', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+    for (let i = 0; i < 12; i += 1) {
+      await seedDecision(store, decisionFixture(`failed-${i}`, new Date(now.getTime() - i * 1000), {
+        execution: { kind: 'rejected', reason: 'telegram_rejected' },
+      }))
+      await store.repos.appeals.insert(appealFixture(`rollback-${i}`, `failed-${i}`, now, {
+        state: 'overturned', resolvedAt: now, rollbackPending: true,
+      }))
+    }
+    await seedDecision(store, decisionFixture('too-old', new Date('2026-09-01T00:00:00Z'), { execution: { kind: 'rejected', reason: 'telegram_rejected' } }))
+    await seedDecision(store, decisionFixture('cancelled', now, { execution: { kind: 'rejected', reason: 'cancelled_by_appeal' } }))
+    await seedDecision(store, decisionFixture('unknown', now, { execution: { kind: 'unknown' } }))
+    await seedDecision(store, decisionFixture('applied', now, { execution: { kind: 'applied', action: 'delete' } }))
+    const result = await getPanelOverview(deps, { initData: ownerInitData() })
+    const attention = (result.body as { attention: { executionIssues: { id: string }[]; moreExecutionIssues: boolean; pendingRollbackCount: number; morePendingRollback: boolean } }).attention
+    expect(attention.executionIssues.map(item => item.id)).toEqual(Array.from({ length: 10 }, (_, i) => `failed-${i}`))
+    expect(attention.moreExecutionIssues).toBe(true)
+    expect(attention.pendingRollbackCount).toBe(10)
+    expect(attention.morePendingRollback).toBe(true)
   })
 
   test('概览带只读的 chatType / linkedChatId（频道行原样透出登记事实）', async () => {
@@ -332,6 +358,7 @@ describe('面板概览', () => {
 describe('面板报表序列', () => {
   test('连续日期升序、缺失日补零', async () => {
     const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
     await seedAggregate(store, chatId, '2026-09-23', { messageCount: 3, actionCount: 1 })
     await seedAggregate(store, chatId, '2026-09-20', { messageCount: 7, appealCount: 2 })
 
@@ -372,26 +399,46 @@ describe('面板报表序列', () => {
     })
   })
 
-  test('days 默认 30 并 clamp 到 [7, 90]', async () => {
-    const { deps } = setup()
+  test('days 默认 30，越界与非整数返回 400 而不是静默夹取', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
 
     const daysOf = async (days: string | null) => {
       const result = await getPanelSeries(deps, { chatId, days, initData: ownerInitData() })
-      return (result.body as { days: unknown[] }).days.length
+      return result
     }
 
-    expect(await daysOf(null)).toBe(30)
-    expect(await daysOf('abc')).toBe(30)
-    expect(await daysOf('3')).toBe(7)
-    expect(await daysOf('999')).toBe(90)
+    // 缺省、空串与范围内的整数照常返回连续序列。
+    expect((((await daysOf(null)).body) as { days: unknown[] }).days).toHaveLength(30)
+    expect((((await daysOf('')).body) as { days: unknown[] }).days).toHaveLength(30)
+    expect((((await daysOf('7')).body) as { days: unknown[] }).days).toHaveLength(7)
+    expect((((await daysOf('90')).body) as { days: unknown[] }).days).toHaveLength(90)
+
+    // 越界、非整数、非数字一律 400：夹成边界值会把调用方的参数错误藏起来。
+    for (const days of ['3', '999', 'abc', '1.5']) {
+      const response = await daysOf(days)
+      expect(response.status).toBe(400)
+      expect(response.body).toMatchObject({ error: 'invalid_request' })
+    }
   })
 
-  test('未登记的群返回全零序列，仍是连续日期', async () => {
+  test('未登记的群返回 404，与 config 端点同口径', async () => {
     const { deps } = setup()
 
-    const result = await getPanelSeries(deps, { chatId: '-1000000000000', days: '7', initData: ownerInitData() })
+    const response = await getPanelSeries(deps, { chatId: '-1000000000000', days: '7', initData: ownerInitData() })
+
+    expect(response.status).toBe(404)
+    expect(response.body).toEqual({ error: 'chat_not_found' })
+  })
+
+  test('已登记但没有聚合数据的群返回全零序列，仍是连续日期', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+
+    const result = await getPanelSeries(deps, { chatId, days: '7', initData: ownerInitData() })
     const body = result.body as { days: Array<Record<string, unknown>> }
 
+    expect(result.status).toBe(200)
     expect(body.days).toHaveLength(7)
     expect(body.days.every((day) => day.messageCount === 0 && day.actionCount === 0)).toBe(true)
   })
@@ -435,6 +482,7 @@ describe('面板处置队列', () => {
       actionUntil: null,
       score: 0.8,
       executed: true,
+      execution: { kind: 'unknown' },
       decidedAt: new Date('2026-09-23T10:00:00Z'),
       ruleIds: ['r-a'],
       llm: { verdict: 'spam', confidence: 0.9 },
@@ -537,7 +585,7 @@ describe('面板处置队列', () => {
     ])
   })
 
-  test('过滤：action=all 含放行、具体档位精确匹配、chatId 与 limit clamp', async () => {
+  test('过滤：action=all 含放行、具体档位精确匹配、chatId 生效', async () => {
     const { deps, store } = setup()
     await seedDecision(store, decisionFixture('d-1', new Date('2026-09-23T10:00:00Z')))
     await seedDecision(store, decisionFixture('d-2', new Date('2026-09-23T11:00:00Z'), { action: { kind: 'mute', until: new Date('2026-09-23T12:00:00Z') } }))
@@ -557,10 +605,21 @@ describe('面板处置队列', () => {
       before: null, beforeId: null,
     })
     expect((otherChat.body as { items: Array<{ id: string }> }).items.map((item) => item.id)).toEqual(['d-3'])
+  })
 
-    // limit=0 clamp 到 1。
-    const clamped = await getPanelDecisions(deps, { initData: ownerInitData(), chatId: null, action: 'all', limit: '0', before: null, beforeId: null })
-    expect((clamped.body as { items: unknown[] }).items).toHaveLength(1)
+  test('limit 越界或非整数返回 400，不静默截断', async () => {
+    const { deps, store } = setup()
+    await seedDecision(store, decisionFixture('d-1', new Date('2026-09-23T10:00:00Z')))
+
+    const base = { initData: ownerInitData(), chatId: null, action: 'all', before: null, beforeId: null }
+    const one = await getPanelDecisions(deps, { ...base, limit: '1' })
+    expect((one.body as { items: unknown[] }).items).toHaveLength(1)
+
+    for (const limit of ['0', '101', 'abc', '1.5', '-3']) {
+      const response = await getPanelDecisions(deps, { ...base, limit })
+      expect(response.status).toBe(400)
+      expect(response.body).toMatchObject({ error: 'invalid_request' })
+    }
   })
 
   test('非法 action 与非法游标返回 400', async () => {
@@ -582,6 +641,49 @@ describe('面板处置队列', () => {
 })
 
 describe('面板申诉队列', () => {
+  test('新结案记录不会挤掉旧待办，且已结案按结案时间排序', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+    for (let i = 0; i < 55; i += 1) {
+      await seedDecision(store, decisionFixture(`d-${i}`, now))
+      await store.repos.appeals.insert(appealFixture(`a-${i}`, `d-${i}`, new Date(now.getTime() + i),
+        i === 0 ? {} : { state: 'upheld', resolvedAt: new Date(now.getTime() + 100 - i) }))
+    }
+    const open = await getPanelAppeals(deps, { initData: ownerInitData(), state: null, limit: null })
+    expect(open.body).toMatchObject({ items: [{ id: 'a-0' }], nextBefore: null })
+    const history = await getPanelAppeals(deps, { initData: ownerInitData(), state: 'resolved', limit: '2' })
+    expect(history.body).toMatchObject({ items: [{ id: 'a-1' }, { id: 'a-2' }] })
+  })
+
+  test('同时间申诉复合游标完整翻页，按群过滤且拒绝半缺游标', async () => {
+    const { deps, store } = setup()
+    const other = asChatId('-100999')
+    const ids = [1, 2, 3, 4].map((n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`)
+    for (const [i, id] of ids.entries()) {
+      await seedDecision(store, decisionFixture(`d-${i}`, now, { chatId: i === 3 ? other : chatId }))
+      await store.repos.appeals.insert(appealFixture(id, `d-${i}`, now))
+    }
+    const base = { initData: ownerInitData(), state: 'open', chatId: String(chatId), limit: '2' }
+    const first = await getPanelAppeals(deps, base)
+    const page = first.body as { items: Array<{ id: string }>; nextBefore: { at: string; id: string } }
+    expect(page.items.map((item) => item.id)).toEqual([ids[2], ids[1]])
+    const second = await getPanelAppeals(deps, { ...base, before: page.nextBefore.at, beforeId: page.nextBefore.id })
+    expect(second.body).toMatchObject({ items: [{ id: ids[0] }], nextBefore: null })
+    expect((await getPanelAppeals(deps, { ...base, before: now.toISOString() })).status).toBe(400)
+    expect((await getPanelAppeals(deps, { ...base, before: 'bad', beforeId: ids[0] ?? '' })).status).toBe(400)
+  })
+
+  test('概览待处理数超过一千条仍准确', async () => {
+    const { deps, store } = setup()
+    await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
+    for (let i = 0; i < 1003; i += 1) {
+      await seedDecision(store, decisionFixture(`count-d-${i}`, now))
+      await store.repos.appeals.insert(appealFixture(`count-a-${i}`, `count-d-${i}`, now))
+    }
+    const result = await getPanelOverview(deps, { initData: ownerInitData() })
+    expect(result.body).toMatchObject({ chats: [{ chatId, openAppeals: 1003 }] })
+  })
+
   test('默认只看待处理，带原处置摘要与摘录；state=all 返回全部', async () => {
     const { deps, store } = setup()
     await store.repos.chats.upsert(chatConfigFor(chatId, '甲群'))
@@ -605,14 +707,18 @@ describe('面板申诉队列', () => {
       note: '误判了',
       createdAt: new Date('2026-09-23T10:05:00Z'),
       resolvedAt: null,
+    rollbackPending: false,
       decision: {
         id: 'd-1',
         action: 'mute',
+        execution: { kind: 'unknown' },
         actionUntil: new Date('2026-09-23T11:00:00Z'),
         score: 0.8,
         chatId,
         chatTitle: '甲群',
         sampleText: '需要处理的原文',
+        ruleIds: ['r-1'],
+        llm: null,
       },
     })
 
@@ -623,6 +729,13 @@ describe('面板申诉队列', () => {
 
     const badState = await getPanelAppeals(deps, { initData: ownerInitData(), state: 'pending', limit: null })
     expect(badState.status).toBe(400)
+
+    // limit 与 state 同一口径：越界与非整数 400，不静默夹取。
+    for (const limit of ['0', '101', 'abc']) {
+      const badLimit = await getPanelAppeals(deps, { initData: ownerInitData(), state: 'all', limit })
+      expect(badLimit.status).toBe(400)
+      expect(badLimit.body).toMatchObject({ error: 'invalid_request' })
+    }
   })
 })
 

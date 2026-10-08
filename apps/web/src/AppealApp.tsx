@@ -3,9 +3,31 @@ import type { FormEvent } from 'react'
 import { AuthError, ConflictError, NotFoundError, fetchAppeal, submitAppeal } from './api.js'
 import type { AppealDto, AppealView, DecisionAction } from './api.js'
 import { getDecisionId, getInitData, getWebApp } from './telegram.js'
+import { executionText } from './execution.js'
 
 /** 申诉理由长度上限，与后端校验一致。 */
 const REASON_MAX = 500
+
+function appealDraftKey(): string | null {
+  const userId = getWebApp()?.initDataUnsafe.user?.id
+  const decisionId = getDecisionId()
+  return userId !== undefined && Number.isSafeInteger(userId) && userId > 0 && decisionId !== null
+    ? `skitarii:appeal-draft:${userId}:${decisionId}` : null
+}
+
+function readAppealDraft(): string {
+  const key = appealDraftKey()
+  if (key === null) return ''
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(key) ?? 'null')
+    if (typeof value !== 'object' || value === null || !('note' in value) || !('savedAt' in value)) return ''
+    if (typeof value.note !== 'string' || typeof value.savedAt !== 'number') return ''
+    const age = Date.now() - value.savedAt
+    if (age >= 0 && age <= 60 * 60_000) return value.note
+    localStorage.removeItem(key)
+    return ''
+  } catch { return '' }
+}
 
 /** 动作类型 → 展示文案与色调。文案只陈述事实，不解释规则。 */
 const ACTION_META: Record<
@@ -13,7 +35,7 @@ const ACTION_META: Record<
   { badge: string; title: string; tone: string }
 > = {
   warn: { badge: '警告', title: '你的发言收到了警告', tone: 'var(--tone-caution)' },
-  delete: { badge: '消息已删除', title: '你的消息已被删除', tone: 'var(--tone-notice)' },
+  delete: { badge: '删除消息', title: '你的消息已被删除', tone: 'var(--tone-notice)' },
   mute: { badge: '禁言', title: '你已被禁言', tone: 'var(--tone-caution)' },
   ban: { badge: '封禁', title: '你已被封禁', tone: 'var(--tone-danger)' },
 }
@@ -39,12 +61,23 @@ function formatTime(iso: string): string {
 
 export function AppealApp() {
   const [screen, setScreen] = useState<Screen>({ kind: 'loading' })
-  const [reason, setReason] = useState('')
+  const [reason, setReason] = useState(readAppealDraft)
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
   /** 区分「本次刚提交成功」与「打开时已有申诉」，两者标题文案不同。 */
   const [justSubmitted, setJustSubmitted] = useState(false)
   const initDataRef = useRef('')
+
+  useEffect(() => {
+    const key = appealDraftKey()
+    if (key === null) return
+    try {
+      if (reason === '' || (screen.kind === 'ready' && screen.view.appeal !== null)) localStorage.removeItem(key)
+      else localStorage.setItem(key, JSON.stringify({ note: reason, savedAt: Date.now() }))
+    } catch {
+      // WebView 禁用存储时，当前页面仍保留输入，不阻断申诉。
+    }
+  }, [reason, screen])
 
   const load = useCallback(async () => {
     const decisionId = getDecisionId()
@@ -97,6 +130,10 @@ export function AppealApp() {
         if (error instanceof ConflictError) {
           // 已有申诉：重新拉取，直接展示既有状态
           await load()
+        } else if (error instanceof AuthError) {
+          setScreen({ kind: 'auth' })
+        } else if (error instanceof NotFoundError) {
+          setScreen({ kind: 'not-found' })
         } else {
           setSubmitError('提交失败，请检查网络后再试一次。')
         }
@@ -183,7 +220,9 @@ export function AppealApp() {
   }
 
   const { decision, appeal } = screen.view
-  const meta = ACTION_META[decision.action]
+  const actual = decision.execution.kind === 'applied' && decision.execution.action !== 'pass'
+    ? decision.execution.action : decision.action
+  const meta = ACTION_META[actual]
 
   return (
     <main className="screen">
@@ -194,14 +233,15 @@ export function AppealApp() {
           <header className="header">
             <span className="badge" style={{ ['--tone' as string]: meta.tone }}>
               <ActionIcon action={decision.action} />
-              {meta.badge}
+              {decision.execution.kind === 'applied' ? meta.badge : `原判定 ${meta.badge}`}
             </span>
-            <h1>{meta.title}</h1>
+            <h1>{decision.execution.kind === 'applied' ? meta.title : '这条发言有一项处理记录'}</h1>
             <p className="sub">如果认为这是误处理，可以在下面申诉，由群主复核。</p>
           </header>
         )}
 
         <section className="card" aria-label="处理详情">
+          <p className="list-sub">{executionText(decision.execution, decision.action)}</p>
           <div className="field">
             <p className="label">群组</p>
             <p className="value">{decision.chatTitle}</p>
@@ -301,6 +341,7 @@ function AppealStatus({ appeal, justSubmitted }: { appeal: AppealDto; justSubmit
       <div>
         <h1>申诉已通过</h1>
         <p>群主复核后撤销了原处理，给你添麻烦了。</p>
+        {appeal.rollbackPending && <p role="status">解除限制仍待处理，负责人会继续核实。</p>}
         {appeal.resolvedAt !== null && <p className="time">复核于 {formatTime(appeal.resolvedAt)}</p>}
       </div>
     </section>

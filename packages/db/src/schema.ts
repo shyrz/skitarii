@@ -163,6 +163,9 @@ export const moderationDecisions = pgTable(
     signals: jsonb('signals').notNull(),
     decidedAt: timestamp('decided_at', { withTimezone: true }).notNull(),
     executed: boolean('executed').notNull().default(false),
+    executionState: text('execution_state').$type<'applied' | 'rejected'>(),
+    effectiveAction: actionKind('effective_action'),
+    executionFailureReason: text('execution_failure_reason').$type<'telegram_rejected' | 'warning_delivery_unconfirmed' | 'cancelled_by_appeal'>(),
     /**
      * 处置通知的落点：私聊优先时是用户私聊（`notice_chat_id` 为用户 id 的字符串形态），
      * 私聊不可达回退群内时是群 id。申诉生命周期（提交 → 等待复核、结案 → 终态）要按这两个列编辑原通知。
@@ -176,6 +179,16 @@ export const moderationDecisions = pgTable(
     // 「mute 才带解禁时刻」的双向约束：既挡住 mute 缺时刻，也挡住非 mute 带时刻。
     check('moderation_decisions_action_until', sql`(${table.action} = 'mute') = (${table.actionUntil} is not null)`),
     check('moderation_decisions_score_range', sql`${table.score} >= 0 and ${table.score} <= 1`),
+    check('moderation_decisions_execution_result', sql`
+      (${table.executionState} is null and ${table.effectiveAction} is null and ${table.executionFailureReason} is null)
+      or (${table.executed} = true and ${table.executionState} is not null and (
+        (${table.executionState} = 'applied' and ${table.effectiveAction} is not null
+          and (${table.effectiveAction} = ${table.action} or (${table.action} in ('mute', 'ban') and ${table.effectiveAction} = 'delete'))
+          and ${table.executionFailureReason} is null)
+        or (${table.executionState} = 'rejected' and ${table.effectiveAction} is null
+          and ${table.executionFailureReason} is not null
+          and ${table.executionFailureReason} in ('telegram_rejected', 'warning_delivery_unconfirmed', 'cancelled_by_appeal'))
+      ))`),
     index('moderation_decisions_event_idx').on(table.eventId),
     index('moderation_decisions_chat_decided_idx').on(table.chatId, table.decidedAt),
     // 累犯加重要按 (群, 用户, 时间) 数违规决策，索引与查询形状对齐，避免全表扫描。
@@ -228,6 +241,10 @@ export const appeals = pgTable(
     check('appeals_resolved_by', sql`(${table.state} = 'open') = (${table.resolvedBy} is null)`),
     uniqueIndex('appeals_decision_unique').on(table.decisionId),
     index('appeals_state_idx').on(table.state),
+    index('appeals_created_cursor_idx').on(table.createdAt.desc(), table.id.desc()),
+    index('appeals_state_created_cursor_idx').on(table.state, table.createdAt.desc(), table.id.desc()),
+    index('appeals_resolved_cursor_idx').on(table.resolvedAt.desc(), table.id.desc())
+      .where(sql`${table.resolvedAt} is not null`),
   ],
 )
 

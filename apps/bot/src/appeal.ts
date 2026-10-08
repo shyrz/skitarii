@@ -405,9 +405,11 @@ async function notifyAppellant(
   outcome: AppealOutcome,
   rollbackFailed: boolean,
 ): Promise<void> {
-  const text = appellantResultText(decision.action.kind, outcome, rollbackFailed)
-
   try {
+    const current = await deps.repos.decisions.findById(decision.id)
+    const action = current?.execution.kind === 'applied' ? current.execution.action
+      : current?.execution.kind === 'rejected' || !rollbackFailed ? 'pass' : decision.action.kind
+    const text = appellantResultText(action, outcome, rollbackFailed)
     await callWithRetry(() => deps.api.sendMessage(decision.userId, text), {
       logger: deps.logger,
       label: 'sendMessage(appeal-result)',
@@ -559,28 +561,32 @@ export function createAppealCallbackHandler(deps: AppealDeps): MiddlewareFn<Cont
 
     if (resolution.rollbackFailed) {
       await editOwnerMessage(ctx, outcome, resolution.resolvedAt)
-      await ctx.answerCallbackQuery({ text: '已结案，但解除限制失败：请手动解禁或解封', show_alert: true })
+      await ctx.answerCallbackQuery({ text: '已撤销，解除限制仍待处理，请核实当前权限', show_alert: true })
       return
     }
 
     await editOwnerMessage(ctx, outcome, resolution.resolvedAt)
-    await ctx.answerCallbackQuery({ text: outcome === 'overturn' ? '已撤销并解除限制' : '已维持原处置' })
+    await ctx.answerCallbackQuery({ text: outcome === 'overturn' ? '已撤销处置' : '已维持原处置' })
   }
 }
 
 /**
  * 回滚处置带来的权限状态。
  *
- * 不可罚目标（管理员/群主）没有可回滚的权限状态：executor 已把这类目标的禁言/封禁降级为删除，
- * 撤销时解禁/解封必然被 Telegram 以「不可被限制」拒绝。此时记日志后正常返回，不让申诉结案中途失败；
- * 其余错误照旧抛出，由调用方走「已结案但恢复失败」分支提示 owner 手动处理。
+ * 已知结果按实际动作恢复，降级删除与拒绝无需解禁；历史未知结果沿用原动作补偿。
+ * 处置仍在执行时抛错，保留恢复任务等待最终结果。Telegram 拒绝不可罚目标时视为无需恢复。
  *
  * @param deps api 与日志。
  * @param decision 原决策。
  */
 async function rollbackAction(deps: AppealDeps, decision: ModerationDecision): Promise<void> {
+  const current = await deps.repos.decisions.findById(decision.id)
+  if (current === null) return
+  if (!current.executed) throw new Error('处置仍待完成，保留权限恢复任务')
+  if (current.execution.kind === 'rejected') return
+  const action = current.execution.kind === 'applied' ? current.execution.action : current.action.kind
   const call = deps.api
-  switch (decision.action.kind) {
+  switch (action) {
     case 'mute':
       try {
         await callWithRetry(
@@ -613,7 +619,7 @@ async function rollbackAction(deps: AppealDeps, decision: ModerationDecision): P
       // 没有可回滚的权限状态：消息已删除或被警示过，撤销只体现在申诉状态与统计上。
       return
     default: {
-      const exhaustive: never = decision.action
+      const exhaustive: never = action
       throw new Error(`未知处置: ${JSON.stringify(exhaustive)}`)
     }
   }

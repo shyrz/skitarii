@@ -269,13 +269,16 @@ async function handlePanelDecisions(request: IncomingMessage, response: ServerRe
   respondJson(response, result.status, result.body)
 }
 
-/** 面板申诉队列：`GET /api/panel/appeals?initData=&state=&limit=`。 */
+/** 面板申诉队列：按群和状态筛选，before/beforeId 必须成对传入。 */
 async function handlePanelAppeals(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? '/', 'http://localhost')
   const result = await getPanelAppeals(panelApi, {
     initData: url.searchParams.get('initData'),
     state: url.searchParams.get('state'),
     limit: url.searchParams.get('limit'),
+    chatId: url.searchParams.get('chatId'),
+    before: url.searchParams.get('before'),
+    beforeId: url.searchParams.get('beforeId'),
   })
   respondJson(response, result.status, result.body)
 }
@@ -586,7 +589,14 @@ const server = createServer((request, response) => {
     const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
     logger.error(`请求处理失败 ${request.method ?? ''} ${pathname}`, error)
     if (!response.headersSent) {
-      respondJson(response, 500, { error: 'internal error' })
+      // 与订阅端点的未预期失败同形（error / message / retryable 三字段 + no-store）：
+      // 同一个 500 有两套形状会让前端与运维各写一条解析分支。
+      respondJson(
+        response,
+        500,
+        { error: 'internal_error', message: '服务器内部错误，请稍后重试', retryable: true },
+        NO_STORE,
+      )
     } else {
       response.end()
     }

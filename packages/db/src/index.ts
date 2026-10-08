@@ -12,6 +12,7 @@ export { createPgRepos } from './pg-repos.js'
 export type {
   AggregateRepo,
   AppealRepo,
+  AppealListFilter,
   ChatMetadataPatch,
   ChatRepo,
   ChatRulesPatch,

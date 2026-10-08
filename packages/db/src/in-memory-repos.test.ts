@@ -25,6 +25,7 @@ async function seedDecision(store: InMemoryRepos): Promise<void> {
     signals: [],
     decidedAt: new Date('2026-09-23T10:00:00Z'),
     executed: true,
+    execution: { kind: 'unknown' },
   }
   await store.repos.decisions.insert(decision)
 }
@@ -90,6 +91,7 @@ async function seedSample(
     signals: [],
     decidedAt: options.resolvedAt,
     executed: true,
+    execution: { kind: 'unknown' },
   })
   await store.repos.appeals.insert({
     id: options.id,
@@ -99,6 +101,7 @@ async function seedSample(
     note: null,
     createdAt: options.resolvedAt,
     resolvedAt: options.resolvedAt,
+    rollbackPending: false,
   })
   if (options.sampleText !== undefined && options.sampleText !== null) {
     await store.repos.events.attachSample(`ev-${options.id}`, options.sampleText)
@@ -127,6 +130,7 @@ async function seedSignalDecision(
     signals: options.signals,
     decidedAt: options.decidedAt,
     executed: true,
+    execution: { kind: 'unknown' },
   })
 }
 
@@ -215,6 +219,7 @@ describe('内存实现：误伤样本', () => {
       signals: [],
       decidedAt: new Date('2026-09-23T10:00:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
     await store.repos.appeals.insert({
       id: 's-orphan',
@@ -224,6 +229,7 @@ describe('内存实现：误伤样本', () => {
       note: null,
       createdAt: new Date('2026-09-23T10:00:00Z'),
       resolvedAt: new Date('2026-09-23T10:00:00Z'),
+      rollbackPending: false,
     })
 
     expect(await store.repos.appeals.listOverturnedSamples(chatId, new Date('2026-09-01T00:00:00Z'), 5)).toEqual([])

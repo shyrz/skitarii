@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchPanelDecisions } from '../api.js'
+import { executionText } from '../execution.js'
 import type {
   DecisionAction,
-  PanelChatDto,
   PanelDecisionCursor,
   PanelDecisionDto,
   PanelDecisionFilter,
@@ -34,11 +34,15 @@ function llmText(llm: PanelDecisionDto['llm']): string {
 
 export function DecisionsTab({
   initData,
-  chats,
+  chatId,
+  active,
+  onOpenRule,
   onFatal,
 }: {
   initData: string
-  chats: PanelChatDto[]
+  chatId: string
+  active: boolean
+  onOpenRule: (chatId: string, ruleId: string) => void
   onFatal: (error: unknown) => boolean
 }) {
   const [state, setState] = useState<'loading' | 'failed' | 'ready'>('loading')
@@ -47,73 +51,100 @@ export function DecisionsTab({
   const [loadingMore, setLoadingMore] = useState(false)
   /** 加载更多失败只提示按钮上方一行，不顶掉已加载的列表。 */
   const [moreFailed, setMoreFailed] = useState(false)
-  const [chatFilter, setChatFilter] = useState('all')
   const [actionFilter, setActionFilter] = useState<ActionFilter>('default')
+  const request = useRef<AbortController | null>(null)
+  const loadedPages = useRef(1)
+  const loadedKey = useRef('')
+  const updatedAt = useRef(0)
+  const [refreshing, setRefreshing] = useState(false)
 
   const buildFilter = useCallback(
     (before?: PanelDecisionCursor): PanelDecisionFilter => {
       const filter: PanelDecisionFilter = { limit: PAGE_SIZE }
-      if (chatFilter !== 'all') filter.chatId = chatFilter
+      if (chatId !== '') filter.chatId = chatId
       if (actionFilter === 'all') filter.action = 'all'
       else if (actionFilter !== 'default') filter.action = actionFilter
       if (before !== undefined) filter.before = before
       return filter
     },
-    [chatFilter, actionFilter],
+    [chatId, actionFilter],
   )
 
   const reload = useCallback(async () => {
-    setState('loading')
+    if (request.current !== null) return
+    const current = new AbortController()
+    request.current = current
+    setRefreshing(true)
+    setLoadingMore(false)
     setMoreFailed(false)
     try {
-      const page = await fetchPanelDecisions(initData, buildFilter())
-      setItems(page.items)
-      setNextBefore(page.nextBefore)
+      const refreshed: PanelDecisionDto[] = []
+      let cursor: PanelDecisionCursor | undefined
+      let next: PanelDecisionCursor | null = null
+      for (let index = 0; index < loadedPages.current; index += 1) {
+        const page = await fetchPanelDecisions(initData, buildFilter(cursor), current.signal)
+        if (current.signal.aborted) return
+        refreshed.push(...page.items)
+        next = page.nextBefore
+        if (next === null) break
+        cursor = next
+      }
+      setItems(refreshed)
+      setNextBefore(next)
+      updatedAt.current = Date.now()
       setState('ready')
     } catch (error) {
-      if (!onFatal(error)) setState('failed')
+      if (!current.signal.aborted && !onFatal(error)) {
+        setState(previous => previous === 'ready' ? previous : 'failed')
+        setMoreFailed(true)
+      }
+    } finally {
+      if (request.current === current) { request.current = null; setRefreshing(false) }
     }
   }, [initData, buildFilter, onFatal])
 
   useEffect(() => {
-    void reload()
-  }, [reload])
+    const key = `${chatId}:${actionFilter}`
+    if (loadedKey.current !== key) {
+      loadedKey.current = key
+      loadedPages.current = 1
+      updatedAt.current = 0
+      setItems([])
+      setState('loading')
+    }
+    if (active && Date.now() - updatedAt.current > 30_000) void reload()
+    return () => { request.current?.abort(); request.current = null; setRefreshing(false); setLoadingMore(false) }
+  }, [reload, active, chatId, actionFilter])
 
   const loadMore = useCallback(async () => {
-    if (nextBefore === null || loadingMore) return
+    if (nextBefore === null || request.current !== null) return
+    const current = new AbortController()
+    request.current = current
     setLoadingMore(true)
     setMoreFailed(false)
     try {
-      const page = await fetchPanelDecisions(initData, buildFilter(nextBefore))
+      const page = await fetchPanelDecisions(initData, buildFilter(nextBefore), current.signal)
+      if (current.signal.aborted) return
+      loadedPages.current += 1
       setItems((current) => [...current, ...page.items])
       setNextBefore(page.nextBefore)
     } catch (error) {
-      if (!onFatal(error)) setMoreFailed(true)
+      if (!current.signal.aborted && !onFatal(error)) setMoreFailed(true)
     } finally {
-      setLoadingMore(false)
+      if (request.current === current) {
+        request.current = null
+        setLoadingMore(false)
+      }
     }
-  }, [initData, buildFilter, nextBefore, loadingMore, onFatal])
+  }, [initData, buildFilter, nextBefore, onFatal])
 
   return (
     <div className="stack">
       <div className="filter-row">
         <select
           className="select"
-          value={chatFilter}
-          onChange={(event) => setChatFilter(event.target.value)}
-          aria-label="按群筛选"
-        >
-          <option value="all">全部群</option>
-          {chats.map((chat) => (
-            <option key={chat.chatId} value={chat.chatId}>
-              {chat.title}
-            </option>
-          ))}
-        </select>
-        <select
-          className="select"
           value={actionFilter}
-          onChange={(event) => setActionFilter(event.target.value as ActionFilter)}
+          onChange={(event) => { request.current?.abort(); setActionFilter(event.target.value as ActionFilter) }}
           aria-label="按档位筛选"
         >
           {ACTION_OPTIONS.map((option) => (
@@ -122,7 +153,9 @@ export function DecisionsTab({
             </option>
           ))}
         </select>
+        <button type="button" className="btn btn-secondary" disabled={refreshing || loadingMore} onClick={() => void reload()}>{refreshing ? '更新中…' : '刷新'}</button>
       </div>
+      {moreFailed && <p className="form-error" role="alert">更新失败，已保留当前记录。请重试。</p>}
 
       {state === 'loading' && (
         <div className="tab-pending">
@@ -147,7 +180,7 @@ export function DecisionsTab({
           <article className="list-card" key={d.id}>
             <div className="row-between">
               <span className="badge" style={{ ['--tone' as string]: ACTION_TONE[d.action] }}>
-                {ACTION_LABEL[d.action]}
+                原判定 {ACTION_LABEL[d.action]}
                 {d.actionUntil !== null ? `（至 ${formatTime(d.actionUntil)}）` : ''}
               </span>
               <span className="list-time">{formatTime(d.decidedAt)}</span>
@@ -156,18 +189,23 @@ export function DecisionsTab({
               {d.chatTitle} · 用户 {d.userId}
             </p>
             <p className="list-sub">
-              分数 {d.score.toFixed(2)} · {d.executed ? '已执行' : '未执行'} · {llmText(d.llm)}
+              {executionText(d.execution, d.action)}
             </p>
+            <details><summary>查看消息摘录与判断依据</summary>
+            <p className="list-sub">分数 {d.score.toFixed(2)} · {llmText(d.llm)}</p>
             {d.ruleIds.length > 0 && (
               <div className="chips" aria-label="命中规则">
                 {d.ruleIds.map((id) => (
-                  <span className="chip" key={id}>
+                  <button type="button" className="chip" key={id} onClick={() => onOpenRule(d.chatId, id)}>
                     {id}
-                  </span>
+                  </button>
                 ))}
               </div>
             )}
-            {d.sampleText !== null && <p className="quote clamp">{d.sampleText}</p>}
+            <p className="footnote">规则入口展示当前配置，可能与判定时不同。分数与置信度不代表误判概率。</p>
+            <p className="quote">{d.sampleText ?? '未保存消息摘录。'}</p>
+            <p className="footnote">仅显示处置时保存的摘录。</p>
+            </details>
           </article>
         ))}
 

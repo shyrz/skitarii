@@ -70,6 +70,9 @@ const decisionRowFixture: ModerationDecisionRow = {
   ],
   decidedAt: new Date('2026-09-23T10:00:01Z'),
   executed: true,
+  executionState: null,
+  effectiveAction: null,
+  executionFailureReason: null,
   noticeChatId: '-1001234567890',
   noticeMessageId: 77,
 }
@@ -228,6 +231,7 @@ describe('申诉、订阅与聚合映射', () => {
       note: '这是我自己的闲置转让',
       createdAt: new Date('2026-09-23T10:05:00Z'),
       resolvedAt: new Date('2026-09-23T10:30:00Z'),
+      rollbackPending: false,
     })
     expect(Object.keys(appeal)).not.toContain('resolvedBy')
   })

@@ -328,6 +328,7 @@ describe('消息管线', () => {
       signals: [],
       decidedAt: new Date('2026-09-23T10:00:00Z'),
       executed: false,
+      execution: { kind: 'pending' },
     })
     let attachCalls = 0
     const repos = {
@@ -367,6 +368,7 @@ describe('消息管线', () => {
       signals: [],
       decidedAt: new Date('2026-09-23T10:00:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
     let attachCalls = 0
     const repos = {
@@ -749,6 +751,7 @@ describe('误伤样本回写', () => {
       signals: [],
       decidedAt: options.resolvedAt,
       executed: true,
+      execution: { kind: 'unknown' },
     })
     await store.repos.appeals.insert({
       id: options.id,
@@ -758,6 +761,7 @@ describe('误伤样本回写', () => {
       note: null,
       createdAt: options.resolvedAt,
       resolvedAt: options.resolvedAt,
+      rollbackPending: false,
     })
     if (options.sampleText !== undefined && options.sampleText !== null) {
       await store.repos.events.attachSample(eventId, options.sampleText)
@@ -786,6 +790,7 @@ describe('误伤样本回写', () => {
       score: 0.4,
       signals: [{ kind: 'rule-hit', ruleId: 'r-ad', score: 0.4 }],
       executed: true,
+      execution: { kind: 'applied', action: 'pass' },
     })
     expect(judgeStub.calls).toEqual([])
     expect(recording.calls).toEqual([])
@@ -1055,6 +1060,7 @@ describe('误伤样本回写', () => {
       score: 0,
       signals: [],
       executed: true,
+      execution: { kind: 'applied', action: 'pass' },
     })
     expect(sampleQueries).toBe(0)
     expect(judgeStub.calls).toEqual([])
@@ -1161,6 +1167,7 @@ describe('非成员经内联机器人发消息', () => {
       signals: [{ kind: 'rule-hit', ruleId: NONMEMBER_INLINE_RULE_ID, score: 1 }],
       decidedAt,
       executed: true,
+      execution: { kind: 'unknown' },
     })
   }
 
@@ -1204,6 +1211,7 @@ describe('非成员经内联机器人发消息', () => {
       score: 1,
       signals: [{ kind: 'rule-hit', ruleId: NONMEMBER_INLINE_RULE_ID, score: 1 }],
       executed: true,
+      execution: { kind: 'applied', action: 'delete' },
     })
     // 窗口 = now − 1 小时；计数锚点必须是标记 ruleId。
     expect(ruleHitQueries).toEqual([{ ruleId: NONMEMBER_INLINE_RULE_ID, since: new Date('2026-09-23T09:00:00Z') }])
@@ -1521,6 +1529,7 @@ async function seedPriorViolations(store: InMemoryRepos, count: number): Promise
       signals: [],
       decidedAt: new Date('2026-09-22T10:00:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
   }
 }

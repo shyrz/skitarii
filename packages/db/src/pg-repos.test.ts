@@ -239,6 +239,7 @@ describe('写入语句的形状与参数化', () => {
       note: '误判了',
       createdAt: new Date('2026-09-23T10:05:00Z'),
       resolvedAt: null,
+      rollbackPending: false,
     })
 
     const [statement] = recorded
@@ -497,7 +498,7 @@ describe('读语句', () => {
 
   test('申诉队列单条 join 取申诉与决策，state=null 时不过滤状态', async () => {
     const { repos, recorded } = createPgReposRecording([])
-    expect(await repos.appeals.listByStateWithDecision('open', 20)).toEqual([])
+    expect(await repos.appeals.listWithDecision({ state: 'open', limit: 20 })).toEqual([])
 
     const [statement] = recorded
     expect(statement?.query).toContain('inner join "moderation_decisions"')
@@ -507,9 +508,33 @@ describe('读语句', () => {
     expect(statement?.params).toEqual(['open', 20])
 
     const all = createPgReposRecording([])
-    await all.repos.appeals.listByStateWithDecision(null, 20)
+    await all.repos.appeals.listWithDecision({ state: null, limit: 20 })
     expect(all.recorded[0]?.query).not.toContain('"appeals"."state" =')
     expect(all.recorded[0]?.params).toEqual([20])
+  })
+
+  test('申诉历史按结案时间分页，微秒游标参数原样传给 PostgreSQL', async () => {
+    const { repos, recorded } = createPgReposRecording([])
+    const at = '2026-09-23T10:00:00.123456Z'
+    const id = '00000000-0000-4000-8000-000000000001'
+    await repos.appeals.listWithDecision({ state: 'resolved', chatId: chatConfigFixture.chatId,
+      before: { at, id }, limit: 21 })
+    const statement = recorded[0]
+    expect(statement?.query).toContain('"appeals"."resolved_at" desc nulls last, "appeals"."id" desc nulls last')
+    expect(statement?.query).toContain('HH24:MI:SS.US')
+    expect(statement?.query).toContain('::timestamptz')
+    expect(statement?.params).toEqual(['upheld', 'overturned', chatConfigFixture.chatId, at, at, id, 21])
+  })
+
+  test('待办统计限定群且只查询聚合，空群不发查询', async () => {
+    const { repos, recorded } = createPgReposRecording([[chatConfigFixture.chatId, 1003]])
+    expect(await repos.appeals.countOpenByChat([])).toEqual(new Map())
+    expect(recorded).toHaveLength(0)
+    expect(await repos.appeals.countOpenByChat([chatConfigFixture.chatId]))
+      .toEqual(new Map([[chatConfigFixture.chatId, 1003]]))
+    expect(recorded[0]?.query).toContain('count(*)')
+    expect(recorded[0]?.query).toContain('group by "moderation_decisions"."chat_id"')
+    expect(recorded[0]?.params).toEqual(['open', chatConfigFixture.chatId])
   })
 
   test('误伤样本用一条三表 join，倒序取时间窗内的撤销结案', async () => {
@@ -1001,7 +1026,7 @@ describe('迁移产物', () => {
     const journal = JSON.parse(readFileSync(join(migrationsDir, 'meta', '_journal.json'), 'utf8')) as {
       entries: Array<{ idx: number; tag: string }>
     }
-    const last = journal.entries.at(-1)
+    const last = journal.entries.find((entry) => entry.idx === 10)
     expect(last).toMatchObject({ idx: 10, version: '7', breakpoints: true })
     // 3b 的 0009 不被覆盖。
     expect(journal.entries[9]).toEqual({

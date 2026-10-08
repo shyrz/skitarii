@@ -2,6 +2,7 @@ import { asChatId, asUserId, type ModerationDecision } from '@skitarii/core'
 import { GrammyError } from 'grammy'
 import { describe, expect, test } from 'vitest'
 import { createActionExecutor, GROUP_NOTICE_TTL_MS, noticeText, type Schedule } from './executor.js'
+import { resolveAppeal, createAppealRollbackService } from './appeal.js'
 import { createIdempotencyRegistry } from './idempotency.js'
 import { createInMemoryRepos } from '@skitarii/db'
 import type { Logger } from './logger.js'
@@ -46,6 +47,7 @@ function decisionFixture(overrides: Partial<ModerationDecision> = {}): Moderatio
     signals: [{ kind: 'rule-hit', ruleId: 'rule-1', score: 0.9 }],
     decidedAt: new Date('2026-09-23T10:00:00Z'),
     executed: false,
+    execution: { kind: 'pending' },
     ...overrides,
   }
 }
@@ -1189,4 +1191,84 @@ describe('重试判定与文案', () => {
     expect(noticeText({ kind: 'ban' }, instant, 'group')).toBe('⛔ 已将违规用户移出本群。')
     expect(noticeText({ kind: 'pass' }, instant, 'group')).toBe('')
   })
+})
+
+describe('持久化实际执行结果', () => {
+  test('降级删除记录实际动作，陈旧决策重放不会覆盖结果', async () => {
+    const { executor, store, recording } = setup({ handlers: {
+      restrictChatMember: () => { throw new GrammyError('failed', { ok: false, error_code: 400, description: 'Bad Request: user is an administrator of the chat' }, 'restrictChatMember', {}) },
+    } })
+    const decision = decisionFixture({ action: { kind: 'mute', until: new Date('2026-09-24T00:00:00Z') } })
+    await store.repos.decisions.insert(decision)
+    await executor.execute(decision, { messageId: 42 })
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ action: decision.action, execution: { kind: 'applied', action: 'delete' } })
+    await store.repos.decisions.completeExecution(decision.id, { kind: 'rejected', reason: 'telegram_rejected' })
+    const restarted = createActionExecutor({ api: recording.api, repos: store.repos, idempotency: createIdempotencyRegistry(), miniAppUrl: 'https://mini.example.com/app', logger: silentLogger })
+    await restarted.execute(decision, { messageId: 42 })
+    expect(recording.countOf('restrictChatMember')).toBe(1)
+    expect(await store.repos.decisions.findById(decision.id)).toMatchObject({ execution: { kind: 'applied', action: 'delete' } })
+  })
+
+  test('终态拒绝存安全码，owner 通知时结果已持久化', async () => {
+    let completedAtNotification = false
+    const { executor, store } = setup({ handlers: {
+      deleteMessage: () => { throw new GrammyError('failed', { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete the message' }, 'deleteMessage', {}) },
+    }, notifyOwnerFailure: async (decision) => {
+      const stored = await store.repos.decisions.findById(decision.id)
+      completedAtNotification = stored?.executed === true && stored.execution.kind === 'rejected'
+    } })
+    const decision = decisionFixture()
+    await store.repos.decisions.insert(decision)
+    await executor.execute(decision, { messageId: 42 })
+    expect((await store.repos.decisions.findById(decision.id))?.execution).toEqual({ kind: 'rejected', reason: 'telegram_rejected' })
+    expect(completedAtNotification).toBe(true)
+  })
+
+  test('警告送达未确认不记成功，限制成功不被通知失败改写', async () => {
+    const { executor, store } = setup({ handlers: { sendMessage: () => { throw new Error('network unavailable') } } })
+    const warning = decisionFixture({ action: { kind: 'warn' } })
+    await store.repos.decisions.insert(warning)
+    await executor.execute(warning, { messageId: 42 })
+    expect(await store.repos.decisions.findById(warning.id)).toMatchObject({ executed: true, execution: { kind: 'rejected', reason: 'warning_delivery_unconfirmed' } })
+    const ban = decisionFixture({ id: 'another-decision', eventId: 'another-event', action: { kind: 'ban' } })
+    await store.repos.decisions.insert(ban)
+    await executor.execute(ban, { messageId: 43 })
+    expect((await store.repos.decisions.findById(ban.id))?.execution).toEqual({ kind: 'applied', action: 'ban' })
+  })
+
+  test('撤销已经结案时不开始处罚', async () => {
+    const { executor, store, recording } = setup()
+    const decision = decisionFixture({ action: { kind: 'ban' } })
+    await store.repos.decisions.insert(decision)
+    await store.repos.appeals.insert({ id: 'appeal', decisionId: decision.id, userId, state: 'overturned', note: null, createdAt: new Date(), resolvedAt: new Date(), rollbackPending: true })
+    await executor.execute(decision, { messageId: 42 })
+    expect(recording.calls).toEqual([])
+    expect((await store.repos.decisions.findById(decision.id))?.execution).toEqual({ kind: 'rejected', reason: 'cancelled_by_appeal' })
+  })
+})
+
+
+test('在途处罚与撤销并发时，重复执行不能用取消结果覆盖实际成功', async () => {
+  let release!: () => void
+  let started!: () => void
+  const began = new Promise<void>((resolve) => { started = resolve })
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const { executor, store, recording } = setup({ handlers: { banChatMember: async () => { started(); await held; return true } } })
+  const decision = decisionFixture({ action: { kind: 'ban' } })
+  await store.repos.decisions.insert(decision)
+  await store.repos.appeals.insert({ id: 'concurrent-appeal', decisionId: decision.id, userId, state: 'open', note: null, createdAt: new Date(), resolvedAt: null, rollbackPending: false })
+  const executing = executor.execute(decision, { messageId: 42 })
+  await began
+  const deps = { api: recording.api, repos: store.repos, ownerUserId: asUserId(1), logger: silentLogger }
+  await resolveAppeal(deps, 'concurrent-appeal', 'overturn')
+  const duplicate = executor.execute(decision, { messageId: 42 })
+  expect(recording.countOf('unbanChatMember')).toBe(0)
+  expect(await store.repos.appeals.findById('concurrent-appeal')).toMatchObject({ rollbackPending: true })
+  release()
+  await Promise.all([executing, duplicate])
+  expect(recording.countOf('banChatMember')).toBe(1)
+  expect((await store.repos.decisions.findById(decision.id))?.execution).toEqual({ kind: 'applied', action: 'ban' })
+  await createAppealRollbackService(deps).runOnce()
+  expect(recording.countOf('unbanChatMember')).toBe(1)
+  expect(await store.repos.appeals.findById('concurrent-appeal')).toMatchObject({ rollbackPending: false })
 })

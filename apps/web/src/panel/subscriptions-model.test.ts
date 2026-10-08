@@ -76,6 +76,7 @@ function memberDto(id: string, userId: number, chatId = '-1001'): SubscriptionMe
     chatId,
     userId,
     linkId: null,
+    linkName: null,
     state: 'member',
     expiresAt: null,
     evidence: 'until_date',
@@ -426,7 +427,9 @@ describe('在途操作与换频道隔离（延迟 promise）', () => {
     expect(model.getState().operation).toBe('idle')
     expect(model.getState().chatId).toBe('A')
     expect(model.getState().notice?.text).toBe(CREATE_SUCCESS_TEXT)
-    expect(api.fetchLinks.mock.calls.length).toBeGreaterThan(0)
+    expect(model.getState().links.items.map(link => link.id)).toEqual(['l1'])
+    expect(model.getState().lastCreatedLink?.id).toBe('l1')
+    expect(api.fetchLinks).not.toHaveBeenCalled()
     for (const call of api.fetchLinks.mock.calls) expect(call[0]).toBe('A')
     for (const call of api.fetchChannelDetails.mock.calls) expect(call[0]).toBe('A')
   })
@@ -598,4 +601,69 @@ describe('创建意图跨刷新与清理（存储替身）', () => {
     expect(lastCall?.[2].requestId).toBeDefined()
     expect(lastCall?.[2].requestId).not.toBe(oldRequestId)
   })
+})
+
+
+describe('保留已加载页的订阅操作', () => {
+  test('改名就地替换并保留后续页；旧刷新响应不覆盖成功结果', async () => {
+    const api = fakeApi()
+    const first = linkDto('first')
+    const second = linkDto('second')
+    api.fetchLinks.mockResolvedValueOnce(pageOf([first], 'next')).mockResolvedValueOnce(pageOf([second]))
+    const model = new SubscriptionsModel(api, 'init', () => false)
+    model.selectChannel('-1001')
+    await flush()
+    model.loadMoreLinks()
+    await flush()
+    const pending = deferred<SubscriptionPage<SubscriptionLinkDto>>()
+    api.fetchLinks.mockReturnValueOnce(pending.promise)
+    model.refreshLinks()
+    const updated = { ...second, name: '新名', version: 2 }
+    api.renameLink.mockResolvedValueOnce(updated)
+    expect(await model.renameLink(second, '新名')).toBe(true)
+    pending.resolve(pageOf([first], 'next'))
+    await flush()
+    expect(model.getState().links.items).toEqual([first, updated])
+    expect(model.getState().links.refreshing).toBe(false)
+  })
+
+  test('刷新按原页数读取并合并重复点击；第二页失败原列表不变', async () => {
+    const api = fakeApi()
+    const first = linkDto('first')
+    const second = linkDto('second')
+    api.fetchLinks.mockResolvedValueOnce(pageOf([first], 'next')).mockResolvedValueOnce(pageOf([second]))
+    const model = new SubscriptionsModel(api, 'init', () => false)
+    model.selectChannel('-1001')
+    await flush()
+    model.loadMoreLinks()
+    await flush()
+    const pending = deferred<SubscriptionPage<SubscriptionLinkDto>>()
+    api.fetchLinks.mockClear().mockReturnValueOnce(pending.promise).mockRejectedValueOnce(new Error('offline'))
+    model.refreshLinks()
+    model.refreshLinks()
+    expect(api.fetchLinks).toHaveBeenCalledTimes(1)
+    pending.resolve(pageOf([{ ...first, name: '新首页' }], 'next'))
+    await flush()
+    expect(api.fetchLinks).toHaveBeenCalledTimes(2)
+    expect(model.getState().links.items).toEqual([first, second])
+    expect(model.getState().links.refreshFailed).toBe(true)
+    expect(model.getState().links.refreshing).toBe(false)
+  })
+})
+
+
+test('新建链接撤销后清除成功复制入口，改名先同步入口', async () => {
+  const api = fakeApi()
+  const model = new SubscriptionsModel(api, 'init', () => false)
+  model.selectChannel('-1001')
+  await flush()
+  await model.createLink('generated', 100)
+  const renamed = { ...linkDto('generated'), name: '新名', version: 2 }
+  api.renameLink.mockResolvedValueOnce(renamed)
+  await model.renameLink(linkDto('generated'), '新名')
+  expect(model.getState().lastCreatedLink).toEqual(renamed)
+  api.revokeLink.mockResolvedValueOnce({ ...renamed, state: 'revoked', revokedAt: TIME, version: 3 })
+  await model.revokeLink(renamed)
+  expect(model.getState().lastCreatedLink).toBeNull()
+  expect(model.getState().links.items[0]?.state).toBe('revoked')
 })

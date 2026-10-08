@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import type { Ref } from 'react'
 import { InvalidRequestError, fetchPanelConfig, savePanelConfig } from '../api.js'
+import { getWebApp } from '../telegram.js'
 import type {
   PanelChatDto,
   PanelConfigDto,
@@ -44,16 +46,37 @@ function toDraft(config: PanelConfigDto): PanelConfigInput {
   }
 }
 
+interface GroupDraft {
+  saved: PanelConfigDto
+  draft: PanelConfigInput
+  dirty: boolean
+  whitelistInput: string
+}
+
+export interface RulesHandle {
+  selectChat(chatId: string, ruleId?: string): boolean
+}
+
 export function RulesTab({
   initData,
   chats,
   onFatal,
+  ref,
+  onOpenReview,
+  onSelected,
 }: {
   initData: string
   chats: PanelChatDto[]
   onFatal: (error: unknown) => boolean
+  ref?: Ref<RulesHandle>
+  onOpenReview: (chatId: string) => void
+  onSelected: (chatId: string) => void
 }) {
-  const [chatId, setChatId] = useState('')
+  const [section, setSection] = useState<'rules' | 'whitelist'>('rules')
+  const [advanced, setAdvanced] = useState(false)
+  const [search, setSearch] = useState('')
+  const [enabledFilter, setEnabledFilter] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [chatId, setChatId] = useState(() => chats.length === 1 ? chats[0]?.chatId ?? '' : '')
   const [status, setStatus] = useState<'idle' | 'loading' | 'failed' | 'ready'>('idle')
   const [saved, setSaved] = useState<PanelConfigDto | null>(null)
   const [draft, setDraft] = useState<PanelConfigInput | null>(null)
@@ -71,6 +94,57 @@ export function RulesTab({
   const localCounter = useRef(0)
   /** 请求序号：快速换群时旧响应靠它识别并丢弃，不覆盖新群的草稿。 */
   const loadSeq = useRef(0)
+  const drafts = useRef(new Map<string, GroupDraft>())
+  const requestedRule = useRef<string | undefined>(undefined)
+  const hasUnsaved = dirty || whitelistInput !== '' || drafts.current.size > 0
+
+  useEffect(() => {
+    if (!hasUnsaved) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    getWebApp()?.enableClosingConfirmation?.()
+    return () => {
+      window.removeEventListener('beforeunload', warn)
+      getWebApp()?.disableClosingConfirmation?.()
+    }
+  }, [hasUnsaved])
+
+  const selectChat = (id: string, ruleId?: string): boolean => {
+    if (saving) return false
+    if (ruleId !== undefined) { setSection('rules'); setSearch(''); setEnabledFilter('all') }
+    requestedRule.current = ruleId
+    if (id === chatId) {
+      if (status !== 'ready') return true
+      requestedRule.current = undefined
+      if (ruleId !== undefined) {
+        setEditingId(ruleId)
+        if (!draft?.rules.some(rule => rule.id === ruleId)) setNotice('这条历史规则已不在当前配置中。')
+      }
+      return true
+    }
+    if (saved !== null && draft !== null && (dirty || whitelistInput !== '')) {
+      drafts.current.set(chatId, { saved, draft, dirty, whitelistInput })
+    }
+    loadSeq.current += 1
+    setStatus('loading')
+    setSaved(null)
+    setDraft(null)
+    setDirty(false)
+    setWhitelistInput('')
+    setChatId(id)
+    onSelected(id)
+    return true
+  }
+
+  useImperativeHandle(ref, () => ({ selectChat }))
+
+  useEffect(() => {
+    if (status !== 'ready' || requestedRule.current === undefined) return
+    const id = requestedRule.current
+    requestedRule.current = undefined
+    setEditingId(id)
+    if (!draft?.rules.some(rule => rule.id === id)) setNotice('这条历史规则已不在当前配置中。')
+  }, [status, draft])
 
   const load = useCallback(
     async (id: string) => {
@@ -82,6 +156,16 @@ export function RulesTab({
       setConfirmingDelete(null)
       setWhitelistInput('')
       setWhitelistError(null)
+      const previous = drafts.current.get(id)
+      if (previous !== undefined) {
+        drafts.current.delete(id)
+        setSaved(previous.saved)
+        setDraft(previous.draft)
+        setDirty(previous.dirty)
+        setWhitelistInput(previous.whitelistInput)
+        setStatus('ready')
+        return
+      }
       try {
         const config = await fetchPanelConfig(id, initData)
         if (seq !== loadSeq.current) return // 期间已换群，丢弃过期响应
@@ -125,6 +209,8 @@ export function RulesTab({
   )
 
   const addRule = useCallback(() => {
+    setSearch('')
+    setEnabledFilter('all')
     localCounter.current += 1
     const id = `${LOCAL_ID_PREFIX}${localCounter.current}`
     mutate((current) => ({
@@ -188,6 +274,7 @@ export function RulesTab({
       // 以服务端返回为准：拿到分配后的正式 id，本地草稿与服务端对齐
       setSaved(config)
       setDraft(toDraft(config))
+      drafts.current.delete(chatId)
       setDirty(false)
       setEditingId(null)
       setConfirmingDelete(null)
@@ -197,6 +284,17 @@ export function RulesTab({
     } catch (error) {
       if (error instanceof InvalidRequestError) {
         setSaveErrors(error.details.length > 0 ? error.details : ['配置校验未通过，请检查后再保存。'])
+        const ruleError = error.details.map(message => /第 (\d+) 条规则/u.exec(message)).find(match => match !== null)
+        if (ruleError) {
+          setSection('rules')
+          setSearch('')
+          setEnabledFilter('all')
+          setEditingId(draft.rules[Number(ruleError[1]) - 1]?.id ?? null)
+        }
+        if (error.details.some(message => message.includes('阈值') || message.includes('muteDurationMinutes'))) {
+          setSection('rules')
+          setAdvanced(true)
+        }
       } else if (!onFatal(error)) {
         setSaveErrors(['保存失败，请检查网络后再试一次。'])
       }
@@ -207,6 +305,7 @@ export function RulesTab({
 
   const onDiscard = useCallback(() => {
     if (saved === null) return
+    drafts.current.delete(chatId)
     setDraft(toDraft(saved))
     setDirty(false)
     setEditingId(null)
@@ -215,17 +314,23 @@ export function RulesTab({
     setNotice(null)
     setWhitelistInput('')
     setWhitelistError(null)
-  }, [saved])
+  }, [saved, chatId])
+
+  const visibleRules = draft?.rules.filter(rule =>
+    (enabledFilter === 'all' || rule.enabled === (enabledFilter === 'enabled')) &&
+    `${rule.id} ${rule.pattern} ${RULE_KIND_LABEL[rule.kind]}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()),
+  ) ?? []
 
   return (
     <div className="stack">
+      {chatId !== '' && <button type="button" className="text-btn" disabled={saving} onClick={() => onOpenReview(chatId)}>查看本群审核记录</button>}
       {chats.length === 0 ? (
         <p className="empty-state">还没有已登记的群。把机器人拉进群后会自动登记。</p>
       ) : (
         <select
           className="select"
           value={chatId}
-          onChange={(event) => setChatId(event.target.value)}
+          onChange={(event) => selectChat(event.target.value)}
           disabled={saving}
           aria-label="选择要配置的群"
         >
@@ -258,7 +363,12 @@ export function RulesTab({
 
       {status === 'ready' && draft !== null && (
         <>
-          <section className="card" aria-label="阈值">
+          <div className="seg" role="group" aria-label="群设置内容">
+            <button type="button" className={section === 'rules' ? 'active' : ''} aria-pressed={section === 'rules'} onClick={() => setSection('rules')}>规则</button>
+            <button type="button" className={section === 'whitelist' ? 'active' : ''} aria-pressed={section === 'whitelist'} onClick={() => setSection('whitelist')}>信任名单</button>
+          </div>
+          <div hidden={section !== 'rules'}>
+          <details className="card" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>高级设置 · 判定阈值与禁言时长</summary><section aria-label="阈值">
             <div className="threshold-grid">
               <div className="field">
                 <label className="label" htmlFor="pass-threshold">
@@ -331,17 +441,27 @@ export function RulesTab({
               />
             </div>
             <p className="list-sub">保存后立即生效。</p>
+            {saveErrors.filter(message => message.includes('阈值') || message.includes('muteDurationMinutes')).map(message => <p className="form-error" key={message}>{message}</p>)}
           </section>
 
+          </details>
           <section aria-label="规则列表">
             <h2 className="section-title">规则（{draft.rules.length}）</h2>
             {draft.rules.length === 0 && (
               <p className="empty-state">这个群还没有规则，点下方「新增规则」。</p>
             )}
-            {draft.rules.map((rule) => (
+            <div className="filter-row">
+              <input className="input" aria-label="查找规则" placeholder="查找匹配内容或规则 ID" value={search} onChange={event => setSearch(event.target.value)} />
+              <select className="select" aria-label="规则启用状态" value={enabledFilter} onChange={event => setEnabledFilter(event.target.value as typeof enabledFilter)}>
+                <option value="all">全部规则</option><option value="enabled">已启用</option><option value="disabled">已停用</option>
+              </select>
+            </div>
+            {draft.rules.length > 0 && visibleRules.length === 0 && <p className="empty-state">没有符合条件的规则，试试调整搜索或启用状态。</p>}
+            {visibleRules.map((rule) => (
               <RuleCard
                 key={rule.id}
                 rule={rule}
+                errors={saveErrors.filter(message => message.startsWith(`第 ${draft.rules.indexOf(rule) + 1} 条规则`))}
                 editing={editingId === rule.id}
                 confirmingDelete={confirmingDelete === rule.id}
                 disabled={saving}
@@ -371,7 +491,8 @@ export function RulesTab({
             </p>
           </section>
 
-          <section aria-label="信任名单">
+          </div>
+          <section aria-label="信任名单" hidden={section !== 'whitelist'}>
             <h2 className="section-title">信任名单（{draft.whitelist.length}）</h2>
             <p className="list-sub">{WHITELIST_HINT}</p>
             {draft.whitelist.length === 0 && <p className="empty-state">{WHITELIST_EMPTY}</p>}
@@ -426,7 +547,8 @@ export function RulesTab({
             </div>
           </section>
 
-          <section aria-label="保存">
+          <section aria-label="保存" className="save-bar">
+            <p className="list-sub">{chats.find(chat => chat.chatId === chatId)?.title} · {dirty ? '有未保存更改' : '当前配置已保存'}</p>
             {notice !== null && (
               <section
                 className="appeal-status"
@@ -475,6 +597,7 @@ export function RulesTab({
 
 function RuleCard({
   rule,
+  errors,
   editing,
   confirmingDelete,
   disabled,
@@ -485,6 +608,7 @@ function RuleCard({
   onDeleteConfirm,
 }: {
   rule: PanelRuleDto
+  errors: string[]
   editing: boolean
   confirmingDelete: boolean
   disabled: boolean
@@ -499,6 +623,7 @@ function RuleCard({
 
   return (
     <article className="list-card">
+      {errors.map(message => <p className="form-error" key={message}>{message}</p>)}
       <div className="row-between">
         <span className="rule-head">
           <label className="switch">
@@ -573,7 +698,7 @@ function RuleCard({
             aria-label="匹配内容"
           />
           {ignoresPattern && <p className="list-sub">此匹配方式不使用 pattern</p>}
-          <div className="rule-edit-row">
+          <details><summary>高级设置 · 违规分</summary><div className="rule-edit-row">
             <input
               className="input"
               type="number"
@@ -588,19 +713,19 @@ function RuleCard({
               }}
               aria-label="违规分"
             />
+          </div></details>
             <button
               type="button"
               className="btn btn-secondary"
               disabled={disabled}
               onClick={onEdit}
             >
-              完成
+              收起编辑
             </button>
-          </div>
         </div>
       ) : (
         <>
-          <p className="rule-pattern">{rule.pattern === '' ? '（未填写）' : rule.pattern}</p>
+          <p className="rule-pattern">{rule.pattern === '' ? ignoresPattern ? '经内联机器人发送的消息' : '（未填写）' : rule.pattern}</p>
           <p className="list-sub">
             分数 {rule.score.toFixed(2)} · 动作 {RULE_ACTION_LABEL[rule.actionHint]}
             {rule.enabled ? '' : ' · 已停用'}
@@ -610,7 +735,7 @@ function RuleCard({
 
       {confirmingDelete && (
         <div className="confirm-box">
-          <p className="confirm-text">确认删除这条规则？保存后才会真正生效。</p>
+          <p className="confirm-text">{rule.id.startsWith('default-') ? '这条默认规则删除后会在下次部署时补回。如需长期关闭，请取消删除并停用规则。仍要删除？' : '确认删除这条规则？保存后才会真正生效。'}</p>
           <div className="btn-row">
             <button
               type="button"

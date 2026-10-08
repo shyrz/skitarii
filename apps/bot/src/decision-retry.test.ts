@@ -89,6 +89,7 @@ async function seedDecision(
     signals: [],
     decidedAt: staleDecidedAt,
     executed: false,
+    execution: { kind: 'pending' },
     ...overrides,
   }
   await store.repos.decisions.insert(decision)

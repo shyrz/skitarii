@@ -964,6 +964,7 @@ describe('列表、详情与稳定分页', () => {
   test('成员分页按 firstObservedAt 倒序；counts 是全量聚合而不是当前页长度', async () => {
     const { deps, store } = setup()
     await seedChats(store)
+    await seedActiveLink(store)
     for (let index = 0; index < 3; index += 1) {
       await store.repos.subscriptionMembers.applyEvent({
         chatId,
@@ -971,7 +972,7 @@ describe('列表、详情与稳定分页', () => {
         state: 'member',
         expiresAt: null,
         evidence: 'until_date',
-        linkId: null,
+        linkId: LINK_ID,
         isJoin: true,
         eventDate: 1_758_000_000,
         eventUpdateId: index + 1,
@@ -982,6 +983,7 @@ describe('列表、详情与稳定分页', () => {
     const page = await listSubscriptionMembers(deps, { chatId: CHAT_ID, initData: ownerInitData(), limit: '1', cursor: null })
     const body = page.body as { items: unknown[]; nextCursor: string | null }
     expect(body.items).toHaveLength(1)
+    expect(body.items[0]).toMatchObject({ linkId: LINK_ID, linkName: '月度' })
     expect(body.nextCursor).not.toBeNull()
 
     const details = await getSubscriptionChannel(deps, { chatId: CHAT_ID, initData: ownerInitData() })

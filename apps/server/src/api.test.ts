@@ -134,6 +134,7 @@ async function seedDecision(store: InMemoryRepos, userId: number = USER_ID): Pro
     signals: [{ kind: 'rule-hit', ruleId: 'rule-1', score: 0.9 }],
     decidedAt: new Date('2026-09-23T10:00:00Z'),
     executed: true,
+    execution: { kind: 'unknown' },
   })
   await store.repos.events.attachSample(eventId, '低价出售会员，需要的私聊')
 }
@@ -150,6 +151,7 @@ describe('GET /api/appeals/:decisionId', () => {
       decision: {
         id: decisionId,
         action: 'delete',
+        execution: { kind: 'unknown' },
         actionUntil: null,
         chatTitle: '测试群',
         createdAt: new Date('2026-09-23T10:00:00Z'),
@@ -194,6 +196,7 @@ describe('GET /api/appeals/:decisionId', () => {
       signals: [],
       decidedAt: new Date('2026-09-23T10:00:00Z'),
       executed: true,
+      execution: { kind: 'unknown' },
     })
 
     const response = await getAppeal(harness.deps, {

@@ -29,9 +29,10 @@ const appealId = 'a1b2c3d4-1111-4222-8333-555566667777'
  *
  * @param store 内存仓储。
  * @param action 原处置。
+ * @param execution 实际结果，默认原动作已成功。
  * @returns 申诉记录。
  */
-async function seedAppeal(store: InMemoryRepos, action: ModerationDecision['action']): Promise<Appeal> {
+async function seedAppeal(store: InMemoryRepos, action: ModerationDecision['action'], execution: ModerationDecision['execution'] = { kind: 'applied', action: action.kind }): Promise<Appeal> {
   await store.repos.chats.upsert({
     chatId,
     title: '测试群',
@@ -62,7 +63,8 @@ async function seedAppeal(store: InMemoryRepos, action: ModerationDecision['acti
     score: 0.9,
     signals: [],
     decidedAt: new Date('2026-09-23T10:00:00Z'),
-    executed: true,
+    executed: execution.kind !== 'pending',
+    execution,
   })
 
   const appeal: Appeal = {
@@ -73,6 +75,7 @@ async function seedAppeal(store: InMemoryRepos, action: ModerationDecision['acti
     note: '这是我自己的闲置转让',
     createdAt: new Date('2026-09-23T10:05:00Z'),
     resolvedAt: null,
+    rollbackPending: false,
   }
   await store.repos.appeals.insert(appeal)
   return appeal
@@ -133,7 +136,7 @@ describe('owner 处理申诉', () => {
     expect(args[2]).toMatchObject({ can_send_messages: true, can_invite_users: true })
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
     expect(store.resolvedByOf(appealId)).toBe(ownerId)
-    expect(answers.at(-1)?.text).toBe('已撤销并解除限制')
+    expect(answers.at(-1)?.text).toBe('已撤销处置')
     expect(edits.at(-1)).toContain('已撤销（误判成立）')
   })
 
@@ -175,7 +178,7 @@ describe('owner 处理申诉', () => {
 
     // executor 本就禁言不了这个管理员，撤销时没有权限可恢复：结案照常，不落进「回滚失败」分支。
     expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned' })
-    expect(answers.at(-1)?.text).toBe('已撤销并解除限制')
+    expect(answers.at(-1)?.text).toBe('已撤销处置')
     expect(edits.at(-1)).toContain('已撤销（误判成立）')
   })
 
@@ -253,7 +256,7 @@ describe('owner 处理申诉', () => {
 
     await handler(ctx, async () => {})
 
-    // 不能答「已撤销并解除限制」：真正结案的是另一次调用。
+    // 不能答「已撤销处置」：真正结案的是另一次调用。
     expect(answers.at(-1)).toEqual({ text: '这条申诉已被处理过' })
     expect(edits).toEqual([])
     expect(recording.calls).toEqual([])
@@ -927,3 +930,63 @@ describe('申诉通知补发', () => {
 function recordedMethods(recording: RecordingApi): string[] {
   return recording.calls.map((call) => call.method)
 }
+
+describe('按实际结果恢复权限', () => {
+  test.each([
+    { kind: 'applied', action: 'delete' } as const,
+    { kind: 'rejected', reason: 'telegram_rejected' } as const,
+  ])('实际结果 %o 不解除原计划封禁', async (execution) => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'ban' }, execution)
+    const recording = createRecordingApi()
+    const deps = { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger }
+    await resolveAppeal(deps, appealId, 'overturn')
+    expect(recording.countOf('unbanChatMember')).toBe(0)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ state: 'overturned', rollbackPending: false })
+    expect(recording.lastArgsOf('sendMessage')).toEqual([userId, '你的申诉已通过：原处理已撤销。'])
+  })
+
+  test('在途执行未落结果时保留恢复任务，完成后按实际动作补偿', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'ban' }, { kind: 'pending' })
+    const recording = createRecordingApi()
+    const deps = { api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger }
+    expect(await resolveAppeal(deps, appealId, 'overturn')).toMatchObject({ kind: 'resolved', rollbackFailed: true })
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ rollbackPending: true })
+    const service = createAppealRollbackService(deps)
+    await service.runOnce()
+    expect(recording.countOf('unbanChatMember')).toBe(0)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ rollbackPending: true })
+    await store.repos.decisions.completeExecution(decisionId, { kind: 'applied', action: 'ban' })
+    await service.runOnce()
+    expect(recording.countOf('unbanChatMember')).toBe(1)
+    expect(await store.repos.appeals.findById(appealId)).toMatchObject({ rollbackPending: false })
+  })
+
+  test('历史未知保留原动作补偿，但不宣称有已恢复证据', async () => {
+    const store = createInMemoryRepos()
+    await seedAppeal(store, { kind: 'ban' }, { kind: 'unknown' })
+    const recording = createRecordingApi()
+    await resolveAppeal({ api: recording.api, repos: store.repos, ownerUserId: ownerId, logger: silentLogger }, appealId, 'overturn')
+    expect(recording.countOf('unbanChatMember')).toBe(1)
+    expect(recording.lastArgsOf('sendMessage')).toEqual([userId, '你的申诉已通过：原处理已撤销。'])
+  })
+})
+
+test.each([
+  { kind: 'applied', action: 'delete' } as const,
+  { kind: 'rejected', reason: 'telegram_rejected' } as const,
+])('结案与结果落库交错时，通知使用最终 %o 而非旧封禁快照', async (execution) => {
+  const store = createInMemoryRepos()
+  await seedAppeal(store, { kind: 'ban' }, { kind: 'pending' })
+  let reads = 0
+  const repos: Repos = { ...store.repos, decisions: { ...store.repos.decisions, async findById(id) {
+    reads += 1
+    if (reads === 2) await store.repos.decisions.completeExecution(id, execution)
+    return store.repos.decisions.findById(id)
+  } } }
+  const recording = createRecordingApi()
+  await resolveAppeal({ api: recording.api, repos, ownerUserId: ownerId, logger: silentLogger }, appealId, 'overturn')
+  expect(recording.countOf('unbanChatMember')).toBe(0)
+  expect(recording.lastArgsOf('sendMessage')).toEqual([userId, '你的申诉已通过：原处理已撤销。'])
+})

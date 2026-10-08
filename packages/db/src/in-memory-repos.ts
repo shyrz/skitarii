@@ -49,8 +49,6 @@ export function createInMemoryRepos(): InMemoryRepos {
   const appeals = new Map<string, Appeal>()
   const resolvedBy = new Map<string, UserId>()
   const notifiedAtBy = new Map<string, Date>()
-  /** 撤销结案后权限尚未回滚的申诉 id。PG 里是 `appeals.rollback_pending` 列，这里旁存。 */
-  const rollbackPendingIds = new Set<string>()
   /** 处置通知的落点（decisionId → 目标 + 消息 id）。PG 里是 `moderation_decisions.notice_*` 列，这里旁存。 */
   const noticeRefs = new Map<string, { chatId: string; messageId: number }>()
   const subscriptions = new Map<string, Subscription>()
@@ -168,9 +166,9 @@ export function createInMemoryRepos(): InMemoryRepos {
       async findById(decisionId: string): Promise<ModerationDecision | null> {
         return decisions.get(decisionId) ?? null
       },
-      async markExecuted(decisionId: string): Promise<void> {
+      async completeExecution(decisionId, result): Promise<void> {
         const stored = decisions.get(decisionId)
-        if (stored !== undefined) decisions.set(decisionId, { ...stored, executed: true })
+        if (stored !== undefined && !stored.executed) decisions.set(decisionId, { ...stored, executed: true, execution: result })
       },
       async listUnexecutedBetween(from: Date, to: Date, limit: number): Promise<ModerationDecision[]> {
         return [...decisions.values()]
@@ -191,6 +189,7 @@ export function createInMemoryRepos(): InMemoryRepos {
             } else if (filter.action !== 'all' && decision.action.kind !== filter.action) {
               return false
             }
+            if (filter.executionIssuesSince !== undefined && (decision.decidedAt < filter.executionIssuesSince || decision.execution.kind !== 'rejected' || decision.execution.reason === 'cancelled_by_appeal')) return false
             if (filter.before !== undefined && !isBeforeCursor(decision, filter.before)) return false
             return true
           })
@@ -246,19 +245,17 @@ export function createInMemoryRepos(): InMemoryRepos {
       ): Promise<boolean> {
         const stored = appeals.get(appealId)
         if (stored === undefined || stored.state !== 'open') return false
-        appeals.set(appealId, { ...stored, state, resolvedAt })
+        appeals.set(appealId, { ...stored, state, resolvedAt, rollbackPending })
         resolvedBy.set(appealId, by)
-        // 「待回滚」标记旁存：领域类型不承载运维标记，与 resolvedBy / notifiedAt 同一先例。
-        if (rollbackPending) rollbackPendingIds.add(appealId)
-        else rollbackPendingIds.delete(appealId)
         return true
       },
       async clearRollbackPending(appealId: string): Promise<void> {
-        rollbackPendingIds.delete(appealId)
+        const stored = appeals.get(appealId)
+        if (stored !== undefined) appeals.set(appealId, { ...stored, rollbackPending: false })
       },
       async listPendingRollback(limit: number): Promise<Appeal[]> {
         return [...appeals.values()]
-          .filter((appeal) => appeal.state === 'overturned' && rollbackPendingIds.has(appeal.id))
+          .filter((appeal) => appeal.state === 'overturned' && appeal.rollbackPending)
           .sort((a, b) => (a.resolvedAt?.getTime() ?? 0) - (b.resolvedAt?.getTime() ?? 0))
           .slice(0, limit)
       },
@@ -297,15 +294,37 @@ export function createInMemoryRepos(): InMemoryRepos {
           .filter((appeal) => appeal.state === 'open' && decisions.get(appeal.decisionId)?.chatId === chatId)
           .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
       },
-      async listByStateWithDecision(state, limit) {
+      async listWithDecision(filter) {
+        const history = filter.state !== null && filter.state !== 'open'
         return [...appeals.values()]
-          .filter((appeal) => state === null || appeal.state === state)
+          .filter((appeal) => filter.state === null ||
+            (filter.state === 'resolved' ? appeal.state !== 'open' : appeal.state === filter.state))
           .flatMap((appeal) => {
             const decision = decisions.get(appeal.decisionId)
-            return decision === undefined ? [] : [{ appeal, decision }]
+            const at = history ? appeal.resolvedAt : appeal.createdAt
+            if (decision === undefined || at === null ||
+              (filter.chatId !== undefined && decision.chatId !== filter.chatId)) return []
+            if (filter.before !== undefined) {
+              const beforeTime = new Date(filter.before.at).getTime()
+              if (at.getTime() > beforeTime ||
+                (at.getTime() === beforeTime && appeal.id >= filter.before.id)) return []
+            }
+            return [{ appeal, decision, cursorAt: at.toISOString() }]
           })
-          .sort((a, b) => b.appeal.createdAt.getTime() - a.appeal.createdAt.getTime())
-          .slice(0, limit)
+          .sort((a, b) => b.cursorAt.localeCompare(a.cursorAt) ||
+            (a.appeal.id < b.appeal.id ? 1 : a.appeal.id > b.appeal.id ? -1 : 0))
+          .slice(0, filter.limit)
+      },
+      async countOpenByChat(chatIds) {
+        const scope = new Set(chatIds)
+        const counts = new Map<ChatId, number>()
+        for (const appeal of appeals.values()) {
+          const chatId = decisions.get(appeal.decisionId)?.chatId
+          if (appeal.state === 'open' && chatId !== undefined && scope.has(chatId)) {
+            counts.set(chatId, (counts.get(chatId) ?? 0) + 1)
+          }
+        }
+        return counts
       },
       async markNotified(appealId: string, notifiedAt: Date): Promise<void> {
         if (appeals.has(appealId)) notifiedAtBy.set(appealId, notifiedAt)
@@ -391,6 +410,14 @@ export function createInMemoryRepos(): InMemoryRepos {
       async findById(chatId: ChatId, id: string): Promise<SubscriptionLink | null> {
         const stored = subscriptionLinks.get(id)
         return stored !== undefined && stored.chatId === chatId ? stored : null
+      },
+      async findNames(chatId, ids) {
+        const result = new Map<string, string>()
+        for (const id of ids) {
+          const link = subscriptionLinks.get(id)
+          if (link?.chatId === chatId) result.set(id, link.name)
+        }
+        return result
       },
       async findByInviteLink(chatId: ChatId, fullLink: string): Promise<SubscriptionLink | null> {
         return (

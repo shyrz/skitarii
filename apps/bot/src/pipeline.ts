@@ -251,6 +251,7 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
       signals: [],
       decidedAt: now(),
       executed: true,
+      execution: { kind: 'applied', action: 'pass' },
     })
     deps.logger.info(
       `信任名单命中，直接放行 chatId=${message.chatId} userId=${message.userId} messageId=${message.messageId} decisionId=${decisionId}`,
@@ -344,6 +345,7 @@ export async function handleIncomingMessage(deps: PipelineDeps, message: Incomin
     signals,
     decidedAt,
     executed: false,
+    execution: { kind: 'pending' },
   })
 
   // 重新读一遍：重投递时 insert 是静默无操作，库里的决策与 `executed` 状态才是权威。

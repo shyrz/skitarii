@@ -198,6 +198,7 @@ async function seedMarkerDecision(store: InMemoryRepos, index: number): Promise<
     // 与 harness 的 now（10:00:00）同一个 1 小时窗口内。
     decidedAt: new Date('2026-09-26T09:30:00Z'),
     executed: true,
+    execution: { kind: 'unknown' },
   })
 }
 
